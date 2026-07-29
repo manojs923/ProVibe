@@ -1,0 +1,20 @@
+# Python / Backend
+backend/__pycache__/
+backend/*.py[cod]
+backend/venv/
+backend/env/
+backend/.env
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# System / IDE
+.vscode/
+.idea/
+.DS_Store
