@@ -8,6 +8,7 @@ import json
 import queue
 import os
 from dotenv import load_dotenv
+import time
 
 # Load the environment variables from the .env file
 load_dotenv()
@@ -74,11 +75,24 @@ def capture_and_solve():
     print("🎯 Sniper mode active. Waiting for hotkeys...")
 
 # --- HOTKEY ACTION HANDLERS ---
+# --- COOLDOWN TRACKERS ---
+last_capture = 0
+last_toggle = 0
+
+# --- HOTKEY ACTION HANDLERS ---
 def trigger_sniper():
-    threading.Thread(target=capture_and_solve).start()
+    global last_capture
+    # 2-second cooldown to prevent double-captures
+    if time.time() - last_capture > 2.0:
+        last_capture = time.time()
+        threading.Thread(target=capture_and_solve).start()
 
 def toggle_visibility():
-    message_queue.put(json.dumps({"status": "command", "action": "toggle_hide"}))
+    global last_toggle
+    # 0.5-second cooldown to prevent flickering
+    if time.time() - last_toggle > 0.5:
+        last_toggle = time.time()
+        message_queue.put(json.dumps({"status": "command", "action": "toggle_hide"}))
     
 def increase_opacity():
     message_queue.put(json.dumps({"status": "command", "action": "opacity_up"}))
