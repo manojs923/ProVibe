@@ -13,7 +13,7 @@ fn main() {
                         
                         // The CTO Translation Layer
                         let unified_command = match raw_os_key.as_str() {
-                            k if k.contains("keys") => "TRIGGER_SNIPER",
+                            // k if k.contains("keys") => "TRIGGER_SNIPER", // 👈 REMOVED: Python handles capture now
                             k if k.contains("keya") => "TRIGGER_AUDIO", // 👈 NEW: Audio Hotkey
                             k if k.contains("keyh") => "TOGGLE_VISIBILITY",
                             k if k.contains("arrowup") => "OPACITY_UP",
@@ -28,7 +28,7 @@ fn main() {
                 .build(),
         )
         .setup(|app| {
-            app.global_shortcut().register("Alt+S")?;
+            // app.global_shortcut().register("Alt+S")?; // 👈 REMOVED: Python handles capture now
             app.global_shortcut().register("Alt+A")?; // 👈 NEW: Register Alt+A with Windows
             app.global_shortcut().register("Alt+H")?;
             app.global_shortcut().register("Alt+Up")?;

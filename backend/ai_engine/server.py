@@ -11,6 +11,8 @@ import speech_recognition as sr
 from google import genai
 from pypdf import PdfReader
 from dotenv import load_dotenv
+import keyboard
+import time
 
 load_dotenv()
 
@@ -90,7 +92,42 @@ def get_genai_client(custom_key=None):
         raise ValueError("No Gemini API key provided. Set it in Settings.")
     return genai.Client(api_key=key)
 
+# =====================================================================
+# TRIPLE SPACE TRACKER
+# =====================================================================
+space_presses = []
 
+async def check_triple_space(websocket):
+    global space_presses
+    
+    def on_space(event):
+        global space_presses
+        if event.event_type == 'down':
+            now = time.time()
+            space_presses.append(now)
+            
+            if len(space_presses) > 3:
+                space_presses.pop(0)
+                
+            if len(space_presses) == 3 and (space_presses[2] - space_presses[0] <= 0.6):
+                print("TRIPLE SPACE DETECTED! Triggering Protocol...")
+                space_presses.clear()
+                
+                asyncio.run_coroutine_threadsafe(
+                    trigger_capture(websocket), 
+                    asyncio.get_running_loop()
+                )
+
+    keyboard.hook_key('space', on_space)
+
+async def trigger_capture(websocket):
+    await websocket.send(json.dumps({
+        "status": "loading",
+        "transcript": "Triple space detected. Triggering sniper..."
+    }))
+    # Directly route the triple-space trigger into the screen workflow
+    await handle_screen_workflow(websocket, "AUTO")
+    
 # =====================================================================
 # SYSTEM PROMPT BUILDER (STRICT MODE)
 # =====================================================================
@@ -176,6 +213,23 @@ async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None):
             await asyncio.sleep(0.2) # Small backoff before failover
 
     raise RuntimeError(f"All models in cascade for task '{task_type}' failed.")
+
+def get_first_inner_code_line(code_text: str) -> int:
+    lines = code_text.split('\n')
+    
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        
+        # Skip empty lines, markdown code blocks, comments, and opening braces alone
+        if not stripped or stripped.startswith("```") or stripped.startswith("//") or stripped.startswith("#") or stripped == "{":
+            continue
+            
+        # Check if the line is indented (indicating it is inside a function/block)
+        if line.startswith(" ") or line.startswith("\t"):
+            return idx
+            
+    # Fallback to line 1 if no inner block line was detected
+    return 1
 
 
 # =====================================================================
@@ -344,10 +398,15 @@ async def handle_audio_workflow(websocket):
             contents=f"Interviewer asked: {transcript}",
             task_type=task_type
         )
+        
+        # Calculate the line number for the first line of inner logic
+        target_line = get_first_inner_code_line(answer)
+
         await websocket.send(json.dumps({
             "status": "success", 
             "data": answer,
-            "transcript": f"Heard: '{transcript}' | Solved by: {resolved_model}"
+            "transcript": f"Heard: '{transcript}' | Solved by: {resolved_model}",
+            "active_line": target_line
         }))
     except Exception as e:
         await websocket.send(json.dumps({"status": "error", "data": str(e)}))
@@ -371,10 +430,14 @@ async def handle_screen_workflow(websocket, requested_mode="AUTO"):
             task_type=task_type
         )
         
+        # Apply the same line-targeting logic to code generated from screenshots
+        target_line = get_first_inner_code_line(answer)
+        
         await websocket.send(json.dumps({
             "status": "success", 
             "data": answer,
-            "transcript": f"Screen Solved | Model: {resolved_model} | Mode: {task_type}"
+            "transcript": f"Screen Solved | Model: {resolved_model} | Mode: {task_type}",
+            "active_line": target_line
         }))
     except Exception as e:
         await websocket.send(json.dumps({"status": "error", "data": str(e)}))
@@ -386,6 +449,9 @@ async def handle_screen_workflow(websocket, requested_mode="AUTO"):
 async def ws_handler(websocket):
     global is_recording, stop_recording_event
     print("\n[🌐 REACT UI CONNECTED TO MULTI-MODEL ENGINE]")
+    
+    # Start listening for the triple space as soon as the UI connects
+    await check_triple_space(websocket)
     
     try:
         async for message in websocket:

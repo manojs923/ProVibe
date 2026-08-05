@@ -16,7 +16,7 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
-            app.global_shortcut().register("Alt+S")?;
+            // app.global_shortcut().register("Alt+S")?; // <--- REMOVED
             app.global_shortcut().register("Alt+H")?;
             app.global_shortcut().register("Alt+Up")?;
             app.global_shortcut().register("Alt+Down")?;
