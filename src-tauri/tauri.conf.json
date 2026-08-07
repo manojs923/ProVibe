@@ -21,7 +21,8 @@
         "decorations": false,
         "shadow": false,
         "alwaysOnTop": true,
-        "contentProtected": true
+        "contentProtected": true,
+        "center": false
       }
     ],
     "security": {

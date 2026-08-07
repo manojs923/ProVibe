@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from "react";
-import { getCurrentWindow, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 
 interface WebSocketPayload {
-  status: 'loading' | 'success' | 'error' | 'config_updated' | 'sync_cursor';
+  status: 'loading' | 'success' | 'error' | 'config_updated' | 'sync_cursor' | 'nav_up' | 'nav_down';
   data?: string;
   transcript?: string;
   active_line?: number;
@@ -12,13 +12,14 @@ interface WebSocketPayload {
 export default function App() {
   const [status, setStatus] = useState("STANDBY");
   const [transcript, setTranscript] = useState("Awaiting voice input or screen sniper...");
-  const [response, setResponse] = useState(`// Protocol AI Multi-Model Suite\n// Press ALT+S to capture screen | ALT+A for audio`);
+  const [response, setResponse] = useState(`// Protocol AI Multi-Model Suite\n// Press Double-Tab to capture screen | ALT+A for audio`);
   const [isVisible, setIsVisible] = useState(true);
   const [uiOpacity, setUiOpacity] = useState(0.95);
   
   // Teleprompter State
   const [activeLine, setActiveLine] = useState<number | null>(null);
   const activeLineRef = useRef<HTMLDivElement>(null);
+  const responseRef = useRef(response);
   
   // Settings & Customization
   const [showSettings, setShowSettings] = useState(false);
@@ -28,80 +29,24 @@ export default function App() {
 
   const wsRef = useRef<WebSocket | null>(null);
 
+  // Keep response ref perfectly synced so the websocket handler knows how many lines there are
+  useEffect(() => {
+    responseRef.current = response;
+  }, [response]);
+
   // ---------------------------------------------------------
-  // 1. RESTORE SAVED WINDOW POSITION, SIZE & OPACITY ON LOAD
+  // RESTORE & SAVE UI OPACITY
   // ---------------------------------------------------------
   useEffect(() => {
-    const appWindow = getCurrentWindow();
-
-    // Restore Opacity
     const savedOpacity = localStorage.getItem('protocol_ui_opacity');
     if (savedOpacity) {
       setUiOpacity(parseFloat(savedOpacity));
     }
-
-    // Restore Window Position & Size
-    const restoreWindowState = async () => {
-      try {
-        const savedPos = localStorage.getItem('protocol_win_pos');
-        const savedSize = localStorage.getItem('protocol_win_size');
-
-        if (savedPos) {
-          const { x, y } = JSON.parse(savedPos);
-          await appWindow.setPosition(new PhysicalPosition(x, y));
-        }
-
-        if (savedSize) {
-          const { width, height } = JSON.parse(savedSize);
-          await appWindow.setSize(new PhysicalSize(width, height));
-        }
-      } catch (err) {
-        console.error("Failed to restore window state:", err);
-      }
-    };
-
-    restoreWindowState();
   }, []);
 
-  // ---------------------------------------------------------
-  // 2. SAVE OPACITY WHENEVER IT CHANGES
-  // ---------------------------------------------------------
   useEffect(() => {
     localStorage.setItem('protocol_ui_opacity', uiOpacity.toString());
   }, [uiOpacity]);
-
-  // ---------------------------------------------------------
-  // 3. TRACK & SAVE WINDOW MOVES & RESIZES
-  // ---------------------------------------------------------
-  useEffect(() => {
-    const appWindow = getCurrentWindow();
-
-    const saveWindowState = async () => {
-      try {
-        const pos = await appWindow.outerPosition();
-        const size = await appWindow.outerSize();
-        localStorage.setItem('protocol_win_pos', JSON.stringify({ x: pos.x, y: pos.y }));
-        localStorage.setItem('protocol_win_size', JSON.stringify({ width: size.width, height: size.height }));
-      } catch (err) {
-        console.error("Failed to save window state:", err);
-      }
-    };
-
-    let unlistenMoved: (() => void) | undefined;
-    let unlistenResized: (() => void) | undefined;
-
-    const setupListeners = async () => {
-      unlistenMoved = await appWindow.onMoved(saveWindowState);
-      unlistenResized = await appWindow.onResized(saveWindowState);
-    };
-
-    setupListeners();
-
-    return () => {
-      if (unlistenMoved) unlistenMoved();
-      if (unlistenResized) unlistenResized();
-    };
-  }, []);
 
   // ---------------------------------------------------------
   // WEBSOCKET HANDLER
@@ -110,7 +55,12 @@ export default function App() {
     const socket = new WebSocket("ws://localhost:8765");
     wsRef.current = socket;
     
-    socket.onopen = () => setStatus("CONNECTED");
+    socket.onopen = () => {
+      setStatus("CONNECTED");
+      // Sync initial mode on connection
+      socket.send(JSON.stringify({ action: "set_mode", mode: "AUTO" }));
+    };
+    
     socket.onclose = () => setStatus("DISCONNECTED");
 
     socket.onmessage = (event: MessageEvent) => {
@@ -128,6 +78,15 @@ export default function App() {
           setActiveLine(payload.active_line || null);
         } else if (payload.status === "sync_cursor" && payload.active_line !== undefined) {
           setActiveLine(payload.active_line);
+        } else if (payload.status === "nav_up") {
+          // Listen to Python global up arrow
+          setActiveLine(prev => (prev === null ? 1 : Math.max(1, prev - 1)));
+        } else if (payload.status === "nav_down") {
+          // Listen to Python global down arrow
+          setActiveLine(prev => {
+            const maxLines = responseRef.current.split('\n').length;
+            return prev === null ? 1 : Math.min(maxLines, prev + 1);
+          });
         } else if (payload.status === "error" && payload.data) {
           setStatus("ERROR");
           setResponse("⚠️ Error: " + payload.data);
@@ -142,6 +101,15 @@ export default function App() {
 
     return () => socket.close();
   }, []);
+
+  // ---------------------------------------------------------
+  // MODE SYNCHRONIZATION
+  // ---------------------------------------------------------
+  useEffect(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ action: "set_mode", mode: taskMode }));
+    }
+  }, [taskMode]);
 
   // Auto-scroll logic when activeLine changes
   useEffect(() => {
@@ -170,7 +138,21 @@ export default function App() {
         }
       }
       
-      if (command === "TOGGLE_VISIBILITY") setIsVisible(prev => !prev);
+      if (command === "TOGGLE_VISIBILITY") {
+        setIsVisible(prev => {
+          const next = !prev;
+          const appWindow = getCurrentWindow();
+          if (next) {
+            appWindow.show();
+            appWindow.setFocus();
+          } else {
+            appWindow.hide();
+          }
+          return next;
+        });
+      }
+
+      // Alt+Up / Alt+Down retain their original opacity function
       if (command === "OPACITY_UP") setUiOpacity(prev => Math.min(1.0, prev + 0.1));
       if (command === "OPACITY_DOWN") setUiOpacity(prev => Math.max(0.1, prev - 0.1));
     });
@@ -310,7 +292,7 @@ export default function App() {
         {/* FOOTER */}
         <div onPointerDown={() => getCurrentWindow().startDragging()} className="mt-3 flex items-center justify-between text-[10px] text-slate-300 font-bold pt-2 border-t border-slate-800 cursor-pointer">
           <span className="text-slate-200 pointer-events-none">CASCADE ROUTER: ACTIVE</span>
-          <span className="text-emerald-400 pointer-events-none">SNIPE: ALT+S | AUDIO: ALT+A | HIDE: ALT+H</span>
+          <span className="text-emerald-400 pointer-events-none">SNIPE: DOUBLE-TAB | AUDIO: ALT+A | HIDE: ALT+H</span>
         </div>
       </div>
     </main>

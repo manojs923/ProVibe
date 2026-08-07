@@ -4,6 +4,7 @@ import json
 import wave
 import asyncio
 import threading
+import time
 import websockets
 from PIL import ImageGrab
 import pyaudiowpatch as pyaudio
@@ -12,122 +13,231 @@ from google import genai
 from pypdf import PdfReader
 from dotenv import load_dotenv
 import keyboard
-import time
 
 load_dotenv()
 
 # =====================================================================
-# MODEL FALLBACK CASCADES (Grouped by Task Capability)
+# MODEL FALLBACK CASCADES (Sanitized for Multimodal Free-Tier Stability)
 # =====================================================================
 MODEL_TIERS = {
     "CODING": [
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3-flash-preview",
-        "gemini-2.5-flash",
-        "gemini-flash-latest"
-    ],
-    "MCQ": [
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-3.1-flash-lite",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash-lite",
-        "gemini-2.0-flash-lite-001",
-        "gemini-flash-lite-latest"
-    ],
-    "SQL": [
-        "gemini-3.5-flash",
-        "gemini-3.1-flash-lite",
         "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-2.0-flash-001"
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-flash-latest"
+    ],
+    "MCQ": [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-lite-preview-02-05",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash-8b-latest",
+        "gemini-1.5-flash-latest"
+    ],
+    "SQL": [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-flash-latest"
     ],
     "BEHAVIORAL": [
-        "gemini-omni-flash-preview",
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
-        "gemini-2.5-flash"
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-flash-latest"
     ],
     "VISUAL": [
-        "gemini-3.1-flash-image",
-        "gemini-3.1-flash-image-preview",
-        "gemini-2.5-flash-image",
-        "gemini-3.1-flash-lite-image",
-        "gemini-3.5-flash"
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-flash-latest"
     ],
     "AUDIO": [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-flash-preview-tts",
-        "gemini-3.5-flash",
-        "gemini-2.5-flash"
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-flash-latest"
     ]
 }
 
-# Default Global Fallback list if classification is ambiguous
 DEFAULT_FALLBACK = [
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-2.0-flash"
+    "gemini-2.0-flash",
+    "gemini-1.5-pro-latest",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash-8b-latest"
 ]
 
 # =====================================================================
-# GLOBAL STATE & USER VAULT
+# GLOBAL STATE & USER VAULT (WITH KEY ROTATION)
 # =====================================================================
+env_keys = [k.strip() for k in os.getenv("GEMINI_API_KEY", "").split(",") if k.strip()]
+
 user_config = {
-    "api_key": os.getenv("GEMINI_API_KEY", ""),
+    "api_keys": env_keys,
     "resume_context": "Candidate has experience in Software Engineering, Data Structures, Algorithms, and System Design."
 }
 
 is_recording = False
 stop_recording_event = threading.Event()
-
+current_mode = "AUTO"
+hooks_registered = False
+connected_clients = set()
+current_key_index = 0
 
 def get_genai_client(custom_key=None):
-    """Instantiates Gemini client using custom user key or environment key."""
-    key = custom_key if custom_key else user_config["api_key"]
-    if not key:
-        raise ValueError("No Gemini API key provided. Set it in Settings.")
-    return genai.Client(api_key=key)
-
-# =====================================================================
-# TRIPLE SPACE TRACKER
-# =====================================================================
-space_presses = []
-
-async def check_triple_space(websocket):
-    global space_presses
+    """Instantiates Gemini client using the current active key in the rotation pool."""
+    global current_key_index
+    if custom_key:
+        return genai.Client(api_key=custom_key)
+        
+    keys = user_config.get("api_keys", [])
+    if not keys:
+        raise ValueError("No Gemini API key provided. Paste one (or more, comma-separated) in the Vault.")
     
-    def on_space(event):
-        global space_presses
+    active_key = keys[current_key_index % len(keys)]
+    return genai.Client(api_key=active_key)
+
+async def broadcast_to_ui(message_dict):
+    """Safely broadcasts a message to all open React windows to beat Strict Mode."""
+    if not connected_clients:
+        return
+    msg = json.dumps(message_dict)
+    for ws in list(connected_clients):
+        try:
+            await ws.send(msg)
+        except Exception:
+            pass
+
+# =====================================================================
+# MULTI-SHOT SCREEN BATCHING (Double Tab -> Enter)
+# =====================================================================
+tab_presses = []
+cooldown_until = 0
+screenshot_buffer = []
+
+def setup_keyboard_hooks(main_loop):
+    """Registers keyboard hooks once globally to prevent memory leaks/crashes."""
+    global hooks_registered
+    if hooks_registered:
+        return
+    hooks_registered = True
+    
+    def on_tab(event):
+        global tab_presses, cooldown_until
         if event.event_type == 'down':
             now = time.time()
-            space_presses.append(now)
-            
-            if len(space_presses) > 3:
-                space_presses.pop(0)
+            if now < cooldown_until:
+                return
                 
-            if len(space_presses) == 3 and (space_presses[2] - space_presses[0] <= 0.6):
-                print("TRIPLE SPACE DETECTED! Triggering Protocol...")
-                space_presses.clear()
+            tab_presses.append(now)
+            if len(tab_presses) > 2:
+                tab_presses.pop(0)
+                
+            if len(tab_presses) == 2 and (tab_presses[1] - tab_presses[0] <= 0.5):
+                print("DOUBLE TAB DETECTED! Buffering screenshot...")
+                tab_presses.clear()
+                cooldown_until = now + 1.0 
                 
                 asyncio.run_coroutine_threadsafe(
-                    trigger_capture(websocket), 
-                    asyncio.get_running_loop()
+                    buffer_screenshot(), 
+                    main_loop
                 )
 
-    keyboard.hook_key('space', on_space)
+    def on_enter(event):
+        global screenshot_buffer, cooldown_until, current_mode
+        if event.event_type == 'down':
+            if len(screenshot_buffer) > 0:
+                now = time.time()
+                if now < cooldown_until:
+                    return
+                cooldown_until = now + 3.0
+                
+                print(f"ENTER DETECTED! Sending {len(screenshot_buffer)} batched screenshot(s) to AI...")
+                asyncio.run_coroutine_threadsafe(
+                    execute_screenshot_batch(requested_mode=current_mode),
+                    main_loop
+                )
 
-async def trigger_capture(websocket):
-    await websocket.send(json.dumps({
-        "status": "loading",
-        "transcript": "Triple space detected. Triggering sniper..."
-    }))
-    # Directly route the triple-space trigger into the screen workflow
-    await handle_screen_workflow(websocket, "AUTO")
+    def on_up(event):
+        if event.event_type == 'down':
+            print("⬆️ GLOBAL UP DETECTED (Stealth scroll)")
+            asyncio.run_coroutine_threadsafe(
+                broadcast_to_ui({"status": "nav_up"}),
+                main_loop
+            )
+
+    def on_down(event):
+        if event.event_type == 'down':
+            print("⬇️ GLOBAL DOWN DETECTED (Stealth scroll)")
+            asyncio.run_coroutine_threadsafe(
+                broadcast_to_ui({"status": "nav_down"}),
+                main_loop
+            )
+
+    keyboard.hook_key('tab', on_tab)
+    keyboard.hook_key('enter', on_enter)
+    keyboard.hook_key('up', on_up)
+    keyboard.hook_key('down', on_down)
+
+async def buffer_screenshot():
+    global screenshot_buffer
+    try:
+        img = ImageGrab.grab()
+        img.thumbnail((1280, 1280))
+        
+        save_dir = "screenshots"
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = int(time.time())
+        file_path = os.path.join(save_dir, f"snipe_{timestamp}.jpg")
+        
+        img.save(file_path, format="JPEG", quality=75)
+        
+        screenshot_buffer.append(img)
+        
+        await broadcast_to_ui({
+            "status": "loading",
+            "transcript": f"📸 Buffered {len(screenshot_buffer)} screenshot(s). Scroll & Double-Tab again, or press [ENTER] to solve..."
+        })
+    except Exception as e:
+        print(f"Failed to buffer screenshot: {e}")
+
+async def execute_screenshot_batch(requested_mode="AUTO"):
+    global screenshot_buffer
     
+    if not screenshot_buffer:
+        return
+        
+    print(f"\n[📸 SCREEN CAPTURE BATCH TRIGGERED: {len(screenshot_buffer)} Images]")
+    await broadcast_to_ui({
+        "status": "loading", 
+        "transcript": f"Analyzing {len(screenshot_buffer)} buffered screenshot(s)..."
+    })
+    
+    try:
+        task_type = "VISUAL" if requested_mode == "AUTO" else requested_mode
+        
+        images_to_process = screenshot_buffer.copy()
+        screenshot_buffer.clear()
+        
+        contents = images_to_process + ["Analyze these images together as one continuous problem. Provide the exact solution according to the system prompt instructions."]
+        
+        answer, resolved_model = await execute_cascade_query(
+            contents=contents,
+            task_type=task_type
+        )
+        
+        target_line = get_first_inner_code_line(answer)
+        
+        await broadcast_to_ui({
+            "status": "success", 
+            "data": answer,
+            "transcript": f"Batch Solved ({len(images_to_process)} images) | Model: {resolved_model} | Mode: {task_type}",
+            "active_line": target_line
+        })
+    except Exception as e:
+        screenshot_buffer.clear()
+        await broadcast_to_ui({"status": "error", "data": str(e)})
+
 # =====================================================================
 # SYSTEM PROMPT BUILDER (STRICT MODE)
 # =====================================================================
@@ -158,18 +268,24 @@ Example Output: B - Hash Table
 """
     elif task_type == "CODING":
         return base_rules + """
-TASK: CODING INTERVIEW QUESTION
+TASK: CODING INTERVIEW QUESTION OR DEBUGGING
 OUTPUT FORMAT:
-Provide ONLY the raw, optimal code inside a markdown block.
-DO NOT explain the code. DO NOT tell me how it works. I just need to copy/paste it.
-Put the Time and Space complexity as a comment at the top of the code.
+1. IF WRITING NEW CODE FROM SCRATCH: Provide ONLY the raw, optimal code inside a markdown block. DO NOT explain the code. ABSOLUTELY NO COMMENTS IN THE CODE (No //, no #, no /* */). I need the direct, clean code block only.
+2. IF FIXING AN ERROR / DEBUGGING: Point out the exact line number, briefly explain what is wrong, and provide ONLY the fixed line(s) of code inside a markdown block.
+
+Example Debug Output:
+Line 23 has no semicolon. It should be:
+```cpp
+return;
+```
 """
+
     elif task_type == "SQL":
         return base_rules + """
 TASK: DATABASE / SQL QUERY
 OUTPUT FORMAT:
 Provide ONLY the raw SQL query inside a markdown block.
-NO explanations.
+NO explanations. NO comments in the SQL.
 """
     elif task_type == "BEHAVIORAL":
         return base_rules + """
@@ -186,51 +302,58 @@ OUTPUT FORMAT:
 Give the direct, raw answer. If it's a concept, give me a 2-sentence script to read out loud. No filler.
 """
 
-
 # =====================================================================
-# AI ROUTER WITH CASCADE FAILOVER
+# AI ROUTER WITH API KEY ROTATION & CASCADE FAILOVER
 # =====================================================================
 async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None):
-    """Iterates through task-specific model cascade until success."""
-    client = get_genai_client(custom_key)
+    global current_key_index
     cascade_models = MODEL_TIERS.get(task_type, DEFAULT_FALLBACK)
     prompt = build_prompt(task_type)
     
     full_contents = [prompt] + (contents if isinstance(contents, list) else [contents])
     
+    total_keys = len(user_config.get("api_keys", []))
+    if total_keys == 0: total_keys = 1
+    
     for model_name in cascade_models:
-        try:
-            print(f"[🤖 ROUTER] Attempting task '{task_type}' on model: {model_name}")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=full_contents
-            )
-            if response and response.text:
-                print(f"[✅ SUCCESS] Handled by model: {model_name}")
-                return response.text.strip(), model_name
-        except Exception as e:
-            print(f"[⚠️ FAILOVER] Model {model_name} failed: {e}. Cascading to next model...")
-            await asyncio.sleep(0.2) # Small backoff before failover
+        for _ in range(max(1, total_keys)):
+            try:
+                client = get_genai_client(custom_key)
+                print(f"[🤖 ROUTER] Attempting task '{task_type}' on model: {model_name} (Key #{current_key_index + 1})")
+                
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=full_contents
+                )
+                
+                if response and response.text:
+                    print(f"[✅ SUCCESS] Handled by model: {model_name}")
+                    return response.text.strip(), model_name
+                    
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                    print(f"[⚠️ RATE LIMIT HIT] Key #{current_key_index + 1} exhausted on {model_name}. Swapping keys...")
+                    if total_keys > 1:
+                        current_key_index += 1
+                        await asyncio.sleep(0.1)
+                        continue
+                    
+                print(f"[⚠️ FAILOVER] Model {model_name} failed: {error_msg}. Cascading to next model...")
+                await asyncio.sleep(0.2)
+                break 
 
     raise RuntimeError(f"All models in cascade for task '{task_type}' failed.")
 
 def get_first_inner_code_line(code_text: str) -> int:
     lines = code_text.split('\n')
-    
     for idx, line in enumerate(lines, start=1):
         stripped = line.strip()
-        
-        # Skip empty lines, markdown code blocks, comments, and opening braces alone
         if not stripped or stripped.startswith("```") or stripped.startswith("//") or stripped.startswith("#") or stripped == "{":
             continue
-            
-        # Check if the line is indented (indicating it is inside a function/block)
         if line.startswith(" ") or line.startswith("\t"):
             return idx
-            
-    # Fallback to line 1 if no inner block line was detected
     return 1
-
 
 # =====================================================================
 # AUDIO RECORDING ENGINE
@@ -242,15 +365,12 @@ def record_audio_sync():
     
     with pyaudio.PyAudio() as p:
         try:
-            # 👈 THE CTO FIX: Aggressive WASAPI Loopback Hunter
             wasapi_info = None
-            
             try:
                 wasapi_info = p.get_default_wasapi_loopback()
             except OSError:
                 print("[⚠️ WARNING] Default WASAPI failed. Hunting for active earphone loopback...")
                 
-            # If default fails or we are using a headset, hunt through all devices
             if not wasapi_info:
                 for i in range(p.get_device_count()):
                     dev = p.get_device_info_by_index(i)
@@ -277,7 +397,6 @@ def record_audio_sync():
             frames = []
             max_chunks = int(sample_rate / CHUNK * MAX_SECONDS)
             
-            # Record loop with interrupt check
             for _ in range(max_chunks):
                 if stop_recording_event.is_set():
                     break
@@ -289,7 +408,6 @@ def record_audio_sync():
             if not frames:
                 return "ERROR_NO_SPEECH"
 
-            # Build WAV in RAM
             wav_io = io.BytesIO()
             wf = wave.open(wav_io, 'wb')
             wf.setnchannels(channels)
@@ -299,7 +417,6 @@ def record_audio_sync():
             wf.close()
             wav_io.seek(0)
 
-            # Transcribe
             recognizer = sr.Recognizer()
             with sr.AudioFile(wav_io) as source:
                 audio_data = recognizer.record(source)
@@ -307,20 +424,16 @@ def record_audio_sync():
             return recognizer.recognize_google(audio_data, language="en-US")
             
         except sr.UnknownValueError:
-            # This specifically triggers when it records pure silence
             return "ERROR_NO_SPEECH"
         except Exception as e:
             print(f"Audio Error: {e}")
             return "ERROR_SYSTEM"
-        
+
 # =====================================================================
 # DYNAMIC INTENT CLASSIFIER
 # =====================================================================
 async def classify_intent(transcript, custom_key=None):
-    """Uses a lightweight, ultra-fast model to classify the user's intent."""
     client = get_genai_client(custom_key)
-    
-    # We use 1.5-flash-8b because it is the fastest model for simple routing
     classifier_model = "gemini-1.5-flash-8b" 
     
     prompt = f"""
@@ -343,7 +456,6 @@ async def classify_intent(transcript, custom_key=None):
         )
         tag = response.text.strip().upper()
         
-        # Validate the output to ensure it matched our schema
         valid_tags = ["[BEHAVIORAL]", "[CODING]", "[SQL]", "[MCQ]", "[GENERAL]"]
         if tag in valid_tags:
             return tag.strip("[]")
@@ -363,35 +475,34 @@ async def handle_audio_workflow(websocket):
     is_recording = True
     stop_recording_event.clear()
     
-    await websocket.send(json.dumps({
+    await broadcast_to_ui({
         "status": "loading", 
         "transcript": "🔴 Intercepting system audio... Press [ALT+A] to finish."
-    }))
+    })
     
     transcript = await asyncio.to_thread(record_audio_sync)
     is_recording = False
     
     if transcript.startswith("ERROR"):
-        await websocket.send(json.dumps({
+        await broadcast_to_ui({
             "status": "error", 
             "data": "Could not process audio. Ensure system sound is playing."
-        }))
+        })
         return
 
     print(f"[🗣️ TRANSCRIBED]: {transcript}")
     
-    await websocket.send(json.dumps({
+    await broadcast_to_ui({
         "status": "loading", 
         "transcript": f"Heard: '{transcript}'\nClassifying intent..."
-    }))
+    })
 
-    # 👈 THE CTO FIX: Dynamic AI Classification instead of hardcoded strings
     task_type = await classify_intent(transcript)
     
-    await websocket.send(json.dumps({
+    await broadcast_to_ui({
         "status": "loading", 
         "transcript": f"Heard: '{transcript}'\nRouting through [{task_type}] cascade..."
-    }))
+    })
 
     try:
         answer, resolved_model = await execute_cascade_query(
@@ -399,68 +510,41 @@ async def handle_audio_workflow(websocket):
             task_type=task_type
         )
         
-        # Calculate the line number for the first line of inner logic
         target_line = get_first_inner_code_line(answer)
 
-        await websocket.send(json.dumps({
+        await broadcast_to_ui({
             "status": "success", 
             "data": answer,
             "transcript": f"Heard: '{transcript}' | Solved by: {resolved_model}",
             "active_line": target_line
-        }))
+        })
     except Exception as e:
-        await websocket.send(json.dumps({"status": "error", "data": str(e)}))
-
-
-async def handle_screen_workflow(websocket, requested_mode="AUTO"):
-    print("\n[📸 SCREEN CAPTURE TRIGGERED]")
-    await websocket.send(json.dumps({
-        "status": "loading", 
-        "transcript": "Capturing screen buffer and analyzing visual layout..."
-    }))
-    
-    try:
-        screenshot = ImageGrab.grab()
-        
-        # Mode override or default visual cascade
-        task_type = "VISUAL" if requested_mode == "AUTO" else requested_mode
-        
-        answer, resolved_model = await execute_cascade_query(
-            contents=[screenshot, "Analyze this image and provide the exact solution according to the prompt instructions."],
-            task_type=task_type
-        )
-        
-        # Apply the same line-targeting logic to code generated from screenshots
-        target_line = get_first_inner_code_line(answer)
-        
-        await websocket.send(json.dumps({
-            "status": "success", 
-            "data": answer,
-            "transcript": f"Screen Solved | Model: {resolved_model} | Mode: {task_type}",
-            "active_line": target_line
-        }))
-    except Exception as e:
-        await websocket.send(json.dumps({"status": "error", "data": str(e)}))
-
+        await broadcast_to_ui({"status": "error", "data": str(e)})
 
 # =====================================================================
 # WEBSOCKET SERVER & CONFIG PROTOCOL
 # =====================================================================
 async def ws_handler(websocket):
-    global is_recording, stop_recording_event
-    print("\n[🌐 REACT UI CONNECTED TO MULTI-MODEL ENGINE]")
+    global is_recording, stop_recording_event, current_mode
     
-    # Start listening for the triple space as soon as the UI connects
-    await check_triple_space(websocket)
+    connected_clients.add(websocket)
+    print(f"\n[🌐 REACT UI CONNECTED] Total Active Clients: {len(connected_clients)}")
+    
+    setup_keyboard_hooks(asyncio.get_running_loop())
     
     try:
         async for message in websocket:
             payload = json.loads(message)
             action = payload.get("action")
             
-            if action == "capture_screen":
-                mode = payload.get("mode", "AUTO")
-                asyncio.create_task(handle_screen_workflow(websocket, mode))
+            if action == "set_mode":
+                current_mode = payload.get("mode", "AUTO")
+                
+            elif action == "capture_screen":
+                async def force_single_capture():
+                    await buffer_screenshot()
+                    await execute_screenshot_batch(payload.get("mode", "AUTO"))
+                asyncio.create_task(force_single_capture())
                 
             elif action == "toggle_audio":
                 if not is_recording:
@@ -469,22 +553,23 @@ async def ws_handler(websocket):
                     stop_recording_event.set()
                     
             elif action == "update_config":
-                # Handle API key and Resume updates dynamically from UI
                 if "api_key" in payload and payload["api_key"]:
-                    user_config["api_key"] = payload["api_key"]
+                    user_config["api_keys"] = [k.strip() for k in payload["api_key"].split(",") if k.strip()]
                 if "resume_text" in payload and payload["resume_text"]:
                     user_config["resume_context"] = payload["resume_text"]
                     
-                await websocket.send(json.dumps({
+                await broadcast_to_ui({
                     "status": "config_updated",
                     "data": "✅ Settings saved successfully! Vault & Resume updated."
-                }))
+                })
                 
     except websockets.exceptions.ConnectionClosed:
         print("\n[⚠️ UI DISCONNECTED]")
+    finally:
+        connected_clients.remove(websocket)
 
 async def start_server():
-    print("✅ 4CPA MULTI-MODEL ROUTER ACTIVE ON PORT 8765")
+    print("✅ PROTOCOL V2 MULTI-MODEL ROUTER ACTIVE ON PORT 8765")
     async with websockets.serve(ws_handler, "localhost", 8765):
         await asyncio.Future()
 

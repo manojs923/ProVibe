@@ -5,16 +5,17 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 fn main() {
     tauri::Builder::default()
+        // 👇 ADD THE NATIVE WINDOW TRACKER HERE
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
                     if event.state == ShortcutState::Pressed {
                         let raw_os_key = shortcut.to_string().to_lowercase();
                         
-                        // The CTO Translation Layer
                         let unified_command = match raw_os_key.as_str() {
-                            // k if k.contains("keys") => "TRIGGER_SNIPER", // 👈 REMOVED: Python handles capture now
-                            k if k.contains("keya") => "TRIGGER_AUDIO", // 👈 NEW: Audio Hotkey
+                            k if k.contains("keya") => "TRIGGER_AUDIO",
                             k if k.contains("keyh") => "TOGGLE_VISIBILITY",
                             k if k.contains("arrowup") => "OPACITY_UP",
                             k if k.contains("arrowdown") => "OPACITY_DOWN",
@@ -28,8 +29,7 @@ fn main() {
                 .build(),
         )
         .setup(|app| {
-            // app.global_shortcut().register("Alt+S")?; // 👈 REMOVED: Python handles capture now
-            app.global_shortcut().register("Alt+A")?; // 👈 NEW: Register Alt+A with Windows
+            app.global_shortcut().register("Alt+A")?; 
             app.global_shortcut().register("Alt+H")?;
             app.global_shortcut().register("Alt+Up")?;
             app.global_shortcut().register("Alt+Down")?;
