@@ -13,59 +13,47 @@ from google import genai
 from pypdf import PdfReader
 from dotenv import load_dotenv
 import keyboard
+import requests
+import base64
 
 load_dotenv()
 
 # =====================================================================
 # MODEL FALLBACK CASCADES (Sanitized for Multimodal Free-Tier Stability)
 # =====================================================================
+ULTIMATE_FALLBACK = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-omni-flash-preview",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-lite-001",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest"
+    "nvidia/nemotron-nano-12b-v2-vl:free",      # Nvidia's free Vision-Language model
+    "cohere/north-mini-code:free",              # Cohere's dedicated coding model
+    "google/gemma-4-31b-it:free",               # Gemma 31B instruction-tuned
+    "openai/gpt-oss-20b:free",                  # Free GPT endpoint
+    "openrouter/free"                           # Dynamic auto-routing free tier
+]
+
 MODEL_TIERS = {
-    "CODING": [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-latest"
-    ],
-    "MCQ": [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash-lite-preview-02-05",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash-8b-latest",
-        "gemini-1.5-flash-latest"
-    ],
-    "SQL": [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-latest"
-    ],
-    "BEHAVIORAL": [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-latest"
-    ],
-    "VISUAL": [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-latest"
-    ],
-    "AUDIO": [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-latest"
-    ]
+    "CODING": ULTIMATE_FALLBACK,
+    "MCQ": ULTIMATE_FALLBACK,
+    "SQL": ULTIMATE_FALLBACK,
+    "BEHAVIORAL": ULTIMATE_FALLBACK,
+    "VISUAL": ULTIMATE_FALLBACK,
+    "AUDIO": ULTIMATE_FALLBACK
 }
 
-DEFAULT_FALLBACK = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-pro-latest",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash-8b-latest"
-]
+DEFAULT_FALLBACK = ULTIMATE_FALLBACK
 
 # =====================================================================
 # GLOBAL STATE & USER VAULT (WITH KEY ROTATION)
@@ -243,107 +231,300 @@ async def execute_screenshot_batch(requested_mode="AUTO"):
 # =====================================================================
 def build_prompt(task_type="GENERAL"):
     base_rules = f"""
-You are a stealth live-interview copilot acting directly for the candidate.
+You are a stealth live-assessment copilot acting directly for the candidate taking the Amazon SDE Online Assessment.
 CANDIDATE RESUME / BACKGROUND:
 \"\"\"
 {user_config['resume_context']}
 \"\"\"
 
+CRITICAL FRAMEWORK: 
+Amazon grades situational and style sections strictly against their 16 Leadership Principles. 
+Always prioritize: Customer Obsession, Ownership, Deliver Results, and Insist on Highest Standards.
+
 CRITICAL AUDIO CORRECTION RULE:
-The input is transcribed from live audio and may contain severe speech-to-text errors (e.g., hearing "kill yourself" instead of "tell me about yourself"). 
-If the prompt sounds nonsensical, hostile, or grammatically broken, USE YOUR CONTEXTUAL LOGIC to infer what standard software engineering interview question was actually asked, and answer THAT question.
+The input is transcribed from live audio and may contain severe speech-to-text errors. Infer what standard interview question or scenario was actually asked.
 
 ABSOLUTE OUTPUT CONSTRAINTS (VIOLATION IS A SYSTEM FAILURE):
 1. NO EXPLANATIONS. NO FILLER. NO PLEASANTRIES.
 2. DO NOT say "Here is the answer" or "The right choice is".
-3. Provide ONLY the exact words I need to speak out loud, or the exact code I need to type.
+3. Provide ONLY the exact words to speak, the code to type, or the option to click.
 """
 
-    if task_type == "MCQ":
+    if task_type == "WORK_SIMULATION":
         return base_rules + """
-TASK: MULTIPLE CHOICE QUESTION (MCQ)
+TASK: WORK SIMULATION (SITUATIONAL JUDGMENT)
+INSTRUCTIONS: 
+Evaluate the scenario using Amazon Leadership Principles. 
+- If balancing speed vs. quality, lean towards quality/standards but escalate blockers immediately.
+- If a customer issue arises, drop everything to prioritize the customer.
+- Never choose options that involve passing the blame or ignoring a broken process.
 OUTPUT FORMAT:
-Provide ONLY the correct option letter and its exact text. 
-Example Output: B - Hash Table
+Provide ONLY the text of the best action to take, or rank the options EXACTLY as requested (e.g., 1. Option C, 2. Option A).
 """
-    elif task_type == "CODING":
-        return base_rules + """
-TASK: CODING INTERVIEW QUESTION OR DEBUGGING
-OUTPUT FORMAT:
-1. IF WRITING NEW CODE FROM SCRATCH: Provide ONLY the raw, optimal code inside a markdown block. DO NOT explain the code. ABSOLUTELY NO COMMENTS IN THE CODE (No //, no #, no /* */). I need the direct, clean code block only.
-2. IF FIXING AN ERROR / DEBUGGING: Point out the exact line number, briefly explain what is wrong, and provide ONLY the fixed line(s) of code inside a markdown block.
 
-Example Debug Output:
-Line 23 has no semicolon. It should be:
-```cpp
-return;
-```
+    elif task_type == "WORK_STYLE":
+        return base_rules + """
+TASK: WORK STYLE SURVEY
+INSTRUCTIONS: 
+The user is presented with two statements on a slider. Pick the statement that best aligns with Amazon Leadership Principles (Action-oriented, data-driven, customer-focused, takes extreme ownership).
+OUTPUT FORMAT: 
+Output EXACTLY one of these phrases based on how strongly it maps to an LP:
+- "Strongly choose [Statement A text]"
+- "Mostly choose [Statement A text]"
+- "Strongly choose [Statement B text]"
+- "Mostly choose [Statement B text]"
+"""
+
+    elif task_type in ["CODING", "VISUAL"]:
+        return base_rules + """
+TASK: CODING CHALLENGE & VISUAL DEBUGGING
+INSTRUCTIONS:
+First, analyze the screenshots or input to determine the current state. 
+
+STATE 1: FAILING TEST CASES DETECTED
+If the screenshot shows execution errors, compiler errors, or failing test cases from a previous attempt, DO NOT output the full code again. 
+OUTPUT FORMAT (Use EXACTLY this format):
+// this was the coding mistake because of which test cases are not passing here is the updated, these things you have to update, not writing the full code
+
+// in [filename.ext] update line [number] to:
+[only the corrected lines of code]
+
+
+STATE 2: NEW PROBLEM OR NO TEST CASES VISIBLE
+If it is a new problem or test cases are not visible, solve it entirely.
+OUTPUT FORMAT:
+1. TRADITIONAL ALGORITHM: Provide ONLY the raw, optimal C++ code inside a markdown block. ABSOLUTELY NO COMMENTS IN THE CODE.
+2. REPOSITORY / MULTI-FILE TASK: Use EXACTLY this format using comments for file routing:
+
+// [Brief 1-sentence note of what to do]
+
+// in [filename.ext] add this code:
+[raw code here]
+
+// in [filename.ext] this is the code:
+[raw code here]
 """
 
     elif task_type == "SQL":
         return base_rules + """
 TASK: DATABASE / SQL QUERY
 OUTPUT FORMAT:
-Provide ONLY the raw SQL query inside a markdown block.
-NO explanations. NO comments in the SQL.
+Provide ONLY the raw SQL query inside a markdown block. NO explanations. NO comments.
 """
+
     elif task_type == "BEHAVIORAL":
         return base_rules + """
 TASK: BEHAVIORAL / CONCEPTUAL INTERVIEW
 OUTPUT FORMAT:
-Write a 3-4 sentence script in the FIRST PERSON ("I", "my") that I can read out loud directly to the interviewer.
-Use the STAR method based ONLY on the resume provided.
-DO NOT explain the logic. ONLY give me the script to read.
+Write a 3-4 sentence script in the FIRST PERSON ("I", "my") using the STAR method based ONLY on the resume provided. DO NOT explain the logic.
 """
+
     else:
         return base_rules + """
 TASK: GENERAL TECHNICAL / INTERVIEW QUESTION
 OUTPUT FORMAT:
-Give the direct, raw answer. If it's a concept, give me a 2-sentence script to read out loud. No filler.
+Give the direct, raw answer. No filler.
 """
 
 # =====================================================================
 # AI ROUTER WITH API KEY ROTATION & CASCADE FAILOVER
 # =====================================================================
+# Track indices for both providers independently
+current_key_index = 0
+current_or_key_index = 0
+
+import os
+import io
+import base64
+import asyncio
+import requests
+
+# Track indices for all three providers independently
+current_key_index = 0
+current_or_key_index = 0
+current_poll_key_index = 0
+
+# =====================================================================
+# MODEL FALLBACK CASCADES (TRIPLE-PROVIDER TITANIUM SHIELD)
+# =====================================================================
+ULTIMATE_FALLBACK = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite-preview-02-05",
+    "nvidia/nemotron-nano-12b-v2-vl:free",      # OpenRouter
+    "cohere/north-mini-code:free",              # OpenRouter
+    "google/gemma-4-31b-it:free",               # OpenRouter
+    "pollinations/openai",                      # Pollinations AI (GPT-4o proxy)
+    "pollinations/gpt-oss",                     # Pollinations AI (Open Source fallback)
+    "openrouter/free"                           # OpenRouter auto-routing
+]
+
+MODEL_TIERS = {
+    "CODING": ULTIMATE_FALLBACK,
+    "MCQ": ULTIMATE_FALLBACK,
+    "SQL": ULTIMATE_FALLBACK,
+    "BEHAVIORAL": ULTIMATE_FALLBACK,
+    "VISUAL": ULTIMATE_FALLBACK,
+    "AUDIO": ULTIMATE_FALLBACK
+}
+
+DEFAULT_FALLBACK = ULTIMATE_FALLBACK
+
+# =====================================================================
+# AI ROUTER WITH TRIPLE CROSS-PROVIDER FAILOVER
+# =====================================================================
 async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None):
-    global current_key_index
+    global current_key_index, current_or_key_index, current_poll_key_index
     cascade_models = MODEL_TIERS.get(task_type, DEFAULT_FALLBACK)
     prompt = build_prompt(task_type)
     
-    full_contents = [prompt] + (contents if isinstance(contents, list) else [contents])
+    # 1. Parse Gemini keys array
+    google_keys = user_config.get("api_keys", [])
+    if not google_keys:
+        env_gkeys = os.getenv("GEMINI_API_KEY", "")
+        google_keys = [k.strip() for k in env_gkeys.split(",") if k.strip()]
+    total_g_keys = max(1, len(google_keys))
+
+    # 2. Parse OpenRouter keys array
+    env_orkeys = os.getenv("OPENROUTER_API_KEY", "")
+    or_keys = [k.strip() for k in env_orkeys.split(",") if k.strip()]
+    total_or_keys = max(1, len(or_keys))
+
+    # 3. Parse Pollinations keys array
+    env_pollkeys = os.getenv("POLLINATIONS_API_KEY", "")
+    poll_keys = [k.strip() for k in env_pollkeys.split(",") if k.strip()]
+    total_poll_keys = max(1, len(poll_keys))
     
-    total_keys = len(user_config.get("api_keys", []))
-    if total_keys == 0: total_keys = 1
+    # Extract images and text strings from contents
+    images = [c for c in contents if hasattr(c, 'convert')] if isinstance(contents, list) else []
+    text_parts = [c for c in contents if isinstance(c, str)] if isinstance(contents, list) else [contents]
+    full_text_prompt = prompt + "\n" + "\n".join(text_parts)
     
     for model_name in cascade_models:
-        for _ in range(max(1, total_keys)):
-            try:
-                client = get_genai_client(custom_key)
-                print(f"[🤖 ROUTER] Attempting task '{task_type}' on model: {model_name} (Key #{current_key_index + 1})")
-                
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=full_contents
-                )
-                
-                if response and response.text:
-                    print(f"[✅ SUCCESS] Handled by model: {model_name}")
-                    return response.text.strip(), model_name
+        is_openrouter = "/" in model_name and not model_name.startswith("pollinations/")
+        is_pollinations = model_name.startswith("pollinations/")
+        
+        # ---------------------------------------------------------
+        # TIER 1: NATIVE GOOGLE MODEL ROTATION
+        # ---------------------------------------------------------
+        if not is_openrouter and not is_pollinations:
+            for _ in range(total_g_keys):
+                actual_key_number = (current_key_index % total_g_keys) + 1
+                try:
+                    client = get_genai_client(custom_key)
+                    print(f"[🤖 GOOGLE ROUTER] Task '{task_type}' on model: {model_name} (Key #{actual_key_number})")
                     
-            except Exception as e:
-                error_msg = str(e)
-                if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                    print(f"[⚠️ RATE LIMIT HIT] Key #{current_key_index + 1} exhausted on {model_name}. Swapping keys...")
-                    if total_keys > 1:
-                        current_key_index += 1
-                        await asyncio.sleep(0.1)
-                        continue
+                    full_contents = [prompt] + (contents if isinstance(contents, list) else [contents])
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=full_contents
+                    )
                     
-                print(f"[⚠️ FAILOVER] Model {model_name} failed: {error_msg}. Cascading to next model...")
-                await asyncio.sleep(0.2)
-                break 
+                    if response and response.text:
+                        print(f"[✅ SUCCESS] Handled by Google: {model_name}")
+                        return response.text.strip(), model_name
+                        
+                except Exception as e:
+                    error_msg = str(e)
+                    if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                        print(f"[⚠️ RATE LIMIT] Gemini Key #{actual_key_number} exhausted. Swapping...")
+                        if total_g_keys > 1:
+                            current_key_index += 1
+                            await asyncio.sleep(0.1)
+                            continue
+                        
+                    print(f"[⚠️ GOOGLE FAILOVER] {model_name} failed: {error_msg}. Cascading...")
+                    await asyncio.sleep(0.2)
+                    break 
+                    
+        # ---------------------------------------------------------
+        # TIER 2 & 3: EXTERNAL ROUTING (OPENROUTER & POLLINATIONS)
+        # ---------------------------------------------------------
+        else:
+            # Determine which external provider we are targeting
+            if is_pollinations:
+                active_keys = poll_keys
+                total_ext_keys = total_poll_keys
+                provider_name = "Pollinations AI"
+                base_url = "https://gen.pollinations.ai/v1/chat/completions"
+                # Strip the routing prefix to pass the actual model name (e.g., "openai")
+                api_model_name = model_name.replace("pollinations/", "")
+            else:
+                active_keys = or_keys
+                total_ext_keys = total_or_keys
+                provider_name = "OpenRouter"
+                base_url = "https://openrouter.ai/api/v1/chat/completions"
+                api_model_name = model_name
 
-    raise RuntimeError(f"All models in cascade for task '{task_type}' failed.")
+            if not active_keys:
+                print(f"[⚠️ SKIP] Skipping {model_name}: No API key found for {provider_name} in .env")
+                continue
+                
+            for _ in range(total_ext_keys):
+                # Handle correct index rotation based on the provider
+                if is_pollinations:
+                    actual_ext_number = (current_poll_key_index % total_ext_keys) + 1
+                    active_key = active_keys[current_poll_key_index % total_ext_keys]
+                else:
+                    actual_ext_number = (current_or_key_index % total_ext_keys) + 1
+                    active_key = active_keys[current_or_key_index % total_ext_keys]
+                
+                try:
+                    print(f"[🌐 EXTERNAL ROUTER] Task '{task_type}' on {provider_name}: {model_name} (Key #{actual_ext_number})")
+                    
+                    # Both providers use exact same OpenAI-compatible payload structure
+                    messages_content = [{"type": "text", "text": full_text_prompt}]
+                    
+                    for img in images:
+                        buffered = io.BytesIO()
+                        img.convert("RGB").save(buffered, format="JPEG")
+                        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                        messages_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}
+                        })
+
+                    headers = {
+                        "Authorization": f"Bearer {active_key}",
+                        "Content-Type": "application/json"
+                    }
+                    payload = {
+                        "model": api_model_name,
+                        "messages": [{"role": "user", "content": messages_content}]
+                    }
+                    
+                    response = await asyncio.to_thread(
+                        requests.post, 
+                        base_url, 
+                        headers=headers, 
+                        json=payload,
+                        timeout=15
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    answer_text = data["choices"][0]["message"]["content"]
+                    if answer_text:
+                        print(f"[✅ SUCCESS] Handled externally by: {model_name}")
+                        return answer_text.strip(), model_name
+                        
+                except Exception as e:
+                    error_msg = str(e)
+                    if "429" in error_msg:
+                        print(f"[⚠️ RATE LIMIT] {provider_name} Key #{actual_ext_number} exhausted. Swapping keys...")
+                        if total_ext_keys > 1:
+                            if is_pollinations:
+                                current_poll_key_index += 1
+                            else:
+                                current_or_key_index += 1
+                            await asyncio.sleep(0.1)
+                            continue
+                            
+                    print(f"[⚠️ EXTERNAL FAILOVER] {provider_name} model {model_name} failed: {e}. Cascading...")
+                    await asyncio.sleep(0.2)
+                    break
+
+    raise RuntimeError(f"All models across all three providers (Google, OpenRouter, Pollinations) failed for task '{task_type}'.")
 
 def get_first_inner_code_line(code_text: str) -> int:
     lines = code_text.split('\n')
@@ -437,17 +618,18 @@ async def classify_intent(transcript, custom_key=None):
     classifier_model = "gemini-1.5-flash-8b" 
     
     prompt = f"""
-    Analyze the following user input and categorize it into EXACTLY ONE of the following tags:
-    [BEHAVIORAL] - For questions about experience, past situations, soft skills, or "tell me about yourself".
-    [CODING] - For algorithmic problems, data structures, debugging, or writing functions.
-    [SQL] - For database queries, joins, or table schema questions.
-    [MCQ] - For multiple choice questions or identifying the correct option from a list.
-    [GENERAL] - For general technical trivia or anything that doesn't fit above.
+Analyze the following user input and categorize it into EXACTLY ONE of the following tags:
+[BEHAVIORAL] - For questions about experience, past situations, or soft skills.
+[CODING] - For algorithmic problems, data structures, or code repository tasks.
+[WORK_SIMULATION] - For scenario-based questions about trade-offs, project timelines, or colleague interactions.
+[WORK_STYLE] - For personality sliders or "how do you approach work" statements.
+[SQL] - For database queries.
+[GENERAL] - For technical trivia or anything that doesn't fit above.
 
-    USER INPUT: "{transcript}"
+USER INPUT: "{transcript}"
 
-    OUTPUT ONLY THE TAG INSIDE BRACKETS. DO NOT OUTPUT ANY OTHER TEXT.
-    """
+OUTPUT ONLY THE TAG INSIDE BRACKETS. DO NOT OUTPUT ANY OTHER TEXT.
+"""
     
     try:
         response = client.models.generate_content(
