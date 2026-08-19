@@ -6,41 +6,43 @@ import asyncio
 import threading
 import time
 import websockets
+import base64
+import requests
+import keyboard
 from PIL import ImageGrab
 import pyaudiowpatch as pyaudio
 import speech_recognition as sr
 from google import genai
 from pypdf import PdfReader
 from dotenv import load_dotenv
-import keyboard
-import requests
-import base64
+from supabase import create_client, Client
 
 load_dotenv()
 
 # =====================================================================
-# MODEL FALLBACK CASCADES (Sanitized for Multimodal Free-Tier Stability)
+# SUPABASE CLOUD CONFIGURATION
+# =====================================================================
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
+    print("[⚠️ WARNING] Supabase credentials missing from .env. Cloud uploads will fail.")
+
+# =====================================================================
+# MODEL FALLBACK CASCADES (TRIPLE-PROVIDER TITANIUM SHIELD)
 # =====================================================================
 ULTIMATE_FALLBACK = [
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-omni-flash-preview",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-3-flash-preview",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-001",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash-lite-001",
-    "gemini-flash-latest",
-    "gemini-flash-lite-latest"
-    "nvidia/nemotron-nano-12b-v2-vl:free",      # Nvidia's free Vision-Language model
-    "cohere/north-mini-code:free",              # Cohere's dedicated coding model
-    "google/gemma-4-31b-it:free",               # Gemma 31B instruction-tuned
-    "openai/gpt-oss-20b:free",                  # Free GPT endpoint
+    "gemini-2.0-flash-lite-preview-02-05",
+    "nvidia/nemotron-nano-12b-v2-vl:free",      # OpenRouter
+    "cohere/north-mini-code:free",              # OpenRouter
+    "google/gemma-4-31b-it:free",               # OpenRouter
+    "pollinations/openai",                      # Pollinations AI (GPT-4o proxy)
+    "pollinations/gpt-oss",                     # Pollinations AI (Open Source fallback)
     "openrouter/free"                           # Dynamic auto-routing free tier
 ]
 
@@ -68,9 +70,14 @@ user_config = {
 is_recording = False
 stop_recording_event = threading.Event()
 current_mode = "AUTO"
+current_session_code = ""  # 🛡️ Tracks the active UI session for cloud uploads
 hooks_registered = False
 connected_clients = set()
+
+# Track indices for all three providers independently
 current_key_index = 0
+current_or_key_index = 0
+current_poll_key_index = 0
 
 def get_genai_client(custom_key=None):
     """Instantiates Gemini client using the current active key in the rotation pool."""
@@ -97,9 +104,10 @@ async def broadcast_to_ui(message_dict):
             pass
 
 # =====================================================================
-# MULTI-SHOT SCREEN BATCHING (Double Tab -> Enter)
+# MULTI-SHOT SCREEN BATCHING (Double Tab OR Double Minus -> Enter)
 # =====================================================================
 tab_presses = []
+minus_presses = []
 cooldown_until = 0
 screenshot_buffer = []
 
@@ -110,26 +118,33 @@ def setup_keyboard_hooks(main_loop):
         return
     hooks_registered = True
     
+    def handle_double_tap(press_history, key_name):
+        global cooldown_until
+        now = time.time()
+        if now < cooldown_until:
+            return
+            
+        press_history.append(now)
+        if len(press_history) > 2:
+            press_history.pop(0)
+            
+        if len(press_history) == 2 and (press_history[1] - press_history[0] <= 0.5):
+            print(f"DOUBLE {key_name.upper()} DETECTED! Buffering screenshot...")
+            press_history.clear()
+            cooldown_until = now + 1.0 
+            
+            asyncio.run_coroutine_threadsafe(
+                buffer_screenshot(), 
+                main_loop
+            )
+
     def on_tab(event):
-        global tab_presses, cooldown_until
         if event.event_type == 'down':
-            now = time.time()
-            if now < cooldown_until:
-                return
-                
-            tab_presses.append(now)
-            if len(tab_presses) > 2:
-                tab_presses.pop(0)
-                
-            if len(tab_presses) == 2 and (tab_presses[1] - tab_presses[0] <= 0.5):
-                print("DOUBLE TAB DETECTED! Buffering screenshot...")
-                tab_presses.clear()
-                cooldown_until = now + 1.0 
-                
-                asyncio.run_coroutine_threadsafe(
-                    buffer_screenshot(), 
-                    main_loop
-                )
+            handle_double_tap(tab_presses, "tab")
+
+    def on_minus(event):
+        if event.event_type == 'down':
+            handle_double_tap(minus_presses, "minus (-)")
 
     def on_enter(event):
         global screenshot_buffer, cooldown_until, current_mode
@@ -140,7 +155,7 @@ def setup_keyboard_hooks(main_loop):
                     return
                 cooldown_until = now + 3.0
                 
-                print(f"ENTER DETECTED! Sending {len(screenshot_buffer)} batched screenshot(s) to AI...")
+                print(f"ENTER DETECTED! Sending {len(screenshot_buffer)} batched screenshot(s) to CLOUD...")
                 asyncio.run_coroutine_threadsafe(
                     execute_screenshot_batch(requested_mode=current_mode),
                     main_loop
@@ -162,7 +177,9 @@ def setup_keyboard_hooks(main_loop):
                 main_loop
             )
 
+    # Register both Tab and Minus key hooks
     keyboard.hook_key('tab', on_tab)
+    keyboard.hook_key('-', on_minus)
     keyboard.hook_key('enter', on_enter)
     keyboard.hook_key('up', on_up)
     keyboard.hook_key('down', on_down)
@@ -184,47 +201,79 @@ async def buffer_screenshot():
         
         await broadcast_to_ui({
             "status": "loading",
-            "transcript": f"📸 Buffered {len(screenshot_buffer)} screenshot(s). Scroll & Double-Tab again, or press [ENTER] to solve..."
+            "transcript": f"📸 Buffered {len(screenshot_buffer)} screenshot(s). Scroll & Double-Tab again, or press [ENTER] to upload..."
         })
     except Exception as e:
         print(f"Failed to buffer screenshot: {e}")
 
+# 🛡️ THE NEW CLOUD UPLOAD THREAD
+def sync_upload_batch(images, session_code, batch_id):
+    """Executes blocking Supabase uploads on a background thread to prevent UI freezing."""
+    for idx, img in enumerate(images):
+        # Convert image to raw bytes
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='JPEG', quality=80)
+        img_bytes = img_byte_arr.getvalue()
+        
+        # Define secure path in bucket
+        file_name = f"{session_code}/{batch_id}_{idx}.jpg"
+        
+        # Upload to Storage
+        supabase.storage.from_("captures").upload(
+            file=img_bytes,
+            path=file_name,
+            file_options={"content-type": "image/jpeg"}
+        )
+        
+        # Retrieve Public URL
+        public_url = supabase.storage.from_("captures").get_public_url(file_name)
+        
+        # Inject into Database for Friend Dashboard to fetch
+        supabase.table("copilot_sessions").insert({
+            "session_code": session_code,
+            "batch_id": batch_id,
+            "image_url": public_url
+        }).execute()
+
 async def execute_screenshot_batch(requested_mode="AUTO"):
-    global screenshot_buffer
+    global screenshot_buffer, current_session_code
     
     if not screenshot_buffer:
         return
         
-    print(f"\n[📸 SCREEN CAPTURE BATCH TRIGGERED: {len(screenshot_buffer)} Images]")
+    if not supabase or not current_session_code:
+        await broadcast_to_ui({
+            "status": "error", 
+            "data": "// CRITICAL ERROR: Supabase keys missing or Session Code not linked.\n// Check .env and UI connection."
+        })
+        screenshot_buffer.clear()
+        return
+
+    print(f"\n[☁️ CLOUD UPLOAD INITIATED: {len(screenshot_buffer)} Images]")
     await broadcast_to_ui({
         "status": "loading", 
-        "transcript": f"Analyzing {len(screenshot_buffer)} buffered screenshot(s)..."
+        "transcript": f"Transmitting {len(screenshot_buffer)} screenshot(s) to Overseer..."
     })
     
     try:
-        task_type = "VISUAL" if requested_mode == "AUTO" else requested_mode
-        
         images_to_process = screenshot_buffer.copy()
         screenshot_buffer.clear()
         
-        contents = images_to_process + ["Analyze these images together as one continuous problem. Provide the exact solution according to the system prompt instructions."]
+        batch_id = f"batch_{int(time.time())}"
         
-        answer, resolved_model = await execute_cascade_query(
-            contents=contents,
-            task_type=task_type
-        )
-        
-        target_line = get_first_inner_code_line(answer)
+        # Offload synchronous network calls to background thread
+        await asyncio.to_thread(sync_upload_batch, images_to_process, current_session_code, batch_id)
         
         await broadcast_to_ui({
             "status": "success", 
-            "data": answer,
-            "transcript": f"Batch Solved ({len(images_to_process)} images) | Model: {resolved_model} | Mode: {task_type}",
-            "active_line": target_line
+            "data": "// ☁️ Transmission Successful.\n// Awaiting manual override from Overseer Terminal...",
+            "transcript": f"✅ {len(images_to_process)} image(s) delivered. Awaiting reply...",
+            "active_line": 1
         })
     except Exception as e:
         screenshot_buffer.clear()
-        await broadcast_to_ui({"status": "error", "data": str(e)})
+        await broadcast_to_ui({"status": "error", "data": f"Upload Failed: {str(e)}"})
+
 
 # =====================================================================
 # SYSTEM PROMPT BUILDER (STRICT MODE)
@@ -325,50 +374,6 @@ TASK: GENERAL TECHNICAL / INTERVIEW QUESTION
 OUTPUT FORMAT:
 Give the direct, raw answer. No filler.
 """
-
-# =====================================================================
-# AI ROUTER WITH API KEY ROTATION & CASCADE FAILOVER
-# =====================================================================
-# Track indices for both providers independently
-current_key_index = 0
-current_or_key_index = 0
-
-import os
-import io
-import base64
-import asyncio
-import requests
-
-# Track indices for all three providers independently
-current_key_index = 0
-current_or_key_index = 0
-current_poll_key_index = 0
-
-# =====================================================================
-# MODEL FALLBACK CASCADES (TRIPLE-PROVIDER TITANIUM SHIELD)
-# =====================================================================
-ULTIMATE_FALLBACK = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite-preview-02-05",
-    "nvidia/nemotron-nano-12b-v2-vl:free",      # OpenRouter
-    "cohere/north-mini-code:free",              # OpenRouter
-    "google/gemma-4-31b-it:free",               # OpenRouter
-    "pollinations/openai",                      # Pollinations AI (GPT-4o proxy)
-    "pollinations/gpt-oss",                     # Pollinations AI (Open Source fallback)
-    "openrouter/free"                           # OpenRouter auto-routing
-]
-
-MODEL_TIERS = {
-    "CODING": ULTIMATE_FALLBACK,
-    "MCQ": ULTIMATE_FALLBACK,
-    "SQL": ULTIMATE_FALLBACK,
-    "BEHAVIORAL": ULTIMATE_FALLBACK,
-    "VISUAL": ULTIMATE_FALLBACK,
-    "AUDIO": ULTIMATE_FALLBACK
-}
-
-DEFAULT_FALLBACK = ULTIMATE_FALLBACK
 
 # =====================================================================
 # AI ROUTER WITH TRIPLE CROSS-PROVIDER FAILOVER
@@ -707,7 +712,7 @@ async def handle_audio_workflow(websocket):
 # WEBSOCKET SERVER & CONFIG PROTOCOL
 # =====================================================================
 async def ws_handler(websocket):
-    global is_recording, stop_recording_event, current_mode
+    global is_recording, stop_recording_event, current_mode, current_session_code
     
     connected_clients.add(websocket)
     print(f"\n[🌐 REACT UI CONNECTED] Total Active Clients: {len(connected_clients)}")
@@ -719,7 +724,12 @@ async def ws_handler(websocket):
             payload = json.loads(message)
             action = payload.get("action")
             
-            if action == "set_mode":
+            # 🛡️ STORES THE 6-DIGIT SESSION CODE WHEN UI CONNECTS
+            if action == "set_session":
+                current_session_code = payload.get("session_code", "")
+                print(f"[🔗 SESSION LINKED] Assigned Code: {current_session_code}")
+                
+            elif action == "set_mode":
                 current_mode = payload.get("mode", "AUTO")
                 
             elif action == "capture_screen":
@@ -733,6 +743,25 @@ async def ws_handler(websocket):
                     asyncio.create_task(handle_audio_workflow(websocket))
                 else:
                     stop_recording_event.set()
+                    
+            # 🛡️ THE NEW TEXT QUERY HANDLER (For AI overrides from React)
+            elif action == "text_query":
+                query_text = payload.get("text", "")
+                if query_text:
+                    async def process_text():
+                        await broadcast_to_ui({"status": "loading", "transcript": f"🤖 AI Processing: {query_text}"})
+                        try:
+                            answer, resolved_model = await execute_cascade_query(contents=query_text, task_type=current_mode)
+                            target_line = get_first_inner_code_line(answer)
+                            await broadcast_to_ui({
+                                "status": "success", 
+                                "data": answer, 
+                                "transcript": f"🤖 Solved by: {resolved_model}", 
+                                "active_line": target_line
+                            })
+                        except Exception as e:
+                            await broadcast_to_ui({"status": "error", "data": str(e)})
+                    asyncio.create_task(process_text())
                     
             elif action == "update_config":
                 if "api_key" in payload and payload["api_key"]:
