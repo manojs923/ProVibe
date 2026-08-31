@@ -9,7 +9,8 @@ import websockets
 import base64
 import requests
 import keyboard
-from PIL import ImageGrab
+import binascii
+from PIL import ImageGrab, Image
 import pyaudiowpatch as pyaudio
 import speech_recognition as sr
 from google import genai
@@ -18,6 +19,18 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 load_dotenv()
+
+# =====================================================================
+# SYSTEM & SECURITY CONFIGURATION
+# =====================================================================
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+
+if REQUIRE_AUTH and not AUTH_TOKEN:
+    raise ValueError("CRITICAL ERROR: REQUIRE_AUTH is true but AUTH_TOKEN is missing. Refusing to start unauthenticated production server.")
+
+ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [orig.strip() for orig in ALLOWED_ORIGINS_ENV.split(",") if orig.strip()] if ALLOWED_ORIGINS_ENV else None
 
 # =====================================================================
 # SUPABASE CLOUD CONFIGURATION
@@ -58,46 +71,57 @@ MODEL_TIERS = {
 DEFAULT_FALLBACK = ULTIMATE_FALLBACK
 
 # =====================================================================
-# GLOBAL STATE & USER VAULT (WITH KEY ROTATION)
+# GLOBAL STATE & MULTI-TENANT SESSION MANAGEMENT
 # =====================================================================
 env_keys = [k.strip() for k in os.getenv("GEMINI_API_KEY", "").split(",") if k.strip()]
 
-user_config = {
-    "api_keys": env_keys,
-    "resume_context": "Candidate has experience in Software Engineering, Data Structures, Algorithms, and System Design."
-}
+sessions_ws = {}          # session_code -> set of connected websocket clients
+session_states = {}       # session_code -> isolated state data for that session
+local_active_session = "" # Tracks the primary local desktop session for hardware hooks
 
-is_recording = False
-stop_recording_event = threading.Event()
-current_mode = "AUTO"
-current_session_code = ""  # 🛡️ Tracks the active UI session for cloud uploads
 hooks_registered = False
-connected_clients = set()
 
-# Track indices for all three providers independently
+# Track indices for all three providers independently (Globally load-balanced)
 current_key_index = 0
 current_or_key_index = 0
 current_poll_key_index = 0
 
-def get_genai_client(custom_key=None):
+def get_session_state(session_code):
+    """Retrieves or initializes the isolated state for a specific room/session."""
+    if session_code not in session_states:
+        session_states[session_code] = {
+            "buffer": [],
+            "mode": "AUTO",
+            "is_recording": False,
+            "stop_recording_event": threading.Event(),
+            "config": {
+                "api_keys": env_keys.copy(),
+                "resume_context": "Candidate has experience in Software Engineering, Data Structures, Algorithms, and System Design."
+            }
+        }
+    return session_states[session_code]
+
+def get_genai_client(keys, custom_key=None):
     """Instantiates Gemini client using the current active key in the rotation pool."""
     global current_key_index
     if custom_key:
         return genai.Client(api_key=custom_key)
         
-    keys = user_config.get("api_keys", [])
     if not keys:
         raise ValueError("No Gemini API key provided. Paste one (or more, comma-separated) in the Vault.")
     
     active_key = keys[current_key_index % len(keys)]
     return genai.Client(api_key=active_key)
 
-async def broadcast_to_ui(message_dict):
-    """Safely broadcasts a message to all open React windows to beat Strict Mode."""
-    if not connected_clients:
+async def broadcast_to_ui(message_dict, session_code=None):
+    """Safely broadcasts a message only to clients within the same session/room."""
+    if not session_code:
+        session_code = local_active_session
+    if not session_code or session_code not in sessions_ws:
         return
+        
     msg = json.dumps(message_dict)
-    for ws in list(connected_clients):
+    for ws in list(sessions_ws[session_code]):
         try:
             await ws.send(msg)
         except Exception:
@@ -109,17 +133,16 @@ async def broadcast_to_ui(message_dict):
 tab_presses = []
 minus_presses = []
 cooldown_until = 0
-screenshot_buffer = []
 
 def setup_keyboard_hooks(main_loop):
-    """Registers keyboard hooks once globally to prevent memory leaks/crashes."""
+    """Registers keyboard hooks once globally for native local clients."""
     global hooks_registered
     if hooks_registered:
         return
     hooks_registered = True
     
     def handle_double_tap(press_history, key_name):
-        global cooldown_until
+        global cooldown_until, local_active_session
         now = time.time()
         if now < cooldown_until:
             return
@@ -134,7 +157,7 @@ def setup_keyboard_hooks(main_loop):
             cooldown_until = now + 1.0 
             
             asyncio.run_coroutine_threadsafe(
-                buffer_screenshot(), 
+                buffer_screenshot(local_active_session), 
                 main_loop
             )
 
@@ -147,45 +170,61 @@ def setup_keyboard_hooks(main_loop):
             handle_double_tap(minus_presses, "minus (-)")
 
     def on_enter(event):
-        global screenshot_buffer, cooldown_until, current_mode
+        global cooldown_until, local_active_session
         if event.event_type == 'down':
-            if len(screenshot_buffer) > 0:
+            session_code = local_active_session
+            if not session_code: return
+            state = get_session_state(session_code)
+            
+            if len(state["buffer"]) > 0:
                 now = time.time()
                 if now < cooldown_until:
                     return
                 cooldown_until = now + 3.0
                 
-                print(f"ENTER DETECTED! Sending {len(screenshot_buffer)} batched screenshot(s) to CLOUD...")
+                print(f"ENTER DETECTED! Sending {len(state['buffer'])} batched screenshot(s) to CLOUD & AI...")
                 asyncio.run_coroutine_threadsafe(
-                    execute_screenshot_batch(requested_mode=current_mode),
+                    execute_screenshot_batch(requested_mode=state["mode"], session_code=session_code),
                     main_loop
                 )
 
     def on_up(event):
+        global local_active_session
         if event.event_type == 'down':
             print("⬆️ GLOBAL UP DETECTED (Stealth scroll)")
             asyncio.run_coroutine_threadsafe(
-                broadcast_to_ui({"status": "nav_up"}),
+                broadcast_to_ui({"status": "nav_up"}, local_active_session),
                 main_loop
             )
 
     def on_down(event):
+        global local_active_session
         if event.event_type == 'down':
             print("⬇️ GLOBAL DOWN DETECTED (Stealth scroll)")
             asyncio.run_coroutine_threadsafe(
-                broadcast_to_ui({"status": "nav_down"}),
+                broadcast_to_ui({"status": "nav_down"}, local_active_session),
                 main_loop
             )
 
-    # Register both Tab and Minus key hooks
-    keyboard.hook_key('tab', on_tab)
-    keyboard.hook_key('-', on_minus)
-    keyboard.hook_key('enter', on_enter)
-    keyboard.hook_key('up', on_up)
-    keyboard.hook_key('down', on_down)
+    # Register both Tab and Minus key hooks safely isolated to OS
+    try:
+        keyboard.hook_key('tab', on_tab)
+        keyboard.hook_key('-', on_minus)
+        keyboard.hook_key('enter', on_enter)
+        keyboard.hook_key('up', on_up)
+        keyboard.hook_key('down', on_down)
+    except ImportError:
+        print("[⚠️ WARNING] Keyboard module requires root/admin or is not supported in this environment.")
+    except Exception as e:
+        print(f"[⚠️ WARNING] Could not bind global hotkeys (Cloud environment?): {e}")
 
-async def buffer_screenshot():
-    global screenshot_buffer
+async def buffer_screenshot(session_code=None):
+    if not session_code:
+        session_code = local_active_session
+    if not session_code: 
+        return
+        
+    state = get_session_state(session_code)
     try:
         img = ImageGrab.grab()
         img.thumbnail((1280, 1280))
@@ -197,93 +236,105 @@ async def buffer_screenshot():
         
         img.save(file_path, format="JPEG", quality=75)
         
-        screenshot_buffer.append(img)
+        state["buffer"].append(img)
         
         await broadcast_to_ui({
             "status": "loading",
-            "transcript": f"📸 Buffered {len(screenshot_buffer)} screenshot(s). Scroll & Double-Tab again, or press [ENTER] to upload..."
-        })
+            "transcript": f"📸 Buffered {len(state['buffer'])} screenshot(s). Scroll & Double-Tab again, or press [ENTER] to process..."
+        }, session_code)
     except Exception as e:
-        print(f"Failed to buffer screenshot: {e}")
+        error_msg = f"Failed to buffer screenshot (Headless environment?): {e}"
+        print(error_msg)
+        await broadcast_to_ui({"status": "error", "data": error_msg}, session_code)
 
 # 🛡️ THE NEW CLOUD UPLOAD THREAD
 def sync_upload_batch(images, session_code, batch_id):
     """Executes blocking Supabase uploads on a background thread to prevent UI freezing."""
+    if not supabase: return
     for idx, img in enumerate(images):
-        # Convert image to raw bytes
         img_byte_arr = io.BytesIO()
         img.save(img_byte_arr, format='JPEG', quality=80)
         img_bytes = img_byte_arr.getvalue()
         
-        # Define secure path in bucket
         file_name = f"{session_code}/{batch_id}_{idx}.jpg"
         
-        # Upload to Storage
         supabase.storage.from_("captures").upload(
             file=img_bytes,
             path=file_name,
             file_options={"content-type": "image/jpeg"}
         )
         
-        # Retrieve Public URL
         public_url = supabase.storage.from_("captures").get_public_url(file_name)
         
-        # Inject into Database for Friend Dashboard to fetch
         supabase.table("copilot_sessions").insert({
             "session_code": session_code,
             "batch_id": batch_id,
             "image_url": public_url
         }).execute()
 
-async def execute_screenshot_batch(requested_mode="AUTO"):
-    global screenshot_buffer, current_session_code
-    
-    if not screenshot_buffer:
+async def execute_screenshot_batch(requested_mode="AUTO", session_code=None):
+    """Handles Native Tauri screenshot batch: Syncs to cloud, then analyzes with existing AI pipeline."""
+    if not session_code:
+        session_code = local_active_session
+    if not session_code: 
         return
         
-    if not supabase or not current_session_code:
+    state = get_session_state(session_code)
+    
+    if not state["buffer"]:
+        return
+        
+    if not supabase:
         await broadcast_to_ui({
             "status": "error", 
-            "data": "// CRITICAL ERROR: Supabase keys missing or Session Code not linked.\n// Check .env and UI connection."
-        })
-        screenshot_buffer.clear()
+            "data": "// CRITICAL ERROR: Supabase keys missing. Cloud uploads will fail.\n// Check .env configuration."
+        }, session_code)
+        state["buffer"].clear()
         return
 
-    print(f"\n[☁️ CLOUD UPLOAD INITIATED: {len(screenshot_buffer)} Images]")
+    print(f"\n[☁️ UPLOAD & AI PROCESSING INITIATED: {len(state['buffer'])} Images for Session {session_code}]")
     await broadcast_to_ui({
         "status": "loading", 
-        "transcript": f"Transmitting {len(screenshot_buffer)} screenshot(s) to Overseer..."
-    })
+        "transcript": f"Transmitting & Analyzing {len(state['buffer'])} screenshot(s)..."
+    }, session_code)
     
     try:
-        images_to_process = screenshot_buffer.copy()
-        screenshot_buffer.clear()
+        images_to_process = state["buffer"].copy()
+        state["buffer"].clear()
         
         batch_id = f"batch_{int(time.time())}"
         
-        # Offload synchronous network calls to background thread
-        await asyncio.to_thread(sync_upload_batch, images_to_process, current_session_code, batch_id)
+        # 1. Offload synchronous network calls to background thread (Cloud Sync)
+        await asyncio.to_thread(sync_upload_batch, images_to_process, session_code, batch_id)
+        
+        # 2. Existing AI Pipeline Integration (Processes visual data directly)
+        answer, resolved_model = await execute_cascade_query(
+            contents=images_to_process,
+            task_type=requested_mode,
+            session_code=session_code
+        )
+        target_line = get_first_inner_code_line(answer)
         
         await broadcast_to_ui({
             "status": "success", 
-            "data": "// ☁️ Transmission Successful.\n// Awaiting manual override from Overseer Terminal...",
-            "transcript": f"✅ {len(images_to_process)} image(s) delivered. Awaiting reply...",
-            "active_line": 1
-        })
+            "data": answer,
+            "transcript": f"✅ Processed by: {resolved_model} (Cloud Synced)",
+            "active_line": target_line
+        }, session_code)
     except Exception as e:
-        screenshot_buffer.clear()
-        await broadcast_to_ui({"status": "error", "data": f"Upload Failed: {str(e)}"})
+        state["buffer"].clear()
+        await broadcast_to_ui({"status": "error", "data": f"Upload/Processing Failed: {str(e)}"}, session_code)
 
 
 # =====================================================================
 # SYSTEM PROMPT BUILDER (STRICT MODE)
 # =====================================================================
-def build_prompt(task_type="GENERAL"):
+def build_prompt(task_type="GENERAL", resume_context=""):
     base_rules = f"""
 You are a stealth live-assessment copilot acting directly for the candidate taking the Amazon SDE Online Assessment.
 CANDIDATE RESUME / BACKGROUND:
 \"\"\"
-{user_config['resume_context']}
+{resume_context}
 \"\"\"
 
 CRITICAL FRAMEWORK: 
@@ -378,13 +429,16 @@ Give the direct, raw answer. No filler.
 # =====================================================================
 # AI ROUTER WITH TRIPLE CROSS-PROVIDER FAILOVER
 # =====================================================================
-async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None):
+async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None, session_code=None):
     global current_key_index, current_or_key_index, current_poll_key_index
     cascade_models = MODEL_TIERS.get(task_type, DEFAULT_FALLBACK)
-    prompt = build_prompt(task_type)
     
-    # 1. Parse Gemini keys array
-    google_keys = user_config.get("api_keys", [])
+    # Retrieve session-specific resume config
+    state = get_session_state(session_code)
+    prompt = build_prompt(task_type, state["config"].get("resume_context", ""))
+    
+    # 1. Parse Gemini keys array (Session Specific falling back to Env)
+    google_keys = state["config"].get("api_keys", [])
     if not google_keys:
         env_gkeys = os.getenv("GEMINI_API_KEY", "")
         google_keys = [k.strip() for k in env_gkeys.split(",") if k.strip()]
@@ -416,8 +470,8 @@ async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None):
             for _ in range(total_g_keys):
                 actual_key_number = (current_key_index % total_g_keys) + 1
                 try:
-                    client = get_genai_client(custom_key)
-                    print(f"[🤖 GOOGLE ROUTER] Task '{task_type}' on model: {model_name} (Key #{actual_key_number})")
+                    client = get_genai_client(google_keys, custom_key)
+                    print(f"[🤖 GOOGLE ROUTER] Task '{task_type}' on model: {model_name} (Key #{actual_key_number}) for session {session_code}")
                     
                     full_contents = [prompt] + (contents if isinstance(contents, list) else [contents])
                     response = client.models.generate_content(
@@ -446,13 +500,11 @@ async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None):
         # TIER 2 & 3: EXTERNAL ROUTING (OPENROUTER & POLLINATIONS)
         # ---------------------------------------------------------
         else:
-            # Determine which external provider we are targeting
             if is_pollinations:
                 active_keys = poll_keys
                 total_ext_keys = total_poll_keys
                 provider_name = "Pollinations AI"
                 base_url = "https://gen.pollinations.ai/v1/chat/completions"
-                # Strip the routing prefix to pass the actual model name (e.g., "openai")
                 api_model_name = model_name.replace("pollinations/", "")
             else:
                 active_keys = or_keys
@@ -466,7 +518,6 @@ async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None):
                 continue
                 
             for _ in range(total_ext_keys):
-                # Handle correct index rotation based on the provider
                 if is_pollinations:
                     actual_ext_number = (current_poll_key_index % total_ext_keys) + 1
                     active_key = active_keys[current_poll_key_index % total_ext_keys]
@@ -475,9 +526,8 @@ async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None):
                     active_key = active_keys[current_or_key_index % total_ext_keys]
                 
                 try:
-                    print(f"[🌐 EXTERNAL ROUTER] Task '{task_type}' on {provider_name}: {model_name} (Key #{actual_ext_number})")
+                    print(f"[🌐 EXTERNAL ROUTER] Task '{task_type}' on {provider_name}: {model_name} (Key #{actual_ext_number}) for session {session_code}")
                     
-                    # Both providers use exact same OpenAI-compatible payload structure
                     messages_content = [{"type": "text", "text": full_text_prompt}]
                     
                     for img in images:
@@ -544,13 +594,12 @@ def get_first_inner_code_line(code_text: str) -> int:
 # =====================================================================
 # AUDIO RECORDING ENGINE
 # =====================================================================
-def record_audio_sync():
-    global stop_recording_event
+def record_audio_sync(stop_event):
     CHUNK = 4096
     MAX_SECONDS = 30
     
-    with pyaudio.PyAudio() as p:
-        try:
+    try:
+        with pyaudio.PyAudio() as p:
             wasapi_info = None
             try:
                 wasapi_info = p.get_default_wasapi_loopback()
@@ -584,7 +633,7 @@ def record_audio_sync():
             max_chunks = int(sample_rate / CHUNK * MAX_SECONDS)
             
             for _ in range(max_chunks):
-                if stop_recording_event.is_set():
+                if stop_event.is_set():
                     break
                 frames.append(stream.read(CHUNK))
                 
@@ -609,20 +658,19 @@ def record_audio_sync():
             
             return recognizer.recognize_google(audio_data, language="en-US")
             
-        except sr.UnknownValueError:
-            return "ERROR_NO_SPEECH"
-        except Exception as e:
-            print(f"Audio Error: {e}")
-            return "ERROR_SYSTEM"
+    except Exception as e:
+        print(f"Audio Error (Check if headless/cloud environment): {e}")
+        return "ERROR_SYSTEM"
 
 # =====================================================================
 # DYNAMIC INTENT CLASSIFIER
 # =====================================================================
-async def classify_intent(transcript, custom_key=None):
-    client = get_genai_client(custom_key)
-    classifier_model = "gemini-1.5-flash-8b" 
-    
-    prompt = f"""
+async def classify_intent(transcript, keys, custom_key=None):
+    try:
+        client = get_genai_client(keys, custom_key)
+        classifier_model = "gemini-1.5-flash-8b" 
+        
+        prompt = f"""
 Analyze the following user input and categorize it into EXACTLY ONE of the following tags:
 [BEHAVIORAL] - For questions about experience, past situations, or soft skills.
 [CODING] - For algorithmic problems, data structures, or code repository tasks.
@@ -635,8 +683,7 @@ USER INPUT: "{transcript}"
 
 OUTPUT ONLY THE TAG INSIDE BRACKETS. DO NOT OUTPUT ANY OTHER TEXT.
 """
-    
-    try:
+        
         response = client.models.generate_content(
             model=classifier_model,
             contents=[prompt]
@@ -657,44 +704,46 @@ OUTPUT ONLY THE TAG INSIDE BRACKETS. DO NOT OUTPUT ANY OTHER TEXT.
 # =====================================================================
 # WORKFLOW HANDLERS
 # =====================================================================
-async def handle_audio_workflow(websocket):
-    global is_recording, stop_recording_event
-    is_recording = True
-    stop_recording_event.clear()
+async def handle_audio_workflow(websocket, session_code):
+    state = get_session_state(session_code)
+    state["is_recording"] = True
+    state["stop_recording_event"].clear()
     
     await broadcast_to_ui({
         "status": "loading", 
         "transcript": "🔴 Intercepting system audio... Press [ALT+A] to finish."
-    })
+    }, session_code)
     
-    transcript = await asyncio.to_thread(record_audio_sync)
-    is_recording = False
+    transcript = await asyncio.to_thread(record_audio_sync, state["stop_recording_event"])
+    state["is_recording"] = False
     
     if transcript.startswith("ERROR"):
         await broadcast_to_ui({
             "status": "error", 
-            "data": "Could not process audio. Ensure system sound is playing."
-        })
+            "data": "Could not process audio. Ensure system sound is playing and environment supports loopback."
+        }, session_code)
         return
 
-    print(f"[🗣️ TRANSCRIBED]: {transcript}")
+    print(f"[🗣️ TRANSCRIBED (Session {session_code})]: {transcript}")
     
     await broadcast_to_ui({
         "status": "loading", 
         "transcript": f"Heard: '{transcript}'\nClassifying intent..."
-    })
+    }, session_code)
 
-    task_type = await classify_intent(transcript)
+    keys = state["config"].get("api_keys", [])
+    task_type = await classify_intent(transcript, keys)
     
     await broadcast_to_ui({
         "status": "loading", 
         "transcript": f"Heard: '{transcript}'\nRouting through [{task_type}] cascade..."
-    })
+    }, session_code)
 
     try:
         answer, resolved_model = await execute_cascade_query(
             contents=f"Interviewer asked: {transcript}",
-            task_type=task_type
+            task_type=task_type,
+            session_code=session_code
         )
         
         target_line = get_first_inner_code_line(answer)
@@ -704,84 +753,273 @@ async def handle_audio_workflow(websocket):
             "data": answer,
             "transcript": f"Heard: '{transcript}' | Solved by: {resolved_model}",
             "active_line": target_line
-        })
+        }, session_code)
     except Exception as e:
-        await broadcast_to_ui({"status": "error", "data": str(e)})
+        await broadcast_to_ui({"status": "error", "data": str(e)}, session_code)
 
 # =====================================================================
 # WEBSOCKET SERVER & CONFIG PROTOCOL
 # =====================================================================
 async def ws_handler(websocket):
-    global is_recording, stop_recording_event, current_mode, current_session_code
+    global local_active_session
     
-    connected_clients.add(websocket)
-    print(f"\n[🌐 REACT UI CONNECTED] Total Active Clients: {len(connected_clients)}")
-    
-    setup_keyboard_hooks(asyncio.get_running_loop())
+    session_code = None
+    client_type = None
     
     try:
+        client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
+    except Exception:
+        client_ip = "unknown"
+        
+    print(f"\n[🌐 NEW CONNECTION] From IP: {client_ip}")
+
+    try:
         async for message in websocket:
-            payload = json.loads(message)
+            # 1. MESSAGE VALIDATION
+            try:
+                payload = json.loads(message)
+                if not isinstance(payload, dict):
+                    raise ValueError("Payload must be a JSON object")
+            except (json.JSONDecodeError, ValueError):
+                print("[⚠️ WARNING] Received malformed JSON from client.")
+                await websocket.send(json.dumps({"status": "error", "data": "Malformed JSON payload."}))
+                continue
+                
             action = payload.get("action")
             
-            # 🛡️ STORES THE 6-DIGIT SESSION CODE WHEN UI CONNECTS
+            # 2. SESSION & AUTH INITIALIZATION
             if action == "set_session":
-                current_session_code = payload.get("session_code", "")
-                print(f"[🔗 SESSION LINKED] Assigned Code: {current_session_code}")
+                req_session_code = payload.get("session_code", "")
+                if not req_session_code or not isinstance(req_session_code, str):
+                    await websocket.send(json.dumps({"status": "error", "data": "Invalid session_code."}))
+                    continue
                 
-            elif action == "set_mode":
-                current_mode = payload.get("mode", "AUTO")
+                # Prevent session switching on an already bound socket
+                if session_code is not None and session_code != req_session_code:
+                    await websocket.send(json.dumps({"status": "error", "data": "Cannot switch sessions after authentication."}))
+                    continue
+                
+                # Verify Authentication if enabled for production deployment
+                if REQUIRE_AUTH:
+                    req_token = payload.get("auth_token", "")
+                    if not AUTH_TOKEN or req_token != AUTH_TOKEN:
+                        print(f"[⚠️ UNAUTHORIZED] Failed auth attempt for session {req_session_code}")
+                        await websocket.send(json.dumps({"status": "error", "data": "Unauthorized connection."}))
+                        continue
+                
+                # Set session code and client type ONLY after successful authorization
+                session_code = req_session_code
+                requested_client_type = payload.get("client_type", "browser")
+
+                if requested_client_type == "desktop":
+                    if not REQUIRE_AUTH:
+                        client_type = "desktop"
+                    else:
+                        client_type = "desktop" if payload.get("auth_token") == AUTH_TOKEN else "browser"
+                else:
+                    client_type = "browser"
+                
+                if session_code not in sessions_ws:
+                    sessions_ws[session_code] = set()
+                sessions_ws[session_code].add(websocket)
+                
+                # Only permit native hooks for explicitly authenticated desktop clients
+                if client_type == "desktop":
+                    local_active_session = session_code
+                    setup_keyboard_hooks(asyncio.get_running_loop())
+                    
+                print(f"[🔗 SESSION LINKED] Assigned Code: {session_code} | Type: {client_type.upper()} | Total sessions: {len(sessions_ws)}")
+                continue
+
+            # 3. AUTHORIZATION GUARD FOR ALL OTHER ACTIONS
+            if not session_code:
+                await websocket.send(json.dumps({"status": "error", "data": "Not authenticated. Send set_session first."}))
+                continue
+                
+            # Verify session scope to prevent cross-session execution
+            msg_session = payload.get("session_code", session_code)
+            if msg_session != session_code:
+                await websocket.send(json.dumps({"status": "error", "data": "Session mismatch boundary violation."}))
+                continue
+
+            # 4. ACTION ROUTING
+            if action == "set_mode":
+                get_session_state(session_code)["mode"] = payload.get("mode", "AUTO")
                 
             elif action == "capture_screen":
-                async def force_single_capture():
-                    await buffer_screenshot()
-                    await execute_screenshot_batch(payload.get("mode", "AUTO"))
-                asyncio.create_task(force_single_capture())
+                # NATIVE FUNCTIONALITY ISOLATION
+                if client_type != "desktop":
+                    await websocket.send(json.dumps({"status": "error", "data": "Action requires desktop client architecture."}))
+                    continue
+                    
+                state = get_session_state(session_code)
+                mode = payload.get("mode", state["mode"])
+                async def force_single_capture(s_code, m):
+                    await buffer_screenshot(s_code)
+                    await execute_screenshot_batch(m, s_code)
+                asyncio.create_task(force_single_capture(session_code, mode))
                 
             elif action == "toggle_audio":
-                if not is_recording:
-                    asyncio.create_task(handle_audio_workflow(websocket))
-                else:
-                    stop_recording_event.set()
+                # NATIVE FUNCTIONALITY ISOLATION
+                if client_type != "desktop":
+                    await websocket.send(json.dumps({"status": "error", "data": "Action requires desktop client architecture."}))
+                    continue
                     
-            # 🛡️ THE NEW TEXT QUERY HANDLER (For AI overrides from React)
+                state = get_session_state(session_code)
+                if not state["is_recording"]:
+                    asyncio.create_task(handle_audio_workflow(websocket, session_code))
+                else:
+                    state["stop_recording_event"].set()
+                    
             elif action == "text_query":
                 query_text = payload.get("text", "")
-                if query_text:
-                    async def process_text():
-                        await broadcast_to_ui({"status": "loading", "transcript": f"🤖 AI Processing: {query_text}"})
+                mode = get_session_state(session_code)["mode"]
+                if query_text and isinstance(query_text, str):
+                    async def process_text(text, m, s_code):
+                        await broadcast_to_ui({"status": "loading", "transcript": f"🤖 AI Processing: {text}"}, s_code)
                         try:
-                            answer, resolved_model = await execute_cascade_query(contents=query_text, task_type=current_mode)
+                            answer, resolved_model = await execute_cascade_query(contents=text, task_type=m, session_code=s_code)
                             target_line = get_first_inner_code_line(answer)
                             await broadcast_to_ui({
                                 "status": "success", 
                                 "data": answer, 
                                 "transcript": f"🤖 Solved by: {resolved_model}", 
                                 "active_line": target_line
-                            })
+                            }, s_code)
                         except Exception as e:
-                            await broadcast_to_ui({"status": "error", "data": str(e)})
-                    asyncio.create_task(process_text())
+                            await broadcast_to_ui({"status": "error", "data": str(e)}, s_code)
+                    asyncio.create_task(process_text(query_text, mode, session_code))
                     
+            elif action == "browser_image_upload":
+                image_data = payload.get("image_data")
+                mode = payload.get("mode", get_session_state(session_code)["mode"])
+
+                # Strict Validation
+                if not image_data or not isinstance(image_data, str) or not image_data.startswith("data:image/"):
+                    await websocket.send(json.dumps({"status": "error", "data": "Invalid or missing image data format."}))
+                    continue
+
+                async def process_browser_image(img_str, m, s_code):
+                    await broadcast_to_ui({"status": "loading", "transcript": "📸 Analyzing browser screen capture..."}, s_code)
+                    img = None
+                    try:
+                        # 1. Safely split data URL metadata from payload
+                        parts = img_str.split(",", 1)
+                        if len(parts) != 2:
+                            raise ValueError("Malformed data URL.")
+                        header, encoded = parts
+                        
+                        if not encoded:
+                            raise ValueError("Empty image payload.")
+
+                        # 2. Strict MIME type validation
+                        mime_type = header.split(";")[0].replace("data:", "")
+                        supported_mimes = ["image/jpeg", "image/png", "image/webp"]
+                        if mime_type not in supported_mimes:
+                            raise ValueError(f"Unsupported MIME type: {mime_type}. Expected JPEG, PNG, or WEBP.")
+                        
+                        # 3. Secure Base64 Decode with strict alphabet validation
+                        try:
+                            img_bytes = base64.b64decode(encoded, validate=True)
+                        except binascii.Error:
+                            raise ValueError("Invalid base64 encoding formatting.")
+
+                        # 4. Enforce resource limits (e.g., maximum 15MB payload)
+                        if len(img_bytes) > 15 * 1024 * 1024:
+                            raise ValueError("Image payload exceeds maximum allowed size (15MB).")
+
+                        # 5. Connect to existing AI visual processing pipeline
+                        img_io = io.BytesIO(img_bytes)
+                        img = Image.open(img_io)
+                        
+                        img_format = img.format
+                        # Force image loading/verification safely to catch truncation/corruption
+                        img.load()
+                        
+                        supported_formats = ["JPEG", "PNG", "WEBP", "MPO"]
+                        if img_format not in supported_formats:
+                            raise ValueError(f"Unsupported internal image format: {img_format}. Expected JPEG, PNG, or WEBP.")
+
+                        if img.mode != 'RGB':
+                            converted_img = img.convert('RGB')
+                            img.close()
+                            img = converted_img
+
+                        answer, resolved_model = await execute_cascade_query(contents=[img], task_type=m, session_code=s_code)
+                        target_line = get_first_inner_code_line(answer)
+
+                        await broadcast_to_ui({
+                            "status": "success",
+                            "data": answer,
+                            "transcript": f"🤖 Solved by: {resolved_model} (Browser Capture)",
+                            "active_line": target_line
+                        }, s_code)
+                        
+                    except Exception as e:
+                        # Log error securely without exposing base64 payload
+                        print(f"[⚠️ BROWSER IMAGE ERROR] Processing failed: {str(e)}")
+                        await broadcast_to_ui({"status": "error", "data": f"Failed to process browser image: {str(e)}"}, s_code)
+                    finally:
+                        # Memory Safety: Explicitly release heavy PIL Image resources
+                        if img is not None:
+                            img.close()
+
+                asyncio.create_task(process_browser_image(image_data, mode, session_code))
+
             elif action == "update_config":
-                if "api_key" in payload and payload["api_key"]:
-                    user_config["api_keys"] = [k.strip() for k in payload["api_key"].split(",") if k.strip()]
-                if "resume_text" in payload and payload["resume_text"]:
-                    user_config["resume_context"] = payload["resume_text"]
+                if REQUIRE_AUTH and client_type != "desktop":
+                    await websocket.send(json.dumps({
+                         "status": "error",
+                         "data": "Only the authorized desktop client can update session configuration."
+                    }))
+                    continue
+                state = get_session_state(session_code)
+                if "api_key" in payload and isinstance(payload["api_key"], str):
+                    state["config"]["api_keys"] = [k.strip() for k in payload["api_key"].split(",") if k.strip()]
+                if "resume_text" in payload and isinstance(payload["resume_text"], str):
+                    state["config"]["resume_context"] = payload["resume_text"]
                     
                 await broadcast_to_ui({
                     "status": "config_updated",
                     "data": "✅ Settings saved successfully! Vault & Resume updated."
-                })
+                }, session_code)
                 
     except websockets.exceptions.ConnectionClosed:
-        print("\n[⚠️ UI DISCONNECTED]")
+        print(f"\n[⚠️ UI DISCONNECTED] Session: {session_code}")
+    except Exception as e:
+        print(f"\n[⚠️ UNEXPECTED WEBSOCKET ERROR] {e}")
     finally:
-        connected_clients.remove(websocket)
+        # CONNECTION CLEANUP
+        if session_code and session_code in sessions_ws:
+            if websocket in sessions_ws[session_code]:
+                sessions_ws[session_code].remove(websocket)
+            
+            # Free unused isolated state spaces
+            if not sessions_ws[session_code]:
+                del sessions_ws[session_code]
+                if session_code in session_states:
+                    del session_states[session_code]
+                if local_active_session == session_code and client_type == "desktop":
+                    local_active_session = ""
 
 async def start_server():
-    print("✅ PROTOCOL V2 MULTI-MODEL ROUTER ACTIVE ON PORT 8765")
-    async with websockets.serve(ws_handler, "localhost", 8765):
+    # Make host and port configurable for Cloud Deployment & Reverse Proxies
+    host = os.getenv("WS_HOST", "127.0.0.1")
+    port = int(os.getenv("WS_PORT", 8765))
+    
+    print(f"✅ PROTOCOL V2 MULTI-MODEL ROUTER ACTIVE ON ws://{host}:{port}")
+    if REQUIRE_AUTH:
+         print("🔒 Authentication layer ENABLED for secure deployment.")
+    else:
+         print("🔓 Authentication layer DISABLED (Local Development Mode).")
+         
+    async with websockets.serve(
+        ws_handler, 
+        host, 
+        port, 
+        max_size=25 * 1024 * 1024,  # 25 MB max size for large browser images
+        origins=ALLOWED_ORIGINS
+    ):
         await asyncio.Future()
 
 if __name__ == "__main__":
