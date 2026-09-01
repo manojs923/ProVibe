@@ -122,7 +122,7 @@ export default function App() {
 
       // Allow production web builds to use a secure WSS endpoint
       const wsUrl = import.meta.env.VITE_WS_URL || "ws://localhost:8765";
-      const socket = new WebSocket(wsUrl);
+      const socket = new WebSocket("wss://protocol-i59x.onrender.com");
       wsRef.current = socket;
       
       socket.onopen = () => {
