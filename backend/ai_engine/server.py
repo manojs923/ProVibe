@@ -8,15 +8,26 @@ import time
 import websockets
 import base64
 import requests
-import keyboard
 import binascii
-from PIL import ImageGrab, Image
-import pyaudiowpatch as pyaudio
+from PIL import Image
 import speech_recognition as sr
 from google import genai
 from pypdf import PdfReader
 from dotenv import load_dotenv
 from supabase import create_client, Client
+
+# =====================================================================
+# CLOUD-SAFE NATIVE HOOKS
+# =====================================================================
+try:
+    import keyboard
+    from PIL import ImageGrab
+    import pyaudiowpatch as pyaudio
+except ImportError:
+    print("[☁️ CLOUD MODE] Native OS libraries skipped. Waiting for Tauri payloads...")
+    keyboard = None
+    ImageGrab = None
+    pyaudio = None
 
 load_dotenv()
 
@@ -1004,8 +1015,8 @@ async def ws_handler(websocket):
 
 async def start_server():
     # Make host and port configurable for Cloud Deployment & Reverse Proxies
-    host = os.getenv("WS_HOST", "127.0.0.1")
-    port = int(os.getenv("WS_PORT", 8765))
+    host = os.getenv("WS_HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", os.getenv("WS_PORT", "8765")))
     
     print(f"✅ PROTOCOL V2 MULTI-MODEL ROUTER ACTIVE ON ws://{host}:{port}")
     if REQUIRE_AUTH:

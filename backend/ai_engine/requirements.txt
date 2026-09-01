@@ -1,0 +1,8 @@
+websockets==12.0
+requests
+Pillow
+SpeechRecognition
+google-genai
+pypdf
+python-dotenv
+supabase
