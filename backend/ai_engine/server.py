@@ -34,7 +34,7 @@ load_dotenv()
 # =====================================================================
 # SYSTEM & SECURITY CONFIGURATION
 # =====================================================================
-REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() == "true"
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 
 if REQUIRE_AUTH and not AUTH_TOKEN:
