@@ -1016,18 +1016,20 @@ async def ws_handler(websocket):
 async def start_server():
     # Make host and port configurable for Cloud Deployment & Reverse Proxies
     host = os.getenv("WS_HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", os.getenv("WS_PORT", "8765")))
+    PORT = int(os.environ.get("PORT", 8765))
     
-    print(f"✅ PROTOCOL V2 MULTI-MODEL ROUTER ACTIVE ON ws://{host}:{port}")
+    # FIX: Changed {port} to {PORT} to match the variable name above
+    print(f"✅ PROTOCOL V2 MULTI-MODEL ROUTER ACTIVE ON ws://{host}:{PORT}")
+    
     if REQUIRE_AUTH:
          print("🔒 Authentication layer ENABLED for secure deployment.")
     else:
          print("🔓 Authentication layer DISABLED (Local Development Mode).")
          
     async with websockets.serve(
-        ws_handler, 
-        host, 
-        port, 
+        handler, 
+        "0.0.0.0", 
+        PORT,
         max_size=25 * 1024 * 1024,  # 25 MB max size for large browser images
         origins=ALLOWED_ORIGINS
     ):

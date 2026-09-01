@@ -1,10 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { createClient } from '@supabase/supabase-js';
 
-// 🛡️ SUPABASE CLOUD CONNECTION
-// Injected with your verified correct URL and Key from the Next.js setup!
-const SUPABASE_URL = "https://yfyiizovbhsddpmgduvs.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_NoyP-ECcNTrOdxc27CQdtw_9iopHIN9";
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error("CRITICAL ERROR: Supabase environment variables are missing!");
@@ -121,7 +119,7 @@ export default function App() {
       }
 
       // Allow production web builds to use a secure WSS endpoint
-      const wsUrl = import.meta.env.VITE_WS_URL || "ws://localhost:8765";
+      // const wsUrl = import.meta.env.VITE_WS_URL || "ws://localhost:8765";
       const socket = new WebSocket("wss://protocol-i59x.onrender.com");
       wsRef.current = socket;
       
