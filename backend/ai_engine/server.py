@@ -1027,7 +1027,7 @@ async def start_server():
          print("🔓 Authentication layer DISABLED (Local Development Mode).")
          
     async with websockets.serve(
-        handler, 
+        ws_handler, 
         "0.0.0.0", 
         PORT,
         max_size=25 * 1024 * 1024,  # 25 MB max size for large browser images
