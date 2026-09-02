@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { createClient } from '@supabase/supabase-js';
+import { invoke } from '@tauri-apps/api/core'; // 🛡️ Tauri IPC Link
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -118,8 +119,7 @@ export default function App() {
         return;
       }
 
-      // Allow production web builds to use a secure WSS endpoint
-      // const wsUrl = import.meta.env.VITE_WS_URL || "ws://localhost:8765";
+      // Deployed Render Cloud Endpoint
       const socket = new WebSocket("wss://protocol-i59x.onrender.com");
       wsRef.current = socket;
       
@@ -202,14 +202,36 @@ export default function App() {
     }
   }, [activeLine, response]);
 
-  // 4. MULTI-PLATFORM MEDIA & ACTION TRIGGERS
+  // 4. MULTI-PLATFORM MEDIA & ACTION TRIGGERS (NATIVE STEALTH HYBRID)
   const triggerScreenCapture = async () => {
     const mode = taskModeRef.current;
+    
     if (isTauri()) {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ action: "capture_screen", mode }));
+      try {
+        setStatus("CAPTURING...");
+        setTranscript("Executing stealth OS-level capture...");
+        
+        // Tells the Rust Backend to take the picture natively & return base64
+        const base64Image: string = await invoke("capture_screen_native");
+        const dataUrl = `data:image/jpeg;base64,${base64Image}`;
+        
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ 
+            action: "browser_image_upload", 
+            image_data: dataUrl,
+            mode: mode
+          }));
+        }
+        
+        setTranscript("Screen capture transmitted to cloud engine for processing.");
+        setStatus("READY");
+      } catch (err) {
+        console.error("Native Capture Error:", err);
+        setStatus("ERROR");
+        setTranscript("Stealth capture failed: " + err);
       }
     } else {
+      // Browser fallback (still has popups)
       let stream: MediaStream | null = null;
       try {
         setStatus("CAPTURING...");
@@ -233,7 +255,7 @@ export default function App() {
           }));
         }
         
-        setTranscript("Browser screen capture transmitted to backend for processing.");
+        setTranscript("Screen capture transmitted to cloud engine for processing.");
         setStatus("READY");
       } catch (err) {
         console.error(err);
@@ -318,10 +340,8 @@ export default function App() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
-  // 6. BROWSER KEYBOARD SHORTCUTS FALLBACK
+  // 6. GLOBAL KEYBOARD SHORTCUTS (ACTIVE IN BOTH BROWSER & TAURI)
   useEffect(() => {
-    if (isTauri()) return;
-
     const tabHistory: number[] = [];
     const minusHistory: number[] = [];
     let cooldown = 0;
@@ -355,14 +375,17 @@ export default function App() {
         history.push(now);
         if (history.length > 2) history.shift();
         if (history.length === 2 && history[1] - history[0] <= 500) {
-          setTranscript(`📸 Buffered screenshot via ${keyName} (Browser)... Press [ENTER] to capture`);
+          setTranscript(`📸 Buffered screenshot via ${keyName}... Press [ENTER] to capture`);
           history.length = 0;
           cooldown = now + 1000;
           (window as any).__browserBuffered = true;
         }
       };
 
-      if (e.key === 'Tab') trackDoubleTap(tabHistory, 'Tab');
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        trackDoubleTap(tabHistory, 'Tab');
+      }
       if (e.key === '-') trackDoubleTap(minusHistory, '-');
 
       if (e.key === 'Enter') {

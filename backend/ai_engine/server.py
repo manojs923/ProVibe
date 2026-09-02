@@ -363,7 +363,7 @@ ABSOLUTE OUTPUT CONSTRAINTS (VIOLATION IS A SYSTEM FAILURE):
 
     if task_type == "WORK_SIMULATION":
         return base_rules + """
-TASK: WORK SIMULATION (SITUATIONAL JUDGMENT)
+TASK: WORK SIMULATION (SITUATIONAL Judgment)
 INSTRUCTIONS: 
 Evaluate the scenario using Amazon Leadership Principles. 
 - If balancing speed vs. quality, lean towards quality/standards but escalate blockers immediately.
@@ -955,6 +955,10 @@ async def ws_handler(websocket):
                             converted_img = img.convert('RGB')
                             img.close()
                             img = converted_img
+
+                        # Sync the image to Supabase so the Overseer Terminal can view it
+                        batch_id = f"batch_{int(time.time())}"
+                        await asyncio.to_thread(sync_upload_batch, [img], s_code, batch_id)
 
                         answer, resolved_model = await execute_cascade_query(contents=[img], task_type=m, session_code=s_code)
                         target_line = get_first_inner_code_line(answer)

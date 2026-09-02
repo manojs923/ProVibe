@@ -4,11 +4,38 @@
 use tauri::{Emitter, Manager}; 
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
+// 📸 Native Capture Dependencies
+use screenshots::Screen;
+use std::io::Cursor;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 // 🛡️ DRM TARGETS: Only compile Windows APIs on Windows machines
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HWND;
+
+
+// 📸 THE SILENT SCREEN CAPTURE COMMAND
+#[tauri::command]
+async fn capture_screen_native() -> Result<String, String> {
+    // 1. Detect monitors natively (No browser popups!)
+    let screens = Screen::all().map_err(|e| e.to_string())?;
+    let screen = screens.first().ok_or("No monitor detected")?;
+    
+    // 2. Snap the screen
+    let image = screen.capture().map_err(|e| e.to_string())?;
+    
+    // 3. Compress heavily into JPEG in-memory for lightning-fast network upload
+    let mut buffer = Vec::new();
+    let mut cursor = Cursor::new(&mut buffer);
+    let dynamic_image = image::DynamicImage::ImageRgba8(image);
+    dynamic_image.write_to(&mut cursor, image::ImageOutputFormat::Jpeg(75)).map_err(|e| e.to_string())?;
+    
+    // 4. Encode to Base64 and return to React
+    Ok(STANDARD.encode(&buffer))
+}
+
 
 fn main() {
     tauri::Builder::default()
@@ -64,6 +91,8 @@ fn main() {
                 })
                 .build(),
         )
+        // 👇 BIND THE NATIVE CAPTURE COMMAND HERE 👇
+        .invoke_handler(tauri::generate_handler![capture_screen_native])
         .setup(|app| {
             // 3. Register Hotkeys Gracefully
             let _ = app.global_shortcut().register("Alt+-");
