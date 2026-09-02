@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from "react";
 import { createClient } from '@supabase/supabase-js';
-import { invoke } from '@tauri-apps/api/core'; // 🛡️ Tauri IPC Link
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -32,7 +31,7 @@ export default function App() {
   const [response, setResponse] = useState(
 `// 🛡️ PROTOCOL STEALTH SUITE INITIALIZED
 //
-// 📸 Double-Tab / Double-[-] : Capture & Upload to Cloud
+// 📸 Double-Tab / Double-[-] : Buffer Capture (Press Enter to send)
 // 🎙️ Alt+A                   : Record Audio
 // 👻 Alt+H                   : Hide / Unhide Window
 // ↕️ Alt+Up/Down             : Adjust UI Opacity`
@@ -107,7 +106,7 @@ export default function App() {
     };
   }, [sessionCode]);
 
-  // 3. WEBSOCKET HANDLER (PYTHON ENGINE) - ROBUST LIFECYCLE
+  // 3. WEBSOCKET HANDLER (PYTHON ENGINE)
   useEffect(() => {
     if (!sessionCode) return;
     let isMounted = true;
@@ -119,8 +118,8 @@ export default function App() {
         return;
       }
 
-      // Deployed Render Cloud Endpoint
-      const socket = new WebSocket("wss://protocol-i59x.onrender.com");
+      // LOCAL HOST RESTORED
+      const socket = new WebSocket("ws://127.0.0.1:8765");
       wsRef.current = socket;
       
       socket.onopen = () => {
@@ -202,70 +201,17 @@ export default function App() {
     }
   }, [activeLine, response]);
 
-  // 4. MULTI-PLATFORM MEDIA & ACTION TRIGGERS (NATIVE STEALTH HYBRID)
+  // 4. ACTION TRIGGERS (LOCAL BACKEND WEBSOCKET CALL)
   const triggerScreenCapture = async () => {
     const mode = taskModeRef.current;
     
-    if (isTauri()) {
-      try {
-        setStatus("CAPTURING...");
-        setTranscript("Executing stealth OS-level capture...");
-        
-        // Tells the Rust Backend to take the picture natively & return base64
-        const base64Image: string = await invoke("capture_screen_native");
-        const dataUrl = `data:image/jpeg;base64,${base64Image}`;
-        
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ 
-            action: "browser_image_upload", 
-            image_data: dataUrl,
-            mode: mode
-          }));
-        }
-        
-        setTranscript("Screen capture transmitted to cloud engine for processing.");
-        setStatus("READY");
-      } catch (err) {
-        console.error("Native Capture Error:", err);
-        setStatus("ERROR");
-        setTranscript("Stealth capture failed: " + err);
-      }
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      // Sends the signal to your local Python server to use ImageGrab
+      wsRef.current.send(JSON.stringify({ action: "capture_screen", mode }));
+      setTranscript("Snipe command sent to local engine...");
     } else {
-      // Browser fallback (still has popups)
-      let stream: MediaStream | null = null;
-      try {
-        setStatus("CAPTURING...");
-        stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-        const video = document.createElement('video');
-        video.srcObject = stream;
-        await video.play();
-        
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        canvas.getContext('2d')?.drawImage(video, 0, 0);
-        
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.8); 
-        
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ 
-            action: "browser_image_upload", 
-            image_data: dataUrl,
-            mode: mode
-          }));
-        }
-        
-        setTranscript("Screen capture transmitted to cloud engine for processing.");
-        setStatus("READY");
-      } catch (err) {
-        console.error(err);
-        setStatus("ERROR");
-        setTranscript("Screen capture permission denied or failed.");
-      } finally {
-        if (stream) {
-          stream.getTracks().forEach(t => t.stop());
-        }
-      }
+      setStatus("ERROR");
+      setTranscript("Backend disconnected. Ensure local Python server is running.");
     }
   };
 
@@ -340,7 +286,7 @@ export default function App() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
-  // 6. GLOBAL KEYBOARD SHORTCUTS (ACTIVE IN BOTH BROWSER & TAURI)
+  // 6. KEYBOARD SHORTCUTS WITH ENTER WAIT RESTORED
   useEffect(() => {
     const tabHistory: number[] = [];
     const minusHistory: number[] = [];
@@ -458,7 +404,6 @@ export default function App() {
             </span>
           </div>
           
-          {/* THE NEW SESSION CODE UI */}
           <div className="flex items-center gap-2 bg-slate-900 border border-slate-700 rounded pl-3 pr-1 py-0.5">
             <span className="text-[10px] font-bold text-slate-400">ID:</span>
             <span className="text-[11px] font-bold text-emerald-400 tracking-wider">{sessionCode || "GEN..."}</span>

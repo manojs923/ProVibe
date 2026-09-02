@@ -15,7 +15,6 @@ use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCL
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HWND;
 
-
 // 📸 THE SILENT SCREEN CAPTURE COMMAND
 #[tauri::command]
 async fn capture_screen_native() -> Result<String, String> {
@@ -35,7 +34,6 @@ async fn capture_screen_native() -> Result<String, String> {
     // 4. Encode to Base64 and return to React
     Ok(STANDARD.encode(&buffer))
 }
-
 
 fn main() {
     tauri::Builder::default()
@@ -57,6 +55,9 @@ fn main() {
                             k if k.contains("keyh") => "TOGGLE_VISIBILITY",
                             k if k.contains("arrowup") => "OPACITY_UP",
                             k if k.contains("arrowdown") => "OPACITY_DOWN",
+                            // 👇 NEW: GLOBAL STEALTH CAPTURE SHORTCUTS 👇
+                            k if k.contains("alt+s") => "TRIGGER_SNIPER",
+                            k if k.contains("alt+enter") => "TRIGGER_SNIPER", 
                             _ => "UNKNOWN_COMMAND",
                         };
 
@@ -75,7 +76,6 @@ fn main() {
                                         let _ = window.set_focus();
                                     }
                                 } else {
-                                    // For SUMMON_COPILOT, force the window open and steal focus
                                     let _ = window.show();
                                     let _ = window.set_focus();
                                 }
@@ -101,6 +101,10 @@ fn main() {
             let _ = app.global_shortcut().register("Alt+H");
             let _ = app.global_shortcut().register("Alt+Up");
             let _ = app.global_shortcut().register("Alt+Down");
+            
+            // 👇 REGISTER THE NEW GLOBAL CAPTURE KEYS 👇
+            let _ = app.global_shortcut().register("Alt+S");
+            let _ = app.global_shortcut().register("Alt+Enter");
 
             // 4. 🛡️ GOD-TIER FEATURE: OS-Level Screen Capture Evasion
             #[cfg(target_os = "windows")]
