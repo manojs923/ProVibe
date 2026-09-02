@@ -11,8 +11,6 @@ import requests
 import binascii
 from PIL import Image
 import speech_recognition as sr
-from google import genai
-from pypdf import PdfReader
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -56,46 +54,13 @@ else:
     print("[⚠️ WARNING] Supabase credentials missing from .env. Cloud uploads will fail.")
 
 # =====================================================================
-# MODEL FALLBACK CASCADES (TRIPLE-PROVIDER TITANIUM SHIELD)
-# =====================================================================
-ULTIMATE_FALLBACK = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite-preview-02-05",
-    "nvidia/nemotron-nano-12b-v2-vl:free",      # OpenRouter
-    "cohere/north-mini-code:free",              # OpenRouter
-    "google/gemma-4-31b-it:free",               # OpenRouter
-    "pollinations/openai",                      # Pollinations AI (GPT-4o proxy)
-    "pollinations/gpt-oss",                     # Pollinations AI (Open Source fallback)
-    "openrouter/free"                           # Dynamic auto-routing free tier
-]
-
-MODEL_TIERS = {
-    "CODING": ULTIMATE_FALLBACK,
-    "MCQ": ULTIMATE_FALLBACK,
-    "SQL": ULTIMATE_FALLBACK,
-    "BEHAVIORAL": ULTIMATE_FALLBACK,
-    "VISUAL": ULTIMATE_FALLBACK,
-    "AUDIO": ULTIMATE_FALLBACK
-}
-
-DEFAULT_FALLBACK = ULTIMATE_FALLBACK
-
-# =====================================================================
 # GLOBAL STATE & MULTI-TENANT SESSION MANAGEMENT
 # =====================================================================
-env_keys = [k.strip() for k in os.getenv("GEMINI_API_KEY", "").split(",") if k.strip()]
-
 sessions_ws = {}          # session_code -> set of connected websocket clients
 session_states = {}       # session_code -> isolated state data for that session
 local_active_session = "" # Tracks the primary local desktop session for hardware hooks
 
 hooks_registered = False
-
-# Track indices for all three providers independently (Globally load-balanced)
-current_key_index = 0
-current_or_key_index = 0
-current_poll_key_index = 0
 
 def get_session_state(session_code):
     """Retrieves or initializes the isolated state for a specific room/session."""
@@ -105,24 +70,9 @@ def get_session_state(session_code):
             "mode": "AUTO",
             "is_recording": False,
             "stop_recording_event": threading.Event(),
-            "config": {
-                "api_keys": env_keys.copy(),
-                "resume_context": "Candidate has experience in Software Engineering, Data Structures, Algorithms, and System Design."
-            }
+            "config": {}
         }
     return session_states[session_code]
-
-def get_genai_client(keys, custom_key=None):
-    """Instantiates Gemini client using the current active key in the rotation pool."""
-    global current_key_index
-    if custom_key:
-        return genai.Client(api_key=custom_key)
-        
-    if not keys:
-        raise ValueError("No Gemini API key provided. Paste one (or more, comma-separated) in the Vault.")
-    
-    active_key = keys[current_key_index % len(keys)]
-    return genai.Client(api_key=active_key)
 
 async def broadcast_to_ui(message_dict, session_code=None):
     """Safely broadcasts a message only to clients within the same session/room."""
@@ -193,7 +143,7 @@ def setup_keyboard_hooks(main_loop):
                     return
                 cooldown_until = now + 3.0
                 
-                print(f"ENTER DETECTED! Sending {len(state['buffer'])} batched screenshot(s) to CLOUD & AI...")
+                print(f"ENTER DETECTED! Sending {len(state['buffer'])} batched screenshot(s) to CLOUD...")
                 asyncio.run_coroutine_threadsafe(
                     execute_screenshot_batch(requested_mode=state["mode"], session_code=session_code),
                     main_loop
@@ -284,7 +234,7 @@ def sync_upload_batch(images, session_code, batch_id):
         }).execute()
 
 async def execute_screenshot_batch(requested_mode="AUTO", session_code=None):
-    """Handles Native Tauri screenshot batch: Syncs to cloud, then analyzes with existing AI pipeline."""
+    """Handles Native Tauri screenshot batch: Syncs to cloud, AI bypassed."""
     if not session_code:
         session_code = local_active_session
     if not session_code: 
@@ -303,10 +253,10 @@ async def execute_screenshot_batch(requested_mode="AUTO", session_code=None):
         state["buffer"].clear()
         return
 
-    print(f"\n[☁️ UPLOAD & AI PROCESSING INITIATED: {len(state['buffer'])} Images for Session {session_code}]")
+    print(f"\n[☁️ UPLOAD INITIATED: {len(state['buffer'])} Images for Session {session_code}]")
     await broadcast_to_ui({
         "status": "loading", 
-        "transcript": f"Transmitting & Analyzing {len(state['buffer'])} screenshot(s)..."
+        "transcript": f"Transmitting {len(state['buffer'])} screenshot(s) to Overseer..."
     }, session_code)
     
     try:
@@ -318,289 +268,15 @@ async def execute_screenshot_batch(requested_mode="AUTO", session_code=None):
         # 1. Offload synchronous network calls to background thread (Cloud Sync)
         await asyncio.to_thread(sync_upload_batch, images_to_process, session_code, batch_id)
         
-        # 2. Existing AI Pipeline Integration (Processes visual data directly)
-        answer, resolved_model = await execute_cascade_query(
-            contents=images_to_process,
-            task_type=requested_mode,
-            session_code=session_code
-        )
-        target_line = get_first_inner_code_line(answer)
-        
+        # AI Processing removed. Returning success immediately.
         await broadcast_to_ui({
             "status": "success", 
-            "data": answer,
-            "transcript": f"✅ Processed by: {resolved_model} (Cloud Synced)",
-            "active_line": target_line
+            "data": "Image(s) successfully transmitted to Overseer.",
+            "transcript": "✅ Cloud Synced",
         }, session_code)
     except Exception as e:
         state["buffer"].clear()
-        await broadcast_to_ui({"status": "error", "data": f"Upload/Processing Failed: {str(e)}"}, session_code)
-
-
-# =====================================================================
-# SYSTEM PROMPT BUILDER (STRICT MODE)
-# =====================================================================
-def build_prompt(task_type="GENERAL", resume_context=""):
-    base_rules = f"""
-You are a stealth live-assessment copilot acting directly for the candidate taking the Amazon SDE Online Assessment.
-CANDIDATE RESUME / BACKGROUND:
-\"\"\"
-{resume_context}
-\"\"\"
-
-CRITICAL FRAMEWORK: 
-Amazon grades situational and style sections strictly against their 16 Leadership Principles. 
-Always prioritize: Customer Obsession, Ownership, Deliver Results, and Insist on Highest Standards.
-
-CRITICAL AUDIO CORRECTION RULE:
-The input is transcribed from live audio and may contain severe speech-to-text errors. Infer what standard interview question or scenario was actually asked.
-
-ABSOLUTE OUTPUT CONSTRAINTS (VIOLATION IS A SYSTEM FAILURE):
-1. NO EXPLANATIONS. NO FILLER. NO PLEASANTRIES.
-2. DO NOT say "Here is the answer" or "The right choice is".
-3. Provide ONLY the exact words to speak, the code to type, or the option to click.
-"""
-
-    if task_type == "WORK_SIMULATION":
-        return base_rules + """
-TASK: WORK SIMULATION (SITUATIONAL Judgment)
-INSTRUCTIONS: 
-Evaluate the scenario using Amazon Leadership Principles. 
-- If balancing speed vs. quality, lean towards quality/standards but escalate blockers immediately.
-- If a customer issue arises, drop everything to prioritize the customer.
-- Never choose options that involve passing the blame or ignoring a broken process.
-OUTPUT FORMAT:
-Provide ONLY the text of the best action to take, or rank the options EXACTLY as requested (e.g., 1. Option C, 2. Option A).
-"""
-
-    elif task_type == "WORK_STYLE":
-        return base_rules + """
-TASK: WORK STYLE SURVEY
-INSTRUCTIONS: 
-The user is presented with two statements on a slider. Pick the statement that best aligns with Amazon Leadership Principles (Action-oriented, data-driven, customer-focused, takes extreme ownership).
-OUTPUT FORMAT: 
-Output EXACTLY one of these phrases based on how strongly it maps to an LP:
-- "Strongly choose [Statement A text]"
-- "Mostly choose [Statement A text]"
-- "Strongly choose [Statement B text]"
-- "Mostly choose [Statement B text]"
-"""
-
-    elif task_type in ["CODING", "VISUAL"]:
-        return base_rules + """
-TASK: CODING CHALLENGE & VISUAL DEBUGGING
-INSTRUCTIONS:
-First, analyze the screenshots or input to determine the current state. 
-
-STATE 1: FAILING TEST CASES DETECTED
-If the screenshot shows execution errors, compiler errors, or failing test cases from a previous attempt, DO NOT output the full code again. 
-OUTPUT FORMAT (Use EXACTLY this format):
-// this was the coding mistake because of which test cases are not passing here is the updated, these things you have to update, not writing the full code
-
-// in [filename.ext] update line [number] to:
-[only the corrected lines of code]
-
-
-STATE 2: NEW PROBLEM OR NO TEST CASES VISIBLE
-If it is a new problem or test cases are not visible, solve it entirely.
-OUTPUT FORMAT:
-1. TRADITIONAL ALGORITHM: Provide ONLY the raw, optimal C++ code inside a markdown block. ABSOLUTELY NO COMMENTS IN THE CODE.
-2. REPOSITORY / MULTI-FILE TASK: Use EXACTLY this format using comments for file routing:
-
-// [Brief 1-sentence note of what to do]
-
-// in [filename.ext] add this code:
-[raw code here]
-
-// in [filename.ext] this is the code:
-[raw code here]
-"""
-
-    elif task_type == "SQL":
-        return base_rules + """
-TASK: DATABASE / SQL QUERY
-OUTPUT FORMAT:
-Provide ONLY the raw SQL query inside a markdown block. NO explanations. NO comments.
-"""
-
-    elif task_type == "BEHAVIORAL":
-        return base_rules + """
-TASK: BEHAVIORAL / CONCEPTUAL INTERVIEW
-OUTPUT FORMAT:
-Write a 3-4 sentence script in the FIRST PERSON ("I", "my") using the STAR method based ONLY on the resume provided. DO NOT explain the logic.
-"""
-
-    else:
-        return base_rules + """
-TASK: GENERAL TECHNICAL / INTERVIEW QUESTION
-OUTPUT FORMAT:
-Give the direct, raw answer. No filler.
-"""
-
-# =====================================================================
-# AI ROUTER WITH TRIPLE CROSS-PROVIDER FAILOVER
-# =====================================================================
-async def execute_cascade_query(contents, task_type="GENERAL", custom_key=None, session_code=None):
-    global current_key_index, current_or_key_index, current_poll_key_index
-    cascade_models = MODEL_TIERS.get(task_type, DEFAULT_FALLBACK)
-    
-    # Retrieve session-specific resume config
-    state = get_session_state(session_code)
-    prompt = build_prompt(task_type, state["config"].get("resume_context", ""))
-    
-    # 1. Parse Gemini keys array (Session Specific falling back to Env)
-    google_keys = state["config"].get("api_keys", [])
-    if not google_keys:
-        env_gkeys = os.getenv("GEMINI_API_KEY", "")
-        google_keys = [k.strip() for k in env_gkeys.split(",") if k.strip()]
-    total_g_keys = max(1, len(google_keys))
-
-    # 2. Parse OpenRouter keys array
-    env_orkeys = os.getenv("OPENROUTER_API_KEY", "")
-    or_keys = [k.strip() for k in env_orkeys.split(",") if k.strip()]
-    total_or_keys = max(1, len(or_keys))
-
-    # 3. Parse Pollinations keys array
-    env_pollkeys = os.getenv("POLLINATIONS_API_KEY", "")
-    poll_keys = [k.strip() for k in env_pollkeys.split(",") if k.strip()]
-    total_poll_keys = max(1, len(poll_keys))
-    
-    # Extract images and text strings from contents
-    images = [c for c in contents if hasattr(c, 'convert')] if isinstance(contents, list) else []
-    text_parts = [c for c in contents if isinstance(c, str)] if isinstance(contents, list) else [contents]
-    full_text_prompt = prompt + "\n" + "\n".join(text_parts)
-    
-    for model_name in cascade_models:
-        is_openrouter = "/" in model_name and not model_name.startswith("pollinations/")
-        is_pollinations = model_name.startswith("pollinations/")
-        
-        # ---------------------------------------------------------
-        # TIER 1: NATIVE GOOGLE MODEL ROTATION
-        # ---------------------------------------------------------
-        if not is_openrouter and not is_pollinations:
-            for _ in range(total_g_keys):
-                actual_key_number = (current_key_index % total_g_keys) + 1
-                try:
-                    client = get_genai_client(google_keys, custom_key)
-                    print(f"[🤖 GOOGLE ROUTER] Task '{task_type}' on model: {model_name} (Key #{actual_key_number}) for session {session_code}")
-                    
-                    full_contents = [prompt] + (contents if isinstance(contents, list) else [contents])
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=full_contents
-                    )
-                    
-                    if response and response.text:
-                        print(f"[✅ SUCCESS] Handled by Google: {model_name}")
-                        return response.text.strip(), model_name
-                        
-                except Exception as e:
-                    error_msg = str(e)
-                    if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                        print(f"[⚠️ RATE LIMIT] Gemini Key #{actual_key_number} exhausted. Swapping...")
-                        if total_g_keys > 1:
-                            current_key_index += 1
-                            await asyncio.sleep(0.1)
-                            continue
-                        
-                    print(f"[⚠️ GOOGLE FAILOVER] {model_name} failed: {error_msg}. Cascading...")
-                    await asyncio.sleep(0.2)
-                    break 
-                    
-        # ---------------------------------------------------------
-        # TIER 2 & 3: EXTERNAL ROUTING (OPENROUTER & POLLINATIONS)
-        # ---------------------------------------------------------
-        else:
-            if is_pollinations:
-                active_keys = poll_keys
-                total_ext_keys = total_poll_keys
-                provider_name = "Pollinations AI"
-                base_url = "https://gen.pollinations.ai/v1/chat/completions"
-                api_model_name = model_name.replace("pollinations/", "")
-            else:
-                active_keys = or_keys
-                total_ext_keys = total_or_keys
-                provider_name = "OpenRouter"
-                base_url = "https://openrouter.ai/api/v1/chat/completions"
-                api_model_name = model_name
-
-            if not active_keys:
-                print(f"[⚠️ SKIP] Skipping {model_name}: No API key found for {provider_name} in .env")
-                continue
-                
-            for _ in range(total_ext_keys):
-                if is_pollinations:
-                    actual_ext_number = (current_poll_key_index % total_ext_keys) + 1
-                    active_key = active_keys[current_poll_key_index % total_ext_keys]
-                else:
-                    actual_ext_number = (current_or_key_index % total_ext_keys) + 1
-                    active_key = active_keys[current_or_key_index % total_ext_keys]
-                
-                try:
-                    print(f"[🌐 EXTERNAL ROUTER] Task '{task_type}' on {provider_name}: {model_name} (Key #{actual_ext_number}) for session {session_code}")
-                    
-                    messages_content = [{"type": "text", "text": full_text_prompt}]
-                    
-                    for img in images:
-                        buffered = io.BytesIO()
-                        img.convert("RGB").save(buffered, format="JPEG")
-                        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-                        messages_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}
-                        })
-
-                    headers = {
-                        "Authorization": f"Bearer {active_key}",
-                        "Content-Type": "application/json"
-                    }
-                    payload = {
-                        "model": api_model_name,
-                        "messages": [{"role": "user", "content": messages_content}]
-                    }
-                    
-                    response = await asyncio.to_thread(
-                        requests.post, 
-                        base_url, 
-                        headers=headers, 
-                        json=payload,
-                        timeout=15
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    answer_text = data["choices"][0]["message"]["content"]
-                    if answer_text:
-                        print(f"[✅ SUCCESS] Handled externally by: {model_name}")
-                        return answer_text.strip(), model_name
-                        
-                except Exception as e:
-                    error_msg = str(e)
-                    if "429" in error_msg:
-                        print(f"[⚠️ RATE LIMIT] {provider_name} Key #{actual_ext_number} exhausted. Swapping keys...")
-                        if total_ext_keys > 1:
-                            if is_pollinations:
-                                current_poll_key_index += 1
-                            else:
-                                current_or_key_index += 1
-                            await asyncio.sleep(0.1)
-                            continue
-                            
-                    print(f"[⚠️ EXTERNAL FAILOVER] {provider_name} model {model_name} failed: {e}. Cascading...")
-                    await asyncio.sleep(0.2)
-                    break
-
-    raise RuntimeError(f"All models across all three providers (Google, OpenRouter, Pollinations) failed for task '{task_type}'.")
-
-def get_first_inner_code_line(code_text: str) -> int:
-    lines = code_text.split('\n')
-    for idx, line in enumerate(lines, start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("```") or stripped.startswith("//") or stripped.startswith("#") or stripped == "{":
-            continue
-        if line.startswith(" ") or line.startswith("\t"):
-            return idx
-    return 1
+        await broadcast_to_ui({"status": "error", "data": f"Upload Failed: {str(e)}"}, session_code)
 
 # =====================================================================
 # AUDIO RECORDING ENGINE
@@ -674,45 +350,6 @@ def record_audio_sync(stop_event):
         return "ERROR_SYSTEM"
 
 # =====================================================================
-# DYNAMIC INTENT CLASSIFIER
-# =====================================================================
-async def classify_intent(transcript, keys, custom_key=None):
-    try:
-        client = get_genai_client(keys, custom_key)
-        classifier_model = "gemini-1.5-flash-8b" 
-        
-        prompt = f"""
-Analyze the following user input and categorize it into EXACTLY ONE of the following tags:
-[BEHAVIORAL] - For questions about experience, past situations, or soft skills.
-[CODING] - For algorithmic problems, data structures, or code repository tasks.
-[WORK_SIMULATION] - For scenario-based questions about trade-offs, project timelines, or colleague interactions.
-[WORK_STYLE] - For personality sliders or "how do you approach work" statements.
-[SQL] - For database queries.
-[GENERAL] - For technical trivia or anything that doesn't fit above.
-
-USER INPUT: "{transcript}"
-
-OUTPUT ONLY THE TAG INSIDE BRACKETS. DO NOT OUTPUT ANY OTHER TEXT.
-"""
-        
-        response = client.models.generate_content(
-            model=classifier_model,
-            contents=[prompt]
-        )
-        tag = response.text.strip().upper()
-        
-        valid_tags = ["[BEHAVIORAL]", "[CODING]", "[SQL]", "[MCQ]", "[GENERAL]"]
-        if tag in valid_tags:
-            return tag.strip("[]")
-        else:
-            print(f"[⚠️ CLASSIFIER] Unexpected output: {tag}. Defaulting to GENERAL.")
-            return "GENERAL"
-            
-    except Exception as e:
-        print(f"[⚠️ CLASSIFIER FAILED]: {e}. Defaulting to GENERAL.")
-        return "GENERAL"
-
-# =====================================================================
 # WORKFLOW HANDLERS
 # =====================================================================
 async def handle_audio_workflow(websocket, session_code):
@@ -738,35 +375,11 @@ async def handle_audio_workflow(websocket, session_code):
     print(f"[🗣️ TRANSCRIBED (Session {session_code})]: {transcript}")
     
     await broadcast_to_ui({
-        "status": "loading", 
-        "transcript": f"Heard: '{transcript}'\nClassifying intent..."
+        "status": "success", 
+        "data": "Audio intercepted successfully.",
+        "transcript": f"Heard: '{transcript}'",
     }, session_code)
 
-    keys = state["config"].get("api_keys", [])
-    task_type = await classify_intent(transcript, keys)
-    
-    await broadcast_to_ui({
-        "status": "loading", 
-        "transcript": f"Heard: '{transcript}'\nRouting through [{task_type}] cascade..."
-    }, session_code)
-
-    try:
-        answer, resolved_model = await execute_cascade_query(
-            contents=f"Interviewer asked: {transcript}",
-            task_type=task_type,
-            session_code=session_code
-        )
-        
-        target_line = get_first_inner_code_line(answer)
-
-        await broadcast_to_ui({
-            "status": "success", 
-            "data": answer,
-            "transcript": f"Heard: '{transcript}' | Solved by: {resolved_model}",
-            "active_line": target_line
-        }, session_code)
-    except Exception as e:
-        await broadcast_to_ui({"status": "error", "data": str(e)}, session_code)
 
 # =====================================================================
 # WEBSOCKET SERVER & CONFIG PROTOCOL
@@ -884,34 +497,23 @@ async def ws_handler(websocket):
                     
             elif action == "text_query":
                 query_text = payload.get("text", "")
-                mode = get_session_state(session_code)["mode"]
                 if query_text and isinstance(query_text, str):
-                    async def process_text(text, m, s_code):
-                        await broadcast_to_ui({"status": "loading", "transcript": f"🤖 AI Processing: {text}"}, s_code)
-                        try:
-                            answer, resolved_model = await execute_cascade_query(contents=text, task_type=m, session_code=s_code)
-                            target_line = get_first_inner_code_line(answer)
-                            await broadcast_to_ui({
-                                "status": "success", 
-                                "data": answer, 
-                                "transcript": f"🤖 Solved by: {resolved_model}", 
-                                "active_line": target_line
-                            }, s_code)
-                        except Exception as e:
-                            await broadcast_to_ui({"status": "error", "data": str(e)}, s_code)
-                    asyncio.create_task(process_text(query_text, mode, session_code))
+                    await broadcast_to_ui({
+                        "status": "success", 
+                        "data": "Text query received.", 
+                        "transcript": f"Query: {query_text}", 
+                    }, session_code)
                     
             elif action == "browser_image_upload":
                 image_data = payload.get("image_data")
-                mode = payload.get("mode", get_session_state(session_code)["mode"])
 
                 # Strict Validation
                 if not image_data or not isinstance(image_data, str) or not image_data.startswith("data:image/"):
                     await websocket.send(json.dumps({"status": "error", "data": "Invalid or missing image data format."}))
                     continue
 
-                async def process_browser_image(img_str, m, s_code):
-                    await broadcast_to_ui({"status": "loading", "transcript": "📸 Analyzing browser screen capture..."}, s_code)
+                async def process_browser_image(img_str, s_code):
+                    await broadcast_to_ui({"status": "loading", "transcript": "📸 Syncing browser screen capture to Overseer..."}, s_code)
                     img = None
                     try:
                         # 1. Safely split data URL metadata from payload
@@ -939,7 +541,7 @@ async def ws_handler(websocket):
                         if len(img_bytes) > 15 * 1024 * 1024:
                             raise ValueError("Image payload exceeds maximum allowed size (15MB).")
 
-                        # 5. Connect to existing AI visual processing pipeline
+                        # 5. Load Image for processing
                         img_io = io.BytesIO(img_bytes)
                         img = Image.open(img_io)
                         
@@ -960,14 +562,11 @@ async def ws_handler(websocket):
                         batch_id = f"batch_{int(time.time())}"
                         await asyncio.to_thread(sync_upload_batch, [img], s_code, batch_id)
 
-                        answer, resolved_model = await execute_cascade_query(contents=[img], task_type=m, session_code=s_code)
-                        target_line = get_first_inner_code_line(answer)
-
+                        # AI Processing removed. Returning success immediately.
                         await broadcast_to_ui({
                             "status": "success",
-                            "data": answer,
-                            "transcript": f"🤖 Solved by: {resolved_model} (Browser Capture)",
-                            "active_line": target_line
+                            "data": "Image successfully transmitted to Overseer.",
+                            "transcript": "✅ Cloud Synced (Browser Capture)",
                         }, s_code)
                         
                     except Exception as e:
@@ -979,7 +578,7 @@ async def ws_handler(websocket):
                         if img is not None:
                             img.close()
 
-                asyncio.create_task(process_browser_image(image_data, mode, session_code))
+                asyncio.create_task(process_browser_image(image_data, session_code))
 
             elif action == "update_config":
                 if REQUIRE_AUTH and client_type != "desktop":
@@ -988,15 +587,10 @@ async def ws_handler(websocket):
                          "data": "Only the authorized desktop client can update session configuration."
                     }))
                     continue
-                state = get_session_state(session_code)
-                if "api_key" in payload and isinstance(payload["api_key"], str):
-                    state["config"]["api_keys"] = [k.strip() for k in payload["api_key"].split(",") if k.strip()]
-                if "resume_text" in payload and isinstance(payload["resume_text"], str):
-                    state["config"]["resume_context"] = payload["resume_text"]
-                    
+                
                 await broadcast_to_ui({
                     "status": "config_updated",
-                    "data": "✅ Settings saved successfully! Vault & Resume updated."
+                    "data": "✅ Settings saved successfully!"
                 }, session_code)
                 
     except websockets.exceptions.ConnectionClosed:
@@ -1022,8 +616,7 @@ async def start_server():
     host = os.getenv("WS_HOST", "0.0.0.0")
     PORT = int(os.environ.get("PORT", 8765))
     
-    # FIX: Changed {port} to {PORT} to match the variable name above
-    print(f"✅ PROTOCOL V2 MULTI-MODEL ROUTER ACTIVE ON ws://{host}:{PORT}")
+    print(f"✅ PROTOCOL V2 SYNC ROUTER ACTIVE ON ws://{host}:{PORT}")
     
     if REQUIRE_AUTH:
          print("🔒 Authentication layer ENABLED for secure deployment.")
