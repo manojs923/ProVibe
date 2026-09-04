@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { createClient } from '@supabase/supabase-js';
+import { invoke } from '@tauri-apps/api/core';
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -51,6 +52,9 @@ export default function App() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const taskModeRef = useRef(taskMode);
+  
+  // 🔥 THE NEW STEALTH BUFFER MEMORY 🔥
+  const imageBufferRef = useRef<string[]>([]);
 
   // Sync state to refs for use in event listeners
   useEffect(() => {
@@ -106,7 +110,7 @@ export default function App() {
     };
   }, [sessionCode]);
 
-  // 3. WEBSOCKET HANDLER (PYTHON ENGINE)
+  // 3. WEBSOCKET HANDLER (DEPLOYED RENDER ENDPOINT)
   useEffect(() => {
     if (!sessionCode) return;
     let isMounted = true;
@@ -118,8 +122,8 @@ export default function App() {
         return;
       }
 
-      // LOCAL HOST RESTORED
-      const socket = new WebSocket("ws://127.0.0.1:8765");
+      // CONNECTS TO DEPLOYED RENDER SERVER
+      const socket = new WebSocket("wss://protocol-i59x.onrender.com");
       wsRef.current = socket;
       
       socket.onopen = () => {
@@ -201,17 +205,108 @@ export default function App() {
     }
   }, [activeLine, response]);
 
-  // 4. ACTION TRIGGERS (LOCAL BACKEND WEBSOCKET CALL)
-  const triggerScreenCapture = async () => {
+  // 4. MULTI-PLATFORM MEDIA & ACTION TRIGGERS (BUFFER + BATCH)
+
+  // A. Triggered by Double-Tab: Takes a native shot and stores it in React memory
+  const bufferNativeScreenshot = async (keyName: string) => {
+    if (isTauri()) {
+      try {
+        const base64Image: string = await invoke("capture_screen_native");
+        const dataUrl = `data:image/jpeg;base64,${base64Image}`;
+        imageBufferRef.current.push(dataUrl);
+        setTranscript(`📸 Buffered ${imageBufferRef.current.length} screenshot(s) via ${keyName}... Press [ENTER] to send.`);
+      } catch (err) {
+        console.error(err);
+        setTranscript("Stealth capture failed: Ensure main.rs is updated.");
+      }
+    } else {
+      setTranscript(`📸 Buffered signal via ${keyName} (Browser)... Press [ENTER] to capture`);
+      (window as any).__browserBuffered = true;
+    }
+  };
+
+  // B. Triggered by Enter: Sends all buffered images sequentially to Render
+  const sendBufferedScreenshots = async () => {
     const mode = taskModeRef.current;
     
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      // Sends the signal to your local Python server to use ImageGrab
-      wsRef.current.send(JSON.stringify({ action: "capture_screen", mode }));
-      setTranscript("Snipe command sent to local engine...");
+    if (isTauri()) {
+      if (wsRef.current?.readyState === WebSocket.OPEN && imageBufferRef.current.length > 0) {
+        setStatus("UPLOADING...");
+        setTranscript(`Transmitting ${imageBufferRef.current.length} image(s) to cloud...`);
+        
+        wsRef.current.send(JSON.stringify({ 
+          action: "browser_image_batch_upload", 
+          images: imageBufferRef.current,
+          mode: mode
+        }));
+        
+        imageBufferRef.current = []; // Clear the buffer after sending
+        setStatus("READY");
+        setTimeout(() => setTranscript("Images successfully synced to cloud."), 1500);
+      } else if (wsRef.current?.readyState !== WebSocket.OPEN) {
+        setStatus("ERROR");
+        setTranscript("Backend disconnected.");
+      }
     } else {
-      setStatus("ERROR");
-      setTranscript("Backend disconnected. Ensure local Python server is running.");
+      // Browser getDisplayMedia fallback (still has popups)
+      let stream: MediaStream | null = null;
+      try {
+        setStatus("CAPTURING...");
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        const video = document.createElement('video');
+        video.srcObject = stream;
+        await video.play();
+        
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d')?.drawImage(video, 0, 0);
+        
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.8); 
+        
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ 
+            action: "browser_image_batch_upload", 
+            images: [dataUrl],
+            mode: mode
+          }));
+        }
+        
+        setTranscript("Browser screen capture transmitted.");
+        setStatus("READY");
+      } catch (err) {
+        console.error(err);
+        setStatus("ERROR");
+        setTranscript("Screen capture permission denied.");
+      } finally {
+        if (stream) {
+          stream.getTracks().forEach(t => t.stop());
+        }
+      }
+    }
+  };
+
+  // C. Triggered by Alt+S: Instantly takes one shot and sends it (Bypasses buffer)
+  const triggerInstantSniper = async () => {
+    if (isTauri()) {
+      try {
+        setStatus("CAPTURING...");
+        const base64Image: string = await invoke("capture_screen_native");
+        const dataUrl = `data:image/jpeg;base64,${base64Image}`;
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ 
+            action: "browser_image_batch_upload", 
+            images: [dataUrl],
+            mode: taskModeRef.current
+          }));
+          setTranscript("📸 Instant Stealth Snipe Transmitted.");
+          setStatus("READY");
+        }
+      } catch (err) {
+         console.error(err);
+      }
+    } else {
+       sendBufferedScreenshots();
     }
   };
 
@@ -269,7 +364,7 @@ export default function App() {
         unlisten = await listen<string>('app-command', (event) => {
           const command = event.payload; 
 
-          if (command === "TRIGGER_SNIPER") triggerScreenCapture();
+          if (command === "TRIGGER_SNIPER") triggerInstantSniper(); // Wires Alt+S to instant fire
           if (command === "TRIGGER_AUDIO") triggerAudio();
           if (command === "SUMMON_COPILOT" || command === "TOGGLE_VISIBILITY") {
             setIsVisible(prev => (command === "SUMMON_COPILOT" ? true : !prev));
@@ -286,7 +381,7 @@ export default function App() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
-  // 6. KEYBOARD SHORTCUTS WITH ENTER WAIT RESTORED
+  // 6. BROWSER KEYBOARD SHORTCUTS (DOUBLE-TAP TO BUFFER, ENTER TO SEND)
   useEffect(() => {
     const tabHistory: number[] = [];
     const minusHistory: number[] = [];
@@ -321,30 +416,40 @@ export default function App() {
         history.push(now);
         if (history.length > 2) history.shift();
         if (history.length === 2 && history[1] - history[0] <= 500) {
-          setTranscript(`📸 Buffered screenshot via ${keyName}... Press [ENTER] to capture`);
           history.length = 0;
           cooldown = now + 1000;
-          (window as any).__browserBuffered = true;
+          bufferNativeScreenshot(keyName); // Push to array
         }
       };
 
       if (e.key === 'Tab') {
-        e.preventDefault();
+        e.preventDefault(); // Kills focus switching
         trackDoubleTap(tabHistory, 'Tab');
       }
-      if (e.key === '-') trackDoubleTap(minusHistory, '-');
+      if (e.key === '-') {
+        e.preventDefault(); // Kills focus switching
+        trackDoubleTap(minusHistory, '-');
+      }
 
       if (e.key === 'Enter') {
-        if ((window as any).__browserBuffered && now > cooldown) {
-          (window as any).__browserBuffered = false;
-          cooldown = now + 3000;
-          triggerScreenCapture();
+        if (isTauri()) {
+          if (imageBufferRef.current.length > 0 && now > cooldown) {
+            cooldown = now + 3000;
+            sendBufferedScreenshots(); // Fire the payload
+          }
+        } else {
+          if ((window as any).__browserBuffered && now > cooldown) {
+            (window as any).__browserBuffered = false;
+            cooldown = now + 3000;
+            sendBufferedScreenshots();
+          }
         }
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // { capture: true } ensures these rules happen before buttons or inputs steal focus
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, []);
 
   const saveSettings = () => {
@@ -409,6 +514,7 @@ export default function App() {
             <span className="text-[11px] font-bold text-emerald-400 tracking-wider">{sessionCode || "GEN..."}</span>
             <button 
               onClick={copySessionCode}
+              tabIndex={-1} 
               className="ml-2 text-[9px] bg-slate-800 hover:bg-slate-700 text-white px-2 py-0.5 rounded cursor-pointer transition-colors"
             >
               COPY
@@ -419,6 +525,7 @@ export default function App() {
             <select 
               value={taskMode} 
               onChange={(e) => setTaskMode(e.target.value as any)}
+              tabIndex={-1} 
               className="bg-slate-900 border border-slate-700 text-[10px] text-emerald-400 font-bold rounded px-1 py-0.5 outline-none cursor-pointer"
             >
               <option value="AUTO">MODE: AUTO</option>
@@ -430,6 +537,7 @@ export default function App() {
 
             <button 
               onClick={() => setShowSettings(!showSettings)}
+              tabIndex={-1} 
               className="flex items-center gap-1 text-[10px] bg-slate-800 hover:bg-slate-700 text-white font-bold px-2 py-0.5 rounded border border-slate-600"
             >
               VAULT
@@ -453,6 +561,7 @@ export default function App() {
                 placeholder="AIzaSy..."
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
+                tabIndex={-1} 
                 className="w-full bg-slate-950 border border-slate-700 text-white text-xs p-2 rounded mb-3 outline-none focus:border-emerald-500"
               />
 
@@ -462,13 +571,14 @@ export default function App() {
                 placeholder="Paste your resume, project highlights, or background info here..."
                 value={resumeText}
                 onChange={(e) => setResumeText(e.target.value)}
+                tabIndex={-1} 
                 className="w-full bg-slate-950 border border-slate-700 text-white text-xs p-2 rounded outline-none focus:border-emerald-500 font-sans resize-none"
               />
             </div>
 
             <div className="flex gap-2">
-              <button onClick={saveSettings} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold py-2 rounded uppercase tracking-wider">Save & Inject Vault</button>
-              <button onClick={() => setShowSettings(false)} className="bg-slate-800 text-slate-300 text-xs font-bold px-4 py-2 rounded">Cancel</button>
+              <button onClick={saveSettings} tabIndex={-1} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold py-2 rounded uppercase tracking-wider">Save & Inject Vault</button>
+              <button onClick={() => setShowSettings(false)} tabIndex={-1} className="bg-slate-800 text-slate-300 text-xs font-bold px-4 py-2 rounded">Cancel</button>
             </div>
           </div>
         )}

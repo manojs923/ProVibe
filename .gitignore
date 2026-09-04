@@ -18,3 +18,23 @@ src-tauri/Cargo.lock
 .vscode/
 .idea/
 .DS_Store
+
+# Keys and Secrets
+.env
+.env.local
+
+# Node/React
+node_modules/
+dist/
+
+# Tauri/Rust builds (These are MASSIVE)
+src-tauri/target/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Local App Data
+screenshots/
