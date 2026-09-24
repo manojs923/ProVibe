@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 # =====================================================================
-# CLOUD-SAFE NATIVE HOOKS
+# DIAGNOSTIC NATIVE HOOKS
 # =====================================================================
 try:
     import keyboard
@@ -42,16 +42,25 @@ ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [orig.strip() for orig in ALLOWED_ORIGINS_ENV.split(",") if orig.strip()] if ALLOWED_ORIGINS_ENV else None
 
 # =====================================================================
-# SUPABASE CLOUD CONFIGURATION
+# CLOUD DATABASE PIPELINE & FALLBACK ROUTING
 # =====================================================================
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+# Accepts comma-separated strings for multi-database redundancy
+SUPABASE_URLS_ENV = os.getenv("SUPABASE_URLS", os.getenv("SUPABASE_URL", ""))
+SUPABASE_KEYS_ENV = os.getenv("SUPABASE_KEYS", os.getenv("SUPABASE_ANON_KEY", ""))
 
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-else:
-    supabase = None
-    print("[⚠️ WARNING] Supabase credentials missing from .env. Cloud uploads will fail.")
+supabase_urls = [url.strip() for url in SUPABASE_URLS_ENV.split(",") if url.strip()]
+supabase_keys = [key.strip() for key in SUPABASE_KEYS_ENV.split(",") if key.strip()]
+
+supabase_clients = []
+for url, key in zip(supabase_urls, supabase_keys):
+    try:
+        client: Client = create_client(url, key)
+        supabase_clients.append(client)
+    except Exception as e:
+        print(f"[⚠️ WARNING] Failed to initialize DB client for {url}: {e}")
+
+if not supabase_clients:
+    print("[⚠️ WARNING] No valid database credentials found. Cloud uploads will fail.")
 
 # =====================================================================
 # GLOBAL STATE & MULTI-TENANT SESSION MANAGEMENT
@@ -167,7 +176,6 @@ def setup_keyboard_hooks(main_loop):
                 main_loop
             )
 
-    # Register both Tab and Minus key hooks safely isolated to OS
     try:
         keyboard.hook_key('tab', on_tab)
         keyboard.hook_key('-', on_minus)
@@ -208,30 +216,45 @@ async def buffer_screenshot(session_code=None):
         print(error_msg)
         await broadcast_to_ui({"status": "error", "data": error_msg}, session_code)
 
-# 🛡️ THE NEW CLOUD UPLOAD THREAD
+# 🛡️ THE MULTI-DB CLOUD UPLOAD THREAD
 def sync_upload_batch(images, session_code, batch_id):
-    """Executes blocking Supabase uploads on a background thread to prevent UI freezing."""
-    if not supabase: return
+    """Executes blocking cloud uploads on a background thread with multi-DB fallback routing."""
+    if not supabase_clients: 
+        return
+        
     for idx, img in enumerate(images):
         img_byte_arr = io.BytesIO()
         img.save(img_byte_arr, format='JPEG', quality=80)
         img_bytes = img_byte_arr.getvalue()
         
         file_name = f"{session_code}/{batch_id}_{idx}.jpg"
+        upload_success = False
         
-        supabase.storage.from_("captures").upload(
-            file=img_bytes,
-            path=file_name,
-            file_options={"content-type": "image/jpeg"}
-        )
+        # Iterate through available DB clients until one succeeds
+        for db_index, client in enumerate(supabase_clients):
+            try:
+                client.storage.from_("captures").upload(
+                    file=img_bytes,
+                    path=file_name,
+                    file_options={"content-type": "image/jpeg"}
+                )
+                
+                public_url = client.storage.from_("captures").get_public_url(file_name)
+                
+                client.table("copilot_sessions").insert({
+                    "session_code": session_code,
+                    "batch_id": batch_id,
+                    "image_url": public_url
+                }).execute()
+                
+                upload_success = True
+                break  # Exit fallback loop on success
+                
+            except Exception as e:
+                print(f"[⚠️ DB FALLBACK] Node {db_index + 1} failed: {e}. Routing to next available database...")
         
-        public_url = supabase.storage.from_("captures").get_public_url(file_name)
-        
-        supabase.table("copilot_sessions").insert({
-            "session_code": session_code,
-            "batch_id": batch_id,
-            "image_url": public_url
-        }).execute()
+        if not upload_success:
+            print(f"[❌ CRITICAL] All database nodes failed to process frame {file_name}.")
 
 async def execute_screenshot_batch(requested_mode="AUTO", session_code=None):
     """Handles Native Tauri screenshot batch: Syncs to cloud, AI bypassed."""
@@ -245,10 +268,10 @@ async def execute_screenshot_batch(requested_mode="AUTO", session_code=None):
     if not state["buffer"]:
         return
         
-    if not supabase:
+    if not supabase_clients:
         await broadcast_to_ui({
             "status": "error", 
-            "data": "// CRITICAL ERROR: Supabase keys missing. Cloud uploads will fail.\n// Check .env configuration."
+            "data": "// CRITICAL ERROR: Database keys missing. Cloud uploads will fail.\n// Check .env configuration."
         }, session_code)
         state["buffer"].clear()
         return
@@ -265,14 +288,12 @@ async def execute_screenshot_batch(requested_mode="AUTO", session_code=None):
         
         batch_id = f"batch_{int(time.time())}"
         
-        # 1. Offload synchronous network calls to background thread (Cloud Sync)
         await asyncio.to_thread(sync_upload_batch, images_to_process, session_code, batch_id)
         
-        # AI Processing removed. Returning success immediately.
         await broadcast_to_ui({
             "status": "success", 
             "data": "Image(s) successfully transmitted to Overseer.",
-            "transcript": "✅ Cloud Synced",
+            "transcript": "✅ Multi-DB Sync Complete",
             "active_line": None
         }, session_code)
     except Exception as e:
@@ -400,7 +421,6 @@ async def ws_handler(websocket):
 
     try:
         async for message in websocket:
-            # 1. MESSAGE VALIDATION
             try:
                 payload = json.loads(message)
                 if not isinstance(payload, dict):
@@ -412,19 +432,16 @@ async def ws_handler(websocket):
                 
             action = payload.get("action")
             
-            # 2. SESSION & AUTH INITIALIZATION
             if action == "set_session":
                 req_session_code = payload.get("session_code", "")
                 if not req_session_code or not isinstance(req_session_code, str):
                     await websocket.send(json.dumps({"status": "error", "data": "Invalid session_code."}))
                     continue
                 
-                # Prevent session switching on an already bound socket
                 if session_code is not None and session_code != req_session_code:
                     await websocket.send(json.dumps({"status": "error", "data": "Cannot switch sessions after authentication."}))
                     continue
                 
-                # Verify Authentication if enabled for production deployment
                 if REQUIRE_AUTH:
                     req_token = payload.get("auth_token", "")
                     if not AUTH_TOKEN or req_token != AUTH_TOKEN:
@@ -432,7 +449,6 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({"status": "error", "data": "Unauthorized connection."}))
                         continue
                 
-                # Set session code and client type ONLY after successful authorization
                 session_code = req_session_code
                 requested_client_type = payload.get("client_type", "browser")
 
@@ -448,7 +464,6 @@ async def ws_handler(websocket):
                     sessions_ws[session_code] = set()
                 sessions_ws[session_code].add(websocket)
                 
-                # Only permit native hooks for explicitly authenticated desktop clients
                 if client_type == "desktop":
                     local_active_session = session_code
                     setup_keyboard_hooks(asyncio.get_running_loop())
@@ -456,23 +471,19 @@ async def ws_handler(websocket):
                 print(f"[🔗 SESSION LINKED] Assigned Code: {session_code} | Type: {client_type.upper()} | Total sessions: {len(sessions_ws)}")
                 continue
 
-            # 3. AUTHORIZATION GUARD FOR ALL OTHER ACTIONS
             if not session_code:
                 await websocket.send(json.dumps({"status": "error", "data": "Not authenticated. Send set_session first."}))
                 continue
                 
-            # Verify session scope to prevent cross-session execution
             msg_session = payload.get("session_code", session_code)
             if msg_session != session_code:
                 await websocket.send(json.dumps({"status": "error", "data": "Session mismatch boundary violation."}))
                 continue
 
-            # 4. ACTION ROUTING
             if action == "set_mode":
                 get_session_state(session_code)["mode"] = payload.get("mode", "AUTO")
                 
             elif action == "capture_screen":
-                # NATIVE FUNCTIONALITY ISOLATION
                 if client_type != "desktop":
                     await websocket.send(json.dumps({"status": "error", "data": "Action requires desktop client architecture."}))
                     continue
@@ -485,7 +496,6 @@ async def ws_handler(websocket):
                 asyncio.create_task(force_single_capture(session_code, mode))
                 
             elif action == "toggle_audio":
-                # NATIVE FUNCTIONALITY ISOLATION
                 if client_type != "desktop":
                     await websocket.send(json.dumps({"status": "error", "data": "Action requires desktop client architecture."}))
                     continue
@@ -534,7 +544,7 @@ async def ws_handler(websocket):
                             await broadcast_to_ui({
                                 "status": "success",
                                 "data": f"{len(processed_images)} Image(s) successfully transmitted to Overseer.",
-                                "transcript": "✅ Cloud Synced (Batch Capture)",
+                                "transcript": "✅ Multi-DB Synced (Batch Capture)",
                             }, s_code)
                     except Exception as e:
                         print(f"[⚠️ BATCH UPLOAD ERROR] {str(e)}")
@@ -563,12 +573,10 @@ async def ws_handler(websocket):
     except Exception as e:
         print(f"\n[⚠️ UNEXPECTED WEBSOCKET ERROR] {e}")
     finally:
-        # CONNECTION CLEANUP
         if session_code and session_code in sessions_ws:
             if websocket in sessions_ws[session_code]:
                 sessions_ws[session_code].remove(websocket)
             
-            # Free unused isolated state spaces
             if not sessions_ws[session_code]:
                 del sessions_ws[session_code]
                 if session_code in session_states:
@@ -577,11 +585,10 @@ async def ws_handler(websocket):
                     local_active_session = ""
 
 async def start_server():
-    # Make host and port configurable for Cloud Deployment & Reverse Proxies
     host = os.getenv("WS_HOST", "0.0.0.0")
     PORT = int(os.environ.get("PORT", 8765))
     
-    print(f"✅ PROTOCOL V2 SYNC ROUTER ACTIVE ON ws://{host}:{PORT}")
+    print(f"✅ PROTOCOL V2 MULTI-DB ROUTER ACTIVE ON ws://{host}:{PORT}")
     
     if REQUIRE_AUTH:
          print("🔒 Authentication layer ENABLED for secure deployment.")

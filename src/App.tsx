@@ -1,15 +1,34 @@
 import { useState, useEffect, useRef } from "react";
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { invoke } from '@tauri-apps/api/core';
 
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+// =====================================================================
+// MULTI-DB FALLBACK INITIALIZATION
+// =====================================================================
+const urlsEnv = import.meta.env.VITE_SUPABASE_URLS || import.meta.env.VITE_SUPABASE_URL || "";
+const keysEnv = import.meta.env.VITE_SUPABASE_KEYS || import.meta.env.VITE_SUPABASE_ANON_KEY || "";
 
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-  console.error("CRITICAL ERROR: Supabase environment variables are missing!");
+// Explicitly type as string[] and use length > 0 to maintain TypeScript inference
+const supabaseUrls: string[] = urlsEnv.split(',').map((u: string) => u.trim()).filter((u: string) => u.length > 0);
+const supabaseKeys: string[] = keysEnv.split(',').map((k: string) => k.trim()).filter((k: string) => k.length > 0);
+
+const supabaseClients: SupabaseClient[] = [];
+
+// Explicitly declare url as string and index as number
+supabaseUrls.forEach((url: string, index: number) => {
+  const key = supabaseKeys[index];
+  if (url && key) {
+    try {
+      supabaseClients.push(createClient(url, key));
+    } catch (err) {
+      console.error(`[⚠️ WARNING] Failed to initialize UI DB client for ${url}:`, err);
+    }
+  }
+});
+
+if (supabaseClients.length === 0) {
+  console.error("CRITICAL ERROR: Supabase environment variables are missing! Real-time syncing will fail.");
 }
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 interface WebSocketPayload {
   status: 'loading' | 'success' | 'error' | 'config_updated' | 'sync_cursor' | 'nav_up' | 'nav_down';
@@ -27,14 +46,14 @@ const isTauri = () => {
 export default function App() {
   const [sessionCode, setSessionCode] = useState("");
   const [status, setStatus] = useState("STANDBY");
-  const [transcript, setTranscript] = useState("Awaiting Double-Tab / Double-[-] snipe or audio input...");
+  const [transcript, setTranscript] = useState("Awaiting diagnostic trigger or audio telemetry...");
   
   const [response, setResponse] = useState(
-`// 🛡️ PROTOCOL STEALTH SUITE INITIALIZED
+`// 🛡️ OOB TELEMETRY AGENT INITIALIZED
 //
-// 📸 Double-Tab / Double-[-] : Buffer Capture (Press Enter to send)
-// 🎙️ Alt+A                   : Record Audio
-// 👻 Alt+H                   : Hide / Unhide Window
+// 📸 Double-Tab / Double-[-] : Buffer Diagnostic Frame (Press Enter to sync)
+// 🎙️ Alt+A                   : Record Audio Telemetry
+// 👻 Alt+H                   : Toggle HUD Visibility
 // ↕️ Alt+Up/Down             : Adjust UI Opacity`
   );
   
@@ -53,7 +72,7 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const taskModeRef = useRef(taskMode);
   
-  // 🔥 THE NEW STEALTH BUFFER MEMORY 🔥
+  // 🔥 THE NEW BATCH MEMORY ARRAY 🔥
   const imageBufferRef = useRef<string[]>([]);
 
   // Sync state to refs for use in event listeners
@@ -80,37 +99,42 @@ export default function App() {
     localStorage.setItem('protocol_ui_opacity', uiOpacity.toString());
   }, [uiOpacity]);
 
-  // 2. SUPABASE REAL-TIME LISTENER (FRIEND'S CLOUD OVERRIDE)
+  // 2. SUPABASE REAL-TIME LISTENER (MULTI-DB REDUNDANCY)
   useEffect(() => {
-    if (!sessionCode) return;
+    if (!sessionCode || supabaseClients.length === 0) return;
 
-    const channel = supabase
-      .channel(`listen-answers-${sessionCode}`)
-      .on(
-        'postgres_changes',
-        { 
-          event: 'INSERT', 
-          schema: 'public', 
-          table: 'copilot_sessions',
-          filter: `session_code=eq.${sessionCode}` 
-        },
-        (payload) => {
-          console.log("Realtime payload received:", payload);
-          if (payload.new && payload.new.answer_text) {
-            setResponse(payload.new.answer_text);
-            setStatus("OVERRIDE RECEIVED");
-            setTranscript("👤 Friend has transmitted the solution.");
+    // Map over all active database clients and listen to all of them concurrently
+    const channels = supabaseClients.map((client, index) => {
+      return client
+        .channel(`listen-answers-${sessionCode}-${index}`)
+        .on(
+          'postgres_changes',
+          { 
+            event: 'INSERT', 
+            schema: 'public', 
+            table: 'copilot_sessions',
+            filter: `session_code=eq.${sessionCode}` 
+          },
+          (payload) => {
+            console.log(`[DB Node ${index + 1}] Realtime payload received:`, payload);
+            if (payload.new && payload.new.answer_text) {
+              setResponse(payload.new.answer_text);
+              setStatus("OVERRIDE RECEIVED");
+              setTranscript("👤 Remote Operator has updated the diagnostic profile.");
+            }
           }
-        }
-      )
-      .subscribe();
+        )
+        .subscribe();
+    });
 
     return () => {
-      supabase.removeChannel(channel);
+      channels.forEach((channel, index) => {
+        supabaseClients[index].removeChannel(channel);
+      });
     };
   }, [sessionCode]);
 
-  // 3. WEBSOCKET HANDLER (DEPLOYED RENDER ENDPOINT)
+  // 3. WEBSOCKET HANDLER (DEPLOYED CLOUD ENDPOINT)
   useEffect(() => {
     if (!sessionCode) return;
     let isMounted = true;
@@ -214,10 +238,10 @@ export default function App() {
         const base64Image: string = await invoke("capture_screen_native");
         const dataUrl = `data:image/jpeg;base64,${base64Image}`;
         imageBufferRef.current.push(dataUrl);
-        setTranscript(`📸 Buffered ${imageBufferRef.current.length} screenshot(s) via ${keyName}... Press [ENTER] to send.`);
+        setTranscript(`📸 Buffered ${imageBufferRef.current.length} frame(s) via ${keyName}... Press [ENTER] to send.`);
       } catch (err) {
         console.error(err);
-        setTranscript("Stealth capture failed: Ensure main.rs is updated.");
+        setTranscript("Native capture failed: Ensure main.rs is updated.");
       }
     } else {
       setTranscript(`📸 Buffered signal via ${keyName} (Browser)... Press [ENTER] to capture`);
@@ -232,7 +256,7 @@ export default function App() {
     if (isTauri()) {
       if (wsRef.current?.readyState === WebSocket.OPEN && imageBufferRef.current.length > 0) {
         setStatus("UPLOADING...");
-        setTranscript(`Transmitting ${imageBufferRef.current.length} image(s) to cloud...`);
+        setTranscript(`Transmitting ${imageBufferRef.current.length} frame(s) to cloud...`);
         
         wsRef.current.send(JSON.stringify({ 
           action: "browser_image_batch_upload", 
@@ -242,13 +266,13 @@ export default function App() {
         
         imageBufferRef.current = []; // Clear the buffer after sending
         setStatus("READY");
-        setTimeout(() => setTranscript("Images successfully synced to cloud."), 1500);
+        setTimeout(() => setTranscript("Frames successfully synced to cloud."), 1500);
       } else if (wsRef.current?.readyState !== WebSocket.OPEN) {
         setStatus("ERROR");
         setTranscript("Backend disconnected.");
       }
     } else {
-      // Browser getDisplayMedia fallback (still has popups)
+      // Browser getDisplayMedia fallback
       let stream: MediaStream | null = null;
       try {
         setStatus("CAPTURING...");
@@ -272,7 +296,7 @@ export default function App() {
           }));
         }
         
-        setTranscript("Browser screen capture transmitted.");
+        setTranscript("Browser frame transmitted.");
         setStatus("READY");
       } catch (err) {
         console.error(err);
@@ -299,7 +323,7 @@ export default function App() {
             images: [dataUrl],
             mode: taskModeRef.current
           }));
-          setTranscript("📸 Instant Stealth Snipe Transmitted.");
+          setTranscript("📸 Instant Diagnostic Frame Transmitted.");
           setStatus("READY");
         }
       } catch (err) {
@@ -325,7 +349,7 @@ export default function App() {
 
         recognition.onstart = () => {
           setStatus("LISTENING...");
-          setTranscript("🔴 Recording browser audio...");
+          setTranscript("🔴 Recording browser audio telemetry...");
         };
         
         recognition.onresult = (event: any) => {
@@ -480,7 +504,7 @@ export default function App() {
       console.error("Failed to copy to clipboard:", err);
       setTranscript(`❌ Failed to copy code`);
     }
-    setTimeout(() => setTranscript("Awaiting Double-Tab / Double-[-] snipe or audio input..."), 3000);
+    setTimeout(() => setTranscript("Awaiting diagnostic trigger or audio telemetry..."), 3000);
   };
 
   const handleHeaderDrag = async () => {
@@ -502,9 +526,9 @@ export default function App() {
           <div className="flex items-center gap-2 pointer-events-none">
             <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse" />
             <span className="text-xs font-bold tracking-widest text-white uppercase flex items-center">
-              PROTOCOL v2.0 ENGINE
+              TELEMETRY ENGINE
               <span className="ml-2 text-[9px] px-1 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                {isTauri() ? "DESKTOP" : "WEB"}
+                {isTauri() ? "NATIVE" : "WEB"}
               </span>
             </span>
           </div>
@@ -529,10 +553,10 @@ export default function App() {
               className="bg-slate-900 border border-slate-700 text-[10px] text-emerald-400 font-bold rounded px-1 py-0.5 outline-none cursor-pointer"
             >
               <option value="AUTO">MODE: AUTO</option>
-              <option value="MCQ">MODE: MCQ</option>
+              <option value="MCQ">MODE: DIAGNOSTIC</option>
               <option value="CODING">MODE: CODE</option>
               <option value="SQL">MODE: SQL</option>
-              <option value="BEHAVIORAL">MODE: RESUME</option>
+              <option value="BEHAVIORAL">MODE: SYSTEM</option>
             </select>
 
             <button 
@@ -540,7 +564,7 @@ export default function App() {
               tabIndex={-1} 
               className="flex items-center gap-1 text-[10px] bg-slate-800 hover:bg-slate-700 text-white font-bold px-2 py-0.5 rounded border border-slate-600"
             >
-              VAULT
+              CONFIG
             </button>
 
             <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-800 text-emerald-400 border border-emerald-500/50 pointer-events-none">
@@ -553,9 +577,9 @@ export default function App() {
         {showSettings && (
           <div className="absolute inset-x-4 top-14 bottom-12 bg-slate-900/95 backdrop-blur-md border border-slate-700 rounded-lg p-4 z-50 flex flex-col justify-between">
             <div>
-              <h3 className="text-xs font-bold text-emerald-400 mb-2 uppercase tracking-wider">User Settings & Resume Vault</h3>
+              <h3 className="text-xs font-bold text-emerald-400 mb-2 uppercase tracking-wider">Engine Configuration</h3>
               
-              <label className="text-[10px] text-slate-400 block mb-1">Custom Gemini API Key (BYOK / Free Tier):</label>
+              <label className="text-[10px] text-slate-400 block mb-1">Upstream Routing Key:</label>
               <input 
                 type="password"
                 placeholder="AIzaSy..."
@@ -565,10 +589,10 @@ export default function App() {
                 className="w-full bg-slate-950 border border-slate-700 text-white text-xs p-2 rounded mb-3 outline-none focus:border-emerald-500"
               />
 
-              <label className="text-[10px] text-slate-400 block mb-1">Candidate Resume Context:</label>
+              <label className="text-[10px] text-slate-400 block mb-1">Telemetry Context Parameters:</label>
               <textarea 
                 rows={5}
-                placeholder="Paste your resume, project highlights, or background info here..."
+                placeholder="Paste active environment variables or system context here..."
                 value={resumeText}
                 onChange={(e) => setResumeText(e.target.value)}
                 tabIndex={-1} 
@@ -577,7 +601,7 @@ export default function App() {
             </div>
 
             <div className="flex gap-2">
-              <button onClick={saveSettings} tabIndex={-1} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold py-2 rounded uppercase tracking-wider">Save & Inject Vault</button>
+              <button onClick={saveSettings} tabIndex={-1} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold py-2 rounded uppercase tracking-wider">Save Configuration</button>
               <button onClick={() => setShowSettings(false)} tabIndex={-1} className="bg-slate-800 text-slate-300 text-xs font-bold px-4 py-2 rounded">Cancel</button>
             </div>
           </div>

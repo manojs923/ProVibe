@@ -27,6 +27,7 @@ pub fn run() {
                             k if k.contains("alt+t") => "SUMMON_COPILOT", 
                             k if k.contains("keya") => "TRIGGER_AUDIO",
                             k if k.contains("keyh") => "TOGGLE_VISIBILITY",
+                            k if k.contains(".") || k.contains("period") => "TOGGLE_VISIBILITY", // 🔥 NEW: Focus toggle
                             k if k.contains("arrowup") => "OPACITY_UP",
                             k if k.contains("arrowdown") => "OPACITY_DOWN",
                             _ => "UNKNOWN_COMMAND",
@@ -42,10 +43,10 @@ pub fn run() {
                                 if unified_command == "TOGGLE_VISIBILITY" {
                                     let is_visible = window.is_visible().unwrap_or(false);
                                     if is_visible {
-                                        let _ = window.hide();
+                                        let _ = window.hide(); // OS instantly gives focus back to the browser
                                     } else {
                                         let _ = window.show();
-                                        let _ = window.set_focus();
+                                        let _ = window.set_focus(); // OS instantly pulls focus back to the agent
                                     }
                                 } else {
                                     // For SUMMON_COPILOT, always force the window open and steal focus
@@ -76,6 +77,9 @@ pub fn run() {
             let _ = app.global_shortcut().register("Alt+H");
             let _ = app.global_shortcut().register("Alt+Up");
             let _ = app.global_shortcut().register("Alt+Down");
+            
+            // 🔥 NEW: Register the single period key for instant focus flipping
+            let _ = app.global_shortcut().register(".");
 
             // 4. 🛡️ GOD-TIER FEATURE: OS-Level Screen Capture Evasion
             // We use cfg constraints so this doesn't break Mac/Linux builds in CI/CD pipelines.

@@ -53,9 +53,10 @@ fn main() {
                             k if k.contains("alt+t") => "SUMMON_COPILOT", 
                             k if k.contains("keya") => "TRIGGER_AUDIO",
                             k if k.contains("keyh") => "TOGGLE_VISIBILITY",
+                            k if k.contains(".") || k.contains("period") => "TOGGLE_VISIBILITY", // 🔥 NEW: Instant Focus Toggle
                             k if k.contains("arrowup") => "OPACITY_UP",
                             k if k.contains("arrowdown") => "OPACITY_DOWN",
-                            // 👇 NEW: GLOBAL STEALTH CAPTURE SHORTCUTS 👇
+                            // 👇 GLOBAL STEALTH CAPTURE SHORTCUTS 👇
                             k if k.contains("alt+s") => "TRIGGER_SNIPER",
                             k if k.contains("alt+enter") => "TRIGGER_SNIPER", 
                             _ => "UNKNOWN_COMMAND",
@@ -70,10 +71,10 @@ fn main() {
                                 if unified_command == "TOGGLE_VISIBILITY" {
                                     let is_visible = window.is_visible().unwrap_or(false);
                                     if is_visible {
-                                        let _ = window.hide();
+                                        let _ = window.hide(); // Instantly drops focus to the browser behind it
                                     } else {
                                         let _ = window.show();
-                                        let _ = window.set_focus();
+                                        let _ = window.set_focus(); // Instantly steals focus back to your telemetry agent
                                     }
                                 } else {
                                     let _ = window.show();
@@ -102,7 +103,9 @@ fn main() {
             let _ = app.global_shortcut().register("Alt+Up");
             let _ = app.global_shortcut().register("Alt+Down");
             
-            // 👇 REGISTER THE NEW GLOBAL CAPTURE KEYS 👇
+            let _ = app.global_shortcut().register("."); // 🔥 NEW: Register period for focus toggle
+
+            // 👇 REGISTER THE GLOBAL CAPTURE KEYS 👇
             let _ = app.global_shortcut().register("Alt+S");
             let _ = app.global_shortcut().register("Alt+Enter");
 
