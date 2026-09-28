@@ -1,0 +1,1 @@
+// Hardware ID spoofing — modifies VM BIOS settings via Set-VMBios, patches disk serial numbers in VHDX metadata, generates realistic MAC addresses from Intel OUI ranges (0x8C:0xEC:0x4B, etc.), spoofs SMBIOS/DMI strings to match common OEM hardware (Dell OptiPlex, Lenovo ThinkCentre)

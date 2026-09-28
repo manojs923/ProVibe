@@ -1,0 +1,1 @@
+// Patch injection engine — executes patches inside the VM via PowerShell remoting over the loopback RDP channel. Methods: registry modifications, driver patching via sc.exe, service disabling, WMI namespace hiding, ETW provider suppression

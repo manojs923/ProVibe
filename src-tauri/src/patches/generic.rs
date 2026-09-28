@@ -1,0 +1,1 @@
+// Fallback patch set for unidentified targets — applies broad-spectrum stealth: hypervisor bit masking, generic process hiding, timing normalization. Less effective than targeted patches but provides baseline evasion

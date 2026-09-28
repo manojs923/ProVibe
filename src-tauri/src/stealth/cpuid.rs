@@ -1,0 +1,1 @@
+// Configures CPUID masking in Hyper-V VM settings — Set-VMProcessor -VMName X -HideHypervisorPresent $true. Patches CPUID leaf 0x40000000 to return zeroed data (removes hypervisor signature)

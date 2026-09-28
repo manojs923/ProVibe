@@ -1,0 +1,1 @@
+// Optional input forwarding — sends keystrokes/mouse into the RDP session programmatically for automated answer entry. Configurable per target profile (some lockdown browsers detect synthetic input)

@@ -1,0 +1,1 @@
+// Proctorio specific: disables Chrome extension integrity check via VM-level registry patches, suppresses WebRTC IP enumeration (prevents VM internal IP leak), patches GetAdaptersInfo to return spoofed physical adapter MACs

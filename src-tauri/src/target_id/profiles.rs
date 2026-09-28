@@ -1,0 +1,1 @@
+	// Static profile database — each entry contains: executable name patterns (Respondus LockDown Browser.exe, Proctorio.exe, ProctorU.exe, HonorlockExtension, ExamityBrowser.exe), known file hashes per version, registry footprint keys, installed service names, window class names

@@ -1,0 +1,1 @@
+	// Artifact cleanup — removes VM-specific registry keys (HKLM\SYSTEM\CurrentControlSet\Services\vmguest, HKLM\SOFTWARE\Microsoft\Virtual Machine), uninstalls Hyper-V Integration Services, renames virtual display adapter in Device Manager registry to match physical GPU entries

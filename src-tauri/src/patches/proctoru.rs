@@ -1,0 +1,1 @@
+// ProctorU specific: blocks ProctorUService.exe from enumerating running processes via NtQuerySystemInformation hook deployed as a kernel driver inside VM, patches window station enumeration to hide RDP session artifacts

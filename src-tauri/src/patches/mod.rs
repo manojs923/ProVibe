@@ -1,0 +1,1 @@
+	// Patch registry — maps patch_set_id from target profile to concrete patch implementations. load_patches(target_id) -> Vec<Patch>

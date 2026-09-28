@@ -1,0 +1,1 @@
+	// Fuzzy matching — handles version drift by matching on executable name + publisher signature + registry artifacts rather than exact hash. Returns TargetProfile struct with: target_id, display_name, detection_vectors: Vec<DetectionVector>, patch_set_id, vm_config_override: Option<VMConfig>

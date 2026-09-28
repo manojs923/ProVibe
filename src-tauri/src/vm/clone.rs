@@ -1,0 +1,1 @@
+	// Clones from a pre-built base VHDX image (sysprep'd, minimal Windows install with RDP enabled) to a new differencing disk. This is what makes spin-up take seconds instead of minutes

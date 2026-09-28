@@ -1,0 +1,1 @@
+	// Respondus LockDown Browser specific: disables RespondusLLB service watchdog, patches registry keys at HKLM\SOFTWARE\Respondus, suppresses virtual device detection by renaming VM-specific device IDs in registry, patches QueryPerformanceFrequency return to match bare metal timing

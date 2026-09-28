@@ -1,0 +1,1 @@
+// Enumerates running processes via Win32 EnumProcesses + OpenProcess, extracts executable paths, computes SHA-256 hashes, checks digital signatures

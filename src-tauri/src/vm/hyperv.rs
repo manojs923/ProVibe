@@ -1,0 +1,1 @@
+	// Hyper-V management via PowerShell Invoke-Command and WMI (Msvm_ComputerSystem, Msvm_VirtualSystemManagementService). Creates VM, configures CPU/RAM/disk, attaches to private virtual switch bound to loopback adapter

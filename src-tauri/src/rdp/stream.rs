@@ -1,0 +1,1 @@
+// Captures the RDP client window's rendered output (not the VM framebuffer — the pixels as displayed on the host monitor). This is the optical air-gap — we never touch VM memory, only what RDP renders to our screen

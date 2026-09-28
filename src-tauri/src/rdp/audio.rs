@@ -1,0 +1,1 @@
+	// RDP audio redirection capture — intercepts audio stream from the RDP session for the speech-to-text pipeline (interview scenarios where questions are spoken)

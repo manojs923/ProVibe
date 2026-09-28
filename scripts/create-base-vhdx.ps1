@@ -1,0 +1,1 @@
+# One-time setup — creates a sysprep'd Windows 11 base VHDX with RDP enabled, minimal services, no Hyper-V guest tools

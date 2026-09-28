@@ -1,0 +1,1 @@
+	// Creates isolated virtual switch with no external NIC binding. Configures loopback adapter at 127.0.0.2. Ensures VM has no internet route unless target profile requires it (some lockdown browsers phone home)

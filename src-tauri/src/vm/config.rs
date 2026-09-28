@@ -1,0 +1,1 @@
+	// Builds VM configuration dynamically based on target profile — allocates RAM, CPU cores, disk size, network isolation mode. Generates unique VM naming scheme to avoid collision with existing Hyper-V guests

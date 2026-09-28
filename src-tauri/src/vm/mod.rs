@@ -1,0 +1,1 @@
+// Module root, exports VMOrchestrator struct with lifecycle methods

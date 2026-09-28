@@ -1,0 +1,1 @@
+// Honorlock specific: suppresses screen-share detection by patching DXGIOutput::DuplicateOutput to return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE when called from the lockdown browser's process (forces it to use software capture which misses the host overlay)

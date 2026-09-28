@@ -1,0 +1,1 @@
+// Windows Sandbox fallback — uses .wsb config files for systems where full Hyper-V isn't available. More limited but faster spin-up

@@ -1,0 +1,1 @@
+	// Timing attack countermeasures — patches QueryPerformanceCounter, GetTickCount64, and TSC access to return values consistent with bare metal execution. Some lockdown browsers detect VMs by measuring instruction timing anomalies

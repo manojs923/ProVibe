@@ -1,0 +1,1 @@
+	// Spawns mstsc.exe with generated .rdp file targeting 127.0.0.2. Configures: full address:s:127.0.0.2, desktopwidth:i:1920, desktopheight:i:1080, authentication level:i:0, enablecredsspsupport:i:0, prompt for credentials:i:0. Uses stored credentials for silent connect

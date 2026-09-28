@@ -1,0 +1,1 @@
+// spawn_vm() → wait_for_boot() → verify_rdp_ready() → destroy_vm(). Includes checkpoint/restore for fast re-deployment between sessions
