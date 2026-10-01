@@ -22,11 +22,15 @@
         "shadow": false,
         "alwaysOnTop": true,
         "contentProtected": true,
-        "center": false
+        "center": false,
+        "skipTaskbar": true,
+        "focus": false,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "capabilities": ["default"]
     }
   },
   "bundle": {
@@ -38,6 +42,23 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": [
+      "resources/base.vhdx",
+      "resources/patches/*.bin",
+      "scripts/*.ps1"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "wix": {
+        "language": "en-US"
+      },
+      "nsis": {
+        "installMode": "perMachine",
+        "displayLanguageSelector": false
+      }
+    }
   }
 }

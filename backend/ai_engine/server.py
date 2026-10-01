@@ -21,11 +21,19 @@ try:
     import keyboard
     from PIL import ImageGrab
     import pyaudiowpatch as pyaudio
+    import mss
+    import cv2
+    import pyvirtualcam
+    import pygetwindow as gw
 except ImportError:
     print("[☁️ CLOUD MODE] Native OS libraries skipped. Waiting for Tauri payloads...")
     keyboard = None
     ImageGrab = None
     pyaudio = None
+    mss = None
+    cv2 = None
+    pyvirtualcam = None
+    gw = None
 
 load_dotenv()
 
@@ -68,6 +76,7 @@ if not supabase_clients:
 sessions_ws = {}          # session_code -> set of connected websocket clients
 session_states = {}       # session_code -> isolated state data for that session
 local_active_session = "" # Tracks the primary local desktop session for hardware hooks
+cam_spoof_active = threading.Event() 
 
 hooks_registered = False
 
@@ -187,34 +196,51 @@ def setup_keyboard_hooks(main_loop):
     except Exception as e:
         print(f"[⚠️ WARNING] Could not bind global hotkeys (Cloud environment?): {e}")
 
+# =====================================================================
+# MSB VIRTUAL CAMERA SPOOF
+# =====================================================================
+def virtual_camera_loop():
+    if not cv2 or not pyvirtualcam: return
+    video = cv2.VideoCapture("assets/loop.mp4")
+    width, height = int(video.get(3)), int(video.get(4))
+    
+    with pyvirtualcam.Camera(width=width, height=height, fps=30, fmt=pyvirtualcam.PixelFormat.BGR) as cam:
+        while cam_spoof_active.is_set():
+            ret, frame = video.read()
+            if not ret:
+                video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            cam.send(frame)
+            cam.sleep_until_next_frame()
+
+def get_vm_window_rect():
+    windows = gw.getWindowsWithTitle("exam_stealth_vm") or gw.getWindowsWithTitle("Virtual Machine Connection")
+    if windows:
+        win = windows[0]
+        return {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
+    return None
+
 async def buffer_screenshot(session_code=None):
-    if not session_code:
-        session_code = local_active_session
-    if not session_code: 
-        return
-        
+    session_code = session_code or local_active_session
     state = get_session_state(session_code)
-    try:
-        img = ImageGrab.grab()
+    
+    rect = get_vm_window_rect()
+    if not rect:
+        await broadcast_to_ui({"status": "error", "data": "vm window not found."}, session_code)
+        return
+
+    with mss.mss() as sct:
+        monitor = {"top": rect["top"], "left": rect["left"], "width": rect["width"], "height": rect["height"]}
+        sct_img = sct.grab(monitor)
+        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         img.thumbnail((1280, 1280))
-        
-        save_dir = "screenshots"
-        os.makedirs(save_dir, exist_ok=True)
-        timestamp = int(time.time())
-        file_path = os.path.join(save_dir, f"snipe_{timestamp}.jpg")
-        
-        img.save(file_path, format="JPEG", quality=75)
-        
         state["buffer"].append(img)
         
         await broadcast_to_ui({
             "status": "loading",
-            "transcript": f"📸 Buffered {len(state['buffer'])} screenshot(s). Scroll & Double-Tab again, or press [ENTER] to process..."
+            "transcript": f"📸 optical air-gap buffered {len(state['buffer'])} frame(s) from vm."
         }, session_code)
-    except Exception as e:
-        error_msg = f"Failed to buffer screenshot (Headless environment?): {e}"
-        print(error_msg)
-        await broadcast_to_ui({"status": "error", "data": error_msg}, session_code)
+
 
 # 🛡️ THE MULTI-DB CLOUD UPLOAD THREAD
 def sync_upload_batch(images, session_code, batch_id):
@@ -482,6 +508,17 @@ async def ws_handler(websocket):
 
             if action == "set_mode":
                 get_session_state(session_code)["mode"] = payload.get("mode", "AUTO")
+                
+            elif action == "set_target_browser":
+                target = payload.get("target", "SEB")
+                state["mode"] = target
+                if target == "MSB" and not cam_spoof_active.is_set():
+                    cam_spoof_active.set()
+                    threading.Thread(target=virtual_camera_loop, daemon=True).start()
+                elif target == "SEB":
+                    cam_spoof_active.clear()
+                await broadcast_to_ui({"status": "idle", "transcript": f"backend target locked to {target}"}, session_code)
+
                 
             elif action == "capture_screen":
                 if client_type != "desktop":

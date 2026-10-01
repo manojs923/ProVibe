@@ -69,6 +69,10 @@ export default function App() {
   const [resumeText, setResumeText] = useState("");
   const [taskMode, setTaskMode] = useState<"AUTO" | "MCQ" | "CODING" | "SQL" | "BEHAVIORAL">("AUTO");
 
+  // new state for vm orchestration
+  const [targetBrowser, setTargetBrowser] = useState<"SEB" | "MSB">("SEB");
+  const [vmStatus, setVmStatus] = useState<"OFFLINE" | "BOOTING" | "HOOKED">("OFFLINE");
+
   const wsRef = useRef<WebSocket | null>(null);
   const taskModeRef = useRef(taskMode);
   
@@ -231,17 +235,37 @@ export default function App() {
 
   // 4. MULTI-PLATFORM MEDIA & ACTION TRIGGERS (BUFFER + BATCH)
 
-  // A. Triggered by Double-Tab: Takes a native shot and stores it in React memory
+  // new function to spin up the bypass environment
+  const engageHypervisor = async () => {
+    if (!isTauri()) return;
+    try {
+      setVmStatus("BOOTING");
+      setTranscript(`initiating hyper-v stealth container for ${targetBrowser}...`);
+      
+      // this will call our new rust module to spin up the vm and patch it
+      await invoke("launch_stealth_vm", { target: targetBrowser });
+      
+      setVmStatus("HOOKED");
+      setTranscript(`rdp loopback established on 127.0.0.2. ${targetBrowser} is sandboxed.`);
+    } catch (err) {
+      console.error(err);
+      setVmStatus("OFFLINE");
+      setTranscript("critical failure: hypervisor hook rejected.");
+    }
+  };
+
+  // updated capture logic
   const bufferNativeScreenshot = async (keyName: string) => {
     if (isTauri()) {
       try {
-        const base64Image: string = await invoke("capture_screen_native");
+        // updated invoke: we tell rust to only capture the rdp window
+        const base64Image: string = await invoke("capture_rdp_window", { ip: "127.0.0.2" });
         const dataUrl = `data:image/jpeg;base64,${base64Image}`;
         imageBufferRef.current.push(dataUrl);
-        setTranscript(`📸 Buffered ${imageBufferRef.current.length} frame(s) via ${keyName}... Press [ENTER] to send.`);
+        setTranscript(`📸 buffered ${imageBufferRef.current.length} rdp frame(s) via ${keyName}...`);
       } catch (err) {
         console.error(err);
-        setTranscript("Native capture failed: Ensure main.rs is updated.");
+        setTranscript("capture failed: is the rdp tunnel active?");
       }
     } else {
       setTranscript(`📸 Buffered signal via ${keyName} (Browser)... Press [ENTER] to capture`);
@@ -546,6 +570,32 @@ export default function App() {
           </div>
           
           <div className="flex items-center gap-2">
+            {/* new target selector */}
+            <select 
+              value={targetBrowser} 
+              onChange={(e) => setTargetBrowser(e.target.value as any)}
+              tabIndex={-1} 
+              className="bg-slate-900 border border-slate-700 text-[10px] text-purple-400 font-bold rounded px-1 py-0.5 outline-none cursor-pointer"
+            >
+              <option value="SEB">TARGET: SEB</option>
+              <option value="MSB">TARGET: MSB</option>
+            </select>
+
+            {/* new hypervisor ignition switch */}
+            <button 
+              onClick={engageHypervisor}
+              disabled={vmStatus !== "OFFLINE"}
+              tabIndex={-1} 
+              className={`flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded border ${
+                vmStatus === "OFFLINE" ? "bg-red-900/50 text-red-400 border-red-700 hover:bg-red-800" : 
+                vmStatus === "BOOTING" ? "bg-yellow-900/50 text-yellow-400 border-yellow-700" : 
+                "bg-purple-900/50 text-purple-400 border-purple-700"
+              }`}
+            >
+              {vmStatus === "OFFLINE" ? "ENGAGE VM" : vmStatus}
+            </button>
+
+            {/* existing task mode selector */}
             <select 
               value={taskMode} 
               onChange={(e) => setTaskMode(e.target.value as any)}
