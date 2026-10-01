@@ -18,21 +18,25 @@ use windows::Win32::Foundation::HWND;
 // 📸 THE SILENT SCREEN CAPTURE COMMAND
 #[tauri::command]
 async fn capture_screen_native() -> Result<String, String> {
-    // 1. Detect monitors natively (No browser popups!)
-    let screens = Screen::all().map_err(|e| e.to_string())?;
-    let screen = screens.first().ok_or("No monitor detected")?;
-    
-    // 2. Snap the screen
-    let image = screen.capture().map_err(|e| e.to_string())?;
-    
-    // 3. Compress heavily into JPEG in-memory for lightning-fast network upload
-    let mut buffer = Vec::new();
-    let mut cursor = Cursor::new(&mut buffer);
-    let dynamic_image = image::DynamicImage::ImageRgba8(image);
-    dynamic_image.write_to(&mut cursor, image::ImageOutputFormat::Jpeg(75)).map_err(|e| e.to_string())?;
-    
-    // 4. Encode to Base64 and return to React
-    Ok(STANDARD.encode(&buffer))
+    // use a task block to keep the executor snappy
+    tokio::task::spawn_blocking(move || {
+        let screens = Screen::all().map_err(|e| e.to_string())?;
+        // capture primary screen (usually index 0)
+        let screen = screens.first().ok_or("monitor_not_found")?;
+        
+        let image = screen.capture().map_err(|e| e.to_string())?;
+        let mut buffer = Vec::new();
+        let mut cursor = Cursor::new(&mut buffer);
+        
+        // convert to dynamic image for processing
+        let dynamic_image = image::DynamicImage::ImageRgba8(image);
+        
+        // 75 quality is the sweet spot for reading text while keeping payloads < 200kb
+        dynamic_image.write_to(&mut cursor, image::ImageOutputFormat::Jpeg(75))
+            .map_err(|e| e.to_string())?;
+        
+        Ok(STANDARD.encode(&buffer))
+    }).await.map_err(|e| e.to_string())?
 }
 
 fn main() {
@@ -117,10 +121,10 @@ fn main() {
                         let hwnd = hwnd_wrapper.0 as isize;
                         
                         unsafe {
-                            let _ = SetWindowDisplayAffinity(
-                                HWND(hwnd as _), 
-                                WDA_EXCLUDEFROMCAPTURE
-                            );
+                            let result = SetWindowDisplayAffinity(HWND(hwnd as _), WDA_EXCLUDEFROMCAPTURE);
+                            if result.is_err() {
+                                eprintln!("🛡️ stealth failure: os blocked drm evasion. check permissions.");
+                            }
                         }
                         
                         #[cfg(debug_assertions)]

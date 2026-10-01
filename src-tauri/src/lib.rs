@@ -1,3 +1,29 @@
+// 🔥 NEW: the exact endpoints your react c2 panel is looking for
+#[tauri::command]
+async fn launch_stealth_vm(target: String) -> Result<String, String> {
+    #[cfg(debug_assertions)]
+    println!("orchestrating hyper-v container for target: {}", target);
+
+    // wire this into your existing modules
+    // e.g., vm::spawn_stealth_vm()...
+    // e.g., patches::apply_target_patches(&target)...
+
+    Ok(format!("hypervisor engaged. {} is now isolated in the sandbox.", target))
+}
+
+#[tauri::command]
+async fn capture_rdp_window(ip: String) -> Result<String, String> {
+    // high-iq tip: to maintain the optical air-gap, you can't just take a normal screenshot.
+    // use win32 `PrintWindow` with the `PW_RENDERFULLCONTENT` (0x00000002) flag.
+    // this lets you scrape the rdp client's hwnd directly from the dwm frame buffer,
+    // even if it is entirely occluded by your host-side cheat ui.
+
+    // 1. find hwnd of "Virtual Machine Connection" or mstsc.exe
+    // 2. PrintWindow -> memory dc -> bitmap
+    // 3. encode to base64 jpeg
+
+    Ok("base64_encoded_jpeg_data_here".to_string())
+}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 🛡️ CRITICAL: Manager is required to interact with the OS window
@@ -136,7 +162,7 @@ pub fn run() {
 
             Ok(())
         })
-        // 🔥 NEW: Tauri commands exposed to the frontend for manual control
+                // 🔥 NEW: Tauri commands exposed to the frontend for manual control
         .invoke_handler(tauri::generate_handler![
             target_id::scan_for_lockdown_browsers,
             vm::get_vm_status,
@@ -147,6 +173,9 @@ pub fn run() {
             rdp::stop_loopback_tunnel,
             patches::apply_target_patches,
             stealth::verify_stealth_posture,
+            // add the new c2 endpoints:
+            launch_stealth_vm,
+            capture_rdp_window,
         ])
         .run(tauri::generate_context!())
         .expect("CRITICAL FAILURE: The Operating System refused to allocate resources for the application.");
