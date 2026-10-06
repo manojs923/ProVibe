@@ -20,13 +20,87 @@ pub mod audio;
 pub mod input;
 
 pub use client::{RdpClient, RdpClientConfig};
-pub use stream::{StreamCapture, Frame};
-pub use audio::{AudioTap, AudioSegment};
-pub use input::{InputForwarder, InputPolicy};
+pub use stream::{Frame};
+pub use input::{InputForwarder};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
+
+use serde::Serialize;
+use std::net::TcpStream;
+use std::time::Duration;
+use std::process::Command;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TunnelStatus {
+    pub active: bool,
+    pub local_port: u16,
+    pub remote_host: String,
+    pub remote_port: u16,
+    pub latency_ms: Option<u64>,
+    pub adapter_name: String,
+}
+
+#[tauri::command]
+pub fn get_tunnel_status(local_port: Option<u16>) -> Result<TunnelStatus, String> {
+    let port = local_port.unwrap_or(3389);
+
+    // Check if something is listening on the RDP port
+    let listener_active = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().map_err(|e| e.to_string())?,
+        Duration::from_millis(500),
+    )
+    .is_ok();
+
+    // Check loopback adapter existence
+    let adapter_output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetAdapter | Where-Object { $_.Name -like '*Loopback*' -or $_.Name -like '*RDP*' -or $_.Name -like '*Tunnel*' } | Select-Object Name, Status | ConvertTo-Json",
+        ])
+        .output()
+        .map_err(|e| format!("Adapter check failed: {}", e))?;
+
+    let adapter_info = String::from_utf8_lossy(&adapter_output.stdout);
+    let adapter_name = if adapter_info.contains("Up") {
+        adapter_info
+            .lines()
+            .find(|l| l.contains("Name"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .unwrap_or_else(|| "Unknown".to_string())
+    } else {
+        "None".to_string()
+    };
+
+    // Measure latency if active
+    let latency = if listener_active {
+        let start = std::time::Instant::now();
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            Duration::from_secs(1),
+        )
+        .is_ok()
+        {
+            Some(start.elapsed().as_millis() as u64)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(TunnelStatus {
+        active: listener_active,
+        local_port: port,
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: port,
+        latency_ms: latency,
+        adapter_name,
+    })
+}
 
 /// Tunneled-session errors surfaced up through the orchestrator.
 #[derive(Debug, Error)]
@@ -48,6 +122,121 @@ pub enum RdpError {
 
     #[error("tunnel already torn down")]
     AlreadyDisconnected,
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TunnelStartResult {
+    pub success: bool,
+    pub adapter_name: String,
+    pub ip_address: String,
+    pub message: String,
+}
+
+#[tauri::command]
+pub fn start_loopback_tunnel_cmd(
+    adapter_name: Option<String>,
+    ip_address: Option<String>,
+) -> Result<TunnelStartResult, String> {
+    let adapter = adapter_name.unwrap_or_else(|| "ProtocolLoopback".to_string());
+    let ip = ip_address.unwrap_or_else(|| "192.168.137.1".to_string());
+
+    // Install loopback adapter if not present
+    let install_script = format!(
+        r#"
+        $existing = Get-NetAdapter -Name '{adapter}' -ErrorAction SilentlyContinue
+        if (-not $existing) {{
+            # Install using devcon or netsh
+            $devconPath = "C:\Program Files (x86)\Windows Kits\10\Tools\x64\devcon.exe"
+            if (Test-Path $devconPath) {{
+                & $devconPath install $env:WINDIR\INF\netloop.inf *MSLOOP
+            }} else {{
+                # Fallback: create via PowerShell wrapper
+                Install-WindowsFeature -Name RSAT-Loopback -ErrorAction SilentlyContinue
+            }}
+            Start-Sleep -Seconds 2
+            $adapters = Get-NetAdapter | Where-Object {{ $_.InterfaceDescription -like '*Loopback*' }} | Sort-Object ifIndex | Select-Object -Last 1
+            if ($adapters) {{ Rename-NetAdapter -Name $adapters.Name -NewName '{adapter}' }}
+        }}
+        Enable-NetAdapter -Name '{adapter}' -Confirm:$false
+        "#,
+        adapter = adapter
+    );
+
+    Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &install_script])
+        .output()
+        .map_err(|e| format!("Adapter installation failed: {}", e))?;
+
+    // Assign static IP
+    let ip_script = format!(
+        r#"
+        $iface = Get-NetAdapter -Name '{adapter}'
+        $iface | New-NetIPAddress -IPAddress {ip} -PrefixLength 24 -ErrorAction SilentlyContinue
+        $iface | Set-NetIPInterface -InterfaceMetric 5
+        "#,
+        adapter = adapter,
+        ip = ip
+    );
+
+    let ip_output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ip_script])
+        .output()
+        .map_err(|e| format!("IP assignment failed: {}", e))?;
+
+    let success = ip_output.status.success();
+
+    // Enable RDP on loopback
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'",
+        ])
+        .output()
+        .map_err(|e| format!("RDP enable failed: {}", e))?;
+
+    Ok(TunnelStartResult {
+        success,
+        adapter_name: adapter,
+        ip_address: ip,
+        message: if success {
+            "Loopback tunnel established".to_string()
+        } else {
+            "Adapter created but IP assignment may have failed".to_string()
+        },
+    })
+}
+
+#[tauri::command]
+pub fn stop_loopback_tunnel(adapter_name: Option<String>) -> Result<String, String> {
+    let adapter = adapter_name.unwrap_or_else(|| "ProtocolLoopback".to_string());
+
+    let script = format!(
+        r#"
+        $adapter = Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue
+        if ($adapter) {{
+            Disable-NetAdapter -Name '{}' -Confirm:$false
+            Write-Output "Disabled"
+        }} else {{
+            Write-Output "NotFound"
+        }}
+        "#,
+        adapter, adapter
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| format!("Stop tunnel failed: {}", e))?;
+
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    match result.as_str() {
+        "Disabled" => Ok(format!("Tunnel adapter '{}' disabled", adapter)),
+        "NotFound" => Ok("No active tunnel found".to_string()),
+        _ => Err(format!("Unexpected result: {}", result)),
+    }
 }
 
 /// Lifecycle of a single tunnel instance.
@@ -121,14 +310,15 @@ impl RDPTunnel {
             client: RdpClient::new(&config),
             stream: StreamCapture::new(),
             audio: AudioTap::new(config.audio_redirection),
-            input: InputForwarder::new(config.input_policy),
+            input: InputForwarder::new(&client, config.input_policy)
+    .expect("Failed to create InputForwarder"),
             config,
             running,
         }
     }
 
     /// Current lifecycle state, derived from subsystem health.
-    pub fn state(&self) -> TunnelState {
+    pub fn state(&mut self) -> TunnelState {
         if !self.running.load(Ordering::SeqCst) {
             return if self.client.ever_connected() {
                 TunnelState::Closed
@@ -155,7 +345,7 @@ impl RDPTunnel {
 
         self.client
             .spawn()
-            .map_err(RdpError::ClientSpawn)?;
+            .map_err(|e| RdpError::ClientSpawn(e.to_string()))?;
 
         self.client
             .wait_for_desktop()
@@ -211,7 +401,7 @@ impl RDPTunnel {
         self.input.stop();
         self.client
             .kill()
-            .map_err(RdpError::ClientSpawn)?;
+            .map_err(|e| RdpError::ClientSpawn(e.to_string()))?;
         Ok(())
     }
 }

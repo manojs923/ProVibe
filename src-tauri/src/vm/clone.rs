@@ -56,7 +56,7 @@ pub fn create_differencing_disk(
     fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create VM disk directory: {}", e))?;
 
-    let disk_path = output_dir.join(format!("{}_diff.vhdx", vm_name);
+    let disk_path = output_dir.join(format!("{}_diff.vhdx", vm_name));
 
     // If a stale differencing disk exists from a previous run, nuke it.
     // We don't want the new session inheriting old writes.

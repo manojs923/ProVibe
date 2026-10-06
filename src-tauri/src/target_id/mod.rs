@@ -3,7 +3,79 @@ pub mod profiles;
 pub mod matcher;
 
 use serde::{Deserialize, Serialize};
+use sysinfo::{System, Process};
 use std::fmt;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LockdownDetection {
+    pub detected: bool,
+    pub process_name: String,
+    pub pid: u32,
+    pub window_title: Option<String>,
+    pub detection_type: LockdownType,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum LockdownType {
+    Respondus,
+    SafeExamBrowser,
+    Honorlock,
+    Proctorio,
+    ProctorU,
+    Examity,
+    TestInvite,
+    Unknown,
+}
+
+const LOCKDOWN_SIGNATURES: &[(&str, LockdownType)] = &[
+    ("lockdownbrowser", LockdownType::Respondus),
+    ("respondus", LockdownType::Respondus),
+    ("safeexambrowser", LockdownType::SafeExamBrowser),
+    ("seb", LockdownType::SafeExamBrowser),
+    ("honorlock", LockdownType::Honorlock),
+    ("proctorio", LockdownType::Proctorio),
+    ("proctoru", LockdownType::ProctorU),
+    ("examity", LockdownType::Examity),
+    ("testinvite", LockdownType::TestInvite),
+]
+
+
+#[tauri::command]
+pub fn scan_for_lockdown_browsers() -> Vec<LockdownDetection> {
+    let mut sys = System::new_all();
+    sys.refresh_processes();
+
+    let mut detections = Vec::new();
+
+    for (_pid, process) in sys.processes() {
+        let name = process.name().to_lowercase();
+
+        for (signature, ld_type) in LOCKDOWN_SIGNATURES {
+            if name.contains(signature) {
+                detections.push(LockdownDetection {
+                    detected: true,
+                    process_name: process.name().to_string(),
+                    pid: process.pid().as_u32(),
+                    window_title: process.cmd().first().map(|s| s.to_string()),
+                    detection_type: ld_type.clone(),
+                });
+                break;
+            }
+        }
+    }
+
+    if detections.is_empty() {
+        detections.push(LockdownDetection {
+            detected: false,
+            process_name: String::new(),
+            pid: 0,
+            window_title: None,
+            detection_type: LockdownType::Unknown,
+        });
+    }
+
+    detections
+}
 
 /// represents a specific lockdown browser or proctoring system
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -16,8 +88,21 @@ pub enum TargetId {
     Generic, // fallback for unknown glowie tech
 }
 
+impl TargetId {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TargetId::Examity => "examity",
+            TargetId::ProctorU => "proctoru",
+            TargetId::Proctorio => "proctorio",
+            TargetId::Honorlock => "honorlock",
+            TargetId::Respondus => "respondus",
+            TargetId::Unknown => "unknown",
+        }
+    }
+}
+
 impl fmt::Display for TargetId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Formatter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), std::fmt::Error> {
         match self {
             TargetId::Respondus => write!(f, "Respondus LockDown Browser"),
             TargetId::Proctorio => write!(f, "Proctorio"),
@@ -27,6 +112,13 @@ impl fmt::Display for TargetId {
             TargetId::Generic => write!(f, "Generic/Unknown Proctor"),
         }
     }
+}
+
+pub struct InputForwarder {
+    client: Option<RDPClientHandle>,
+    config: InputConfig,
+    rng: rand::rngs::ThreadRng,  // This fixes the thread_rng() error at line 144
+    running: Arc<AtomicBool>,
 }
 
 /// detection vectors used by the matcher to identify the target

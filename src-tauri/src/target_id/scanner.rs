@@ -6,7 +6,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, MAX_PATH};
-use windows_sys::Win32::Security::Cryptography::{
+use windows_sys::Win32::Security::WinTrust::{
     WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
     WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_IGNORE, WTD_UI_NONE,
 };
@@ -75,7 +75,7 @@ pub fn scan_host_artifacts() -> Vec<ScannedArtifact> {
 fn get_process_path(pid: u32) -> Option<String> {
     unsafe {
         let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
+        if handle.is_null() {  
             return None;
         }
 
@@ -130,7 +130,7 @@ fn verify_digital_signature(path: &str) -> bool {
         dwUIChoice: WTD_UI_NONE,
         fdwRevocationChecks: WTD_REVOKE_NONE,
         dwUnionChoice: WTD_CHOICE_FILE,
-        Anonymous: windows_sys::Win32::Security::Cryptography::WINTRUST_DATA_0 {
+        Anonymous: windows_sys::Win32::Security::WinTrust::WINTRUST_DATA_0 {
             pFile: &mut file_info,
         },
         dwStateAction: WTD_STATEACTION_IGNORE,
@@ -145,7 +145,7 @@ fn verify_digital_signature(path: &str) -> bool {
 
     unsafe {
         let status = WinVerifyTrust(
-            std::ptr::null_mut(),
+        std::ptr::null_mut(),
             &mut action_id,
             &mut trust_data as *mut _ as *mut std::ffi::c_void,
         );

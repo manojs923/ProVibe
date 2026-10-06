@@ -12,6 +12,234 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use thiserror::Error;
 
+use serde::Serialize;
+use std::process::Command;
+use sysinfo::{System, SystemExt, ProcessExt};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StealthCheck {
+    pub check_name: String,
+    pub passed: bool,
+    pub status: String,
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StealthPosture {
+    pub overall_score: u8,
+    pub total_checks: usize,
+    pub passed_checks: usize,
+    pub failed_checks: usize,
+    pub checks: Vec<StealthCheck>,
+    pub posture_level: String,
+}
+
+fn check_process_running(signature: &str) -> bool {
+    let mut sys = System::new_all();
+    sys.refresh_processes();
+    sys.processes()
+        .iter()
+        .any(|(_, p)| p.name().to_lowercase().contains(&signature.to_lowercase()))
+}
+
+fn powershell_scalar(script: &str) -> String {
+    Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
+    let mut checks: Vec<StealthCheck> = Vec::new();
+
+    // Check 1: Hypervisor services not leaking to host detection tools
+    let hyperv_running = check_process_running("vmms");
+    checks.push(StealthCheck {
+        check_name: "hyperv_management".to_string(),
+        passed: true, // VMMS running is fine — it's the Guest that matters
+        status: if hyperv_running {
+            "Hyper-V VM Management running (normal)".to_string()
+        } else {
+            "Hyper-V VM Management not running — VMs won't start".to_string()
+        },
+        remediation: if !hyperv_running {
+            Some("Start-Service vmms".to_string())
+        } else {
+            None
+        },
+    });
+
+    // Check 2: RDP window is available for optical capture
+    let rdp_procs = ["mstsc", "vmconnect", "rdpclient"];
+    let rdp_found = rdp_procs.iter().any(|p| check_process_running(p));
+    checks.push(StealthCheck {
+        check_name: "rdp_window_present".to_string(),
+        passed: rdp_found,
+        status: if rdp_found {
+            "RDP/VM window process detected — capture available".to_string()
+        } else {
+            "No RDP or VMConnect window open — nothing to capture".to_string()
+        },
+        remediation: if !rdp_found {
+            Some("Start the RDP session or launch VMConnect before activating overlay".to_string())
+        } else {
+            None
+        },
+    });
+
+    // Check 3: Proctoring software detection (informational — what's running)
+    let proctor_sigs = [
+        "proctorio",
+        "honorlock",
+        "proctoru",
+        "respondus",
+        "lockdownbrowser",
+        "examity",
+        "testinvite",
+    ];
+    let running_proctors: Vec<String> = proctor_sigs
+        .iter()
+        .filter(|sig| check_process_running(sig))
+        .map(|s| s.to_string())
+        .collect();
+
+    checks.push(StealthCheck {
+        check_name: "proctoring_software".to_string(),
+        passed: true, // Informational — optical air-gap makes this irrelevant
+        status: if running_proctors.is_empty() {
+            "No proctoring software detected on Host".to_string()
+        } else {
+            format!("Active proctoring: {} (Guest-side only — optical gap holds)", running_proctors.join(", "))
+        },
+        remediation: None,
+    });
+
+    // Check 4: Tauri overlay window flags
+    let overlay_script = r#"
+        Add-Type -TypeDefinition @'
+        using System;
+        using System.Runtime.InteropServices;
+        public class Win32 {
+            [DllImport("user32.dll")]
+            public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+            [DllImport("user32.dll")]
+            public static extern int GetWindowDisplayAffinity(IntPtr hWnd, out uint affinity);
+        }
+'@
+        $proc = Get-Process | Where-Object { $_.MainWindowTitle -ne '' -and $_.ProcessName -match 'protocol|tauri' } | Select-Object -First 1
+        if ($proc) {
+            $hwnd = $proc.MainWindowHandle
+            $affinity = 0
+            [Win32]::GetWindowDisplayAffinity($hwnd, [ref]$affinity) | Out-Null
+            Write-Output $affinity
+        } else {
+            Write-Output 'no-window'
+        }
+    "#;
+
+    let affinity_result = powershell_scalar(overlay_script);
+    let overlay_protected = affinity_result == "17"; // WDA_EXCLUDEFROMCAPTURE = 0x11
+    checks.push(StealthCheck {
+        check_name: "overlay_capture_protection".to_string(),
+        passed: overlay_protected,
+        status: match affinity_result.as_str() {
+            "17" => "WDA_EXCLUDEFROMCAPTURE active — overlay invisible to screen share".to_string(),
+            "no-window" => "Overlay window not found — is the app running?".to_string(),
+            "0" => "Overlay visible to capture APIs — NOT protected".to_string(),
+            other => format!("Display affinity returned: {}", other),
+        },
+        remediation: if !overlay_protected {
+            Some("Ensure Windows 10 2004+ and overlay is calling SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)".to_string())
+        } else {
+            None
+        },
+    });
+
+    // Check 5: Network adapter state (loopback tunnel)
+    let adapter_result = powershell_scalar(
+        "(Get-NetAdapter | Where-Object { $_.Name -match 'Loopback|Protocol' } | Measure-Object).Count",
+    );
+    let tunnel_ready = adapter_result.parse::<u32>().unwrap_or(0) > 0;
+    checks.push(StealthCheck {
+        check_name: "loopback_tunnel".to_string(),
+        passed: true, // Advisory — tunnel not required for local mode
+        status: if tunnel_ready {
+            "Loopback adapter present — tunnel mode available".to_string()
+        } else {
+            "No loopback adapter — tunnel mode unavailable (local capture still works)".to_string()
+        },
+        remediation: if !tunnel_ready {
+            Some("Run start_loopback_tunnel to provision the adapter".to_string())
+        } else {
+            None
+        },
+    });
+
+    // Check 6: RDP port 3389 listening
+    let port_check = std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:3389".parse().map_err(|e| e.to_string())?,
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok();
+
+    checks.push(StealthCheck {
+        check_name: "rdp_listener".to_string(),
+        passed: port_check,
+        status: if port_check {
+            "RDP listener active on 3389".to_string()
+        } else {
+            "RDP not listening on 3389 — Guest connection may fail".to_string()
+        },
+        remediation: if !port_check {
+            Some("Enable RDP in Guest OS or use vmconnect instead".to_string())
+        } else {
+            None
+        },
+    });
+
+    // Check 7: Windows Defender real-time scanning (can flag the overlay binary)
+    let defender_result = powershell_scalar(
+        "(Get-MpPreference | Select-Object -ExpandProperty DisableRealtimeMonitoring)",
+    );
+    let defender_off = defender_result.contains("True");
+    checks.push(StealthCheck {
+        check_name: "defender_realtime".to_string(),
+        passed: true, // Informational
+        status: if defender_off {
+            "Defender real-time monitoring disabled".to_string()
+        } else {
+            "Defender real-time monitoring ACTIVE — may scan overlay binary".to_string()
+        },
+        remediation: if !defender_off {
+            Some("Add exclusion folder for the protocol binary if scans cause lag".to_string())
+        } else {
+            None
+        },
+    });
+
+    let passed = checks.iter().filter(|c| c.passed).count();
+    let total = checks.len();
+    let failed = total - passed;
+
+    let score = ((passed as f32 / total as f32) * 100.0) as u8;
+    let posture_level = match score {
+        90..=100 => "GREEN".to_string(),
+        70..=89 => "YELLOW".to_string(),
+        0..=69 => "RED".to_string(),
+    };
+
+    Ok(StealthPosture {
+        overall_score: score,
+        total_checks: total,
+        passed_checks: passed,
+        failed_checks: failed,
+        checks,
+        posture_level,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum StealthError {
     #[error("VM handle invalid or VM not running: {0}")]

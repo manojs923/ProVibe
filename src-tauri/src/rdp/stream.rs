@@ -6,15 +6,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
 
 use crate::rdp::client::RdpClient;
 
 #[cfg(windows)]
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, BOOL, RECT, POINT};
+
+
 #[cfg(windows)]
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
-    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
+    IDXGIOutput, IDXGIDevice, IDXGIFactory1,
+    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
 };
 #[cfg(windows)]
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -22,44 +26,46 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, IsWindowVisible, GetClientRect, GetWindowRect,
-    MapWindowPoints, GetWindowTextW,
+    EnumWindows, GetWindowRect, GetWindowTextW, IsWindowVisible,
+    GetClientRect, GetForegroundWindow,
+    SetForegroundWindow, FindWindowW,
 };
+
+use windows::Win32::UI::WindowsAndMessaging::PrintWindow;
+use windows::Win32::Graphics::Gdi::{
+    MapWindowPoints, HDC, HBITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
+    GetDC, GetDIBits, ReleaseDC, SelectObject, BitBlt, SRCCOPY, DIB_RGB_COLORS,
+};
+
 #[cfg(windows)]
 use windows::core::{Interface, HRESULT};
+
+use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum StreamError {
+    #[error("RDP window not found")]
     NoRdpWindow,
+    #[error("backend init failed: {0}")]
     BackendInit(String),
+    #[error("desktop duplication unsupported")]
     DuplicationUnsupported,
+    #[error("frame timeout")]
     FrameTimeout,
+    #[error("window gone")]
     WindowGone,
+    #[error("GDI failure: {0}")]
     GdiFailure(String),
+    #[error("channel closed")]
     ChannelClosed,
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
-
-impl std::fmt::Display for StreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StreamError::NoRdpWindow => write!(f, "no mstsc.exe top-level window found"),
-            StreamError::BackendInit(s) => write!(f, "capture backend failed to init: {}", s),
-            StreamError::DuplicationUnsupported => {
-                write!(f, "DXGI Desktop Duplication unavailable on this system")
-            }
-            StreamError::FrameTimeout => write!(f, "duplicate frame acquisition timed out"),
-            StreamError::WindowGone => write!(f, "target window was closed mid-capture"),
-            StreamError::GdiFailure(s) => write!(f, "GDI fallback failed: {}", s),
-            StreamError::ChannelClosed => write!(f, "frame receiver dropped"),
-        }
-    }
-}
-
-impl std::error::Error for StreamError {}
 
 // ---------------------------------------------------------------------------
 // Frame
@@ -92,11 +98,8 @@ impl Frame {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CaptureBackend {
-    /// DXGI Desktop Duplication — GPU-side, grabs the monitor scanout.
-    /// Highest fidelity, matches exactly what the host monitor displays.
     DesktopDuplication,
-    /// GDI BitBlt fallback — works everywhere, slight color rounding.
-    GdiBlt,
+    Gdi,
 }
 
 #[derive(Debug, Clone)]
@@ -222,8 +225,8 @@ struct EnumState {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: isize) -> i32 {
-    let state = &mut *(lparam as *mut EnumState);
+unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = &mut *(lparam.0 as *mut EnumState);
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     if pid == state.target_pid && IsWindowVisible(hwnd).as_bool() {
@@ -241,7 +244,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: isize) -> i32 {
             }
         }
     }
-    1 // continue enumeration
+    BOOL(1)
 }
 
 /// Locate the top-level visible window belonging to the RDP client process.
@@ -252,11 +255,12 @@ pub fn find_rdp_window(process_id: u32) -> Result<HWND, StreamError> {
         found: None,
     };
     unsafe {
-        let _ = EnumWindows(Some(enum_proc), &mut state as *mut EnumState as isize);
+        // Add this import at the top if missing: use windows::Win32::Foundation::LPARAM;
+        let _ = EnumWindows(Some(enum_proc), windows::Win32::Foundation::LPARAM(&mut state as *mut _ as isize));
     }
     state
         .found
-        .map(|h| HWND(h as *mut _))
+        .map(|h| HWND(h as *mut core::ffi::c_void))
         .ok_or(StreamError::NoRdpWindow)
 }
 
@@ -275,25 +279,25 @@ pub fn window_screen_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
 // ---------------------------------------------------------------------------
 
 pub struct RdpStream {
-    config: StreamConfig,
-    running: Arc<AtomicBool>,
+    frames: std::sync::mpsc::Receiver<Frame>,
     sequence: Arc<AtomicU64>,
-    worker: Option<JoinHandle<()>>,
-    last_error: Arc<Mutex<Option<StreamError>>>,
-    #[allow(dead_code)]
+    worker_handle: Option<JoinHandle<()>>,
+    hwnd: HWND,
+    running: Arc<AtomicBool>,
     rdp_client_pid: Option<u32>,
-}
+    last_error: Arc<Mutex<Option<String>>>,
+    config: StreamConfig,
+}   
 
 impl RdpStream {
     pub fn new(config: StreamConfig) -> Self {
-        Self {
-            config,
-            running: Arc::new(AtomicBool::new(false)),
-            sequence: Arc::new(AtomicU64::new(0)),
-            worker: None,
-            last_error: Arc::new(Mutex::new(None)),
-            rdp_client_pid: None,
-        }
+       Self {
+    frames: rx,
+    sequence: Arc::new(AtomicU64::new(0)),
+    worker_handle: None,
+    hwnd: None,
+    running: Arc::new(AtomicBool::new(false)),
+}
     }
 
     /// Attach to a running RdpClient's spawned mstsc.exe, locate its window,
@@ -318,14 +322,15 @@ impl RdpStream {
         self.running.store(true, Ordering::SeqCst);
 
         let running = Arc::clone(&self.running);
-        let sequence = Arc::clone(&self.sequence);
+        let sequence = self.sequence.clone();
         let last_error = Arc::clone(&self.last_error);
         let config = self.config.clone();
 
         let worker = thread::Builder::new()
             .name("rdp-capture".to_string())
             .spawn(move || {
-                let frame_interval = Duration::from_secs_f64(1.0 / config.target_fps.max(1.0).max(0.1) as f64);
+                let fps = config.target_fps.max(1) as f64;
+                let frame_interval = Duration::from_secs_f64(1.0 / fps.max(0.1));
                 let mut next_frame_at = Instant::now();
 
                 #[cfg(windows)]
@@ -351,7 +356,7 @@ impl RdpStream {
                                 Err(e) => {
                                     // DDA can fail if the window is minimized or occluded
                                     // Fall back to GDI capture in that case
-                                    *last_error.lock().unwrap() = Some(e);
+                                    *last_error.lock().unwrap() = Some(e.to_string());
                                     match Self::acquire_gdi(hwnd, &config, &mut gdi_fallback) {
                                         Ok(f) => f,
                                         Err(e2) => {
@@ -368,7 +373,7 @@ impl RdpStream {
                             match Self::acquire_gdi(hwnd, &config, &mut gdi_fallback) {
                                 Ok(f) => f,
                                 Err(e) => {
-                                    *last_error.lock().unwrap() = Some(e);
+                                    *last_error.lock().unwrap() = Some(e.to_string());
                                     thread::sleep(Duration::from_millis(100));
                                     continue;
                                 }
@@ -381,7 +386,7 @@ impl RdpStream {
                         height: raw.2,
                         stride: raw.3,
                         data: raw.0,
-                        timestamp: SystemTime::now(),
+                        timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
                         sequence: sequence.fetch_add(1, Ordering::SeqCst),
                     };
 
@@ -404,13 +409,13 @@ impl RdpStream {
         hwnd: HWND,
         config: &StreamConfig,
     ) -> Result<(Vec<u8>, u32, u32, usize), StreamError> {
-        use winapi::um::dxgi1_2::{IDXGIResource, DXGI_OUTDUPL_DESC};
-        use winapi::um::dxgi::{IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication};
-        use winapi::Interface;
+        // use winapi::um::dxgi1_2::{IDXGIResource, DXGI_OUTDUPL_DESC};
+        // use winapi::um::dxgi::{IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication};
+        // use winapi::Interface;   -> i have commented it 
 
         // Get the window rect to determine which monitor it's on
-        let mut rect = win32::Win32Rect::default();
-        if unsafe { win32::ffi::GetWindowRect(hwnd, &mut rect) } == 0 {
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) }.is_err() {
             return Err(StreamError::WindowNotFound);
         }
 
@@ -427,28 +432,28 @@ impl RdpStream {
 
             // Acquire next frame with timeout
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut resource: *mut IDXGIResource = std::ptr::null_mut();
-
-            let hr = (*duplication).AcquireNextFrame(
-                config.acquire_timeout_ms,
-                &mut frame_info,
-                &mut resource,
-            );
-
-            if hr != winapi::shared::winerror::S_OK {
-                if hr == winapi::shared::winerror::DXGI_ERROR_WAIT_TIMEOUT {
-                    return Err(StreamError::Timeout);
-                }
-                return Err(StreamError::CaptureFailed(format!("AcquireNextFrame hr=0x{:08X}", hr)));
-            }
-
-            // Map the desktop texture, crop to window rect, and copy pixels
-            // ... (texture mapping and pixel copy code)
-
-            (*resource).Release();
-            (*duplication).ReleaseFrame();
-
-            Ok((pixel_data, width, height, stride))
+    let mut resource: Option<IDXGIResource> = None;
+    
+    let hr = duplication.AcquireNextFrame(100, &mut frame_info, &mut resource);
+    
+    if hr.is_err() {
+        return Err(StreamError::FrameTimeout);
+    }
+    
+    if let Some(resource) = resource {
+        // Do something with resource
+        drop(resource);
+    }
+    
+    duplication.ReleaseFrame();
+    
+    // Define your variables here from frame_info or other sources
+    let pixel_data: Vec<u8> = Vec::new(); // Replace with actual data extraction
+    let width: u32 = frame_info.LastPresentTime.QuadPart as u32; // Example, adjust as needed
+    let height: u32 = 0; // Replace with actual value
+    let stride: u32 = 0; // Replace with actual value
+    
+    Ok((pixel_data, width, height, stride))
         }
     }
 
@@ -458,9 +463,11 @@ impl RdpStream {
         config: &StreamConfig,
         state: &mut Option<(HDC, HDC, HBITMAP, BITMAPINFO, Vec<u8>)>,
     ) -> Result<(Vec<u8>, u32, u32, usize), StreamError> {
-        unsafe {
-            let mut rect = win32::Win32Rect::default();
-            if win32::ffi::GetWindowRect(hwnd, &mut rect) == 0 {
+unsafe {
+            let mut rect = windows::Win32::Foundation::RECT::default();
+            
+            // GetWindowRect now returns a Result instead of an integer
+            if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).is_err() {
                 return Err(StreamError::WindowNotFound);
             }
 
@@ -474,24 +481,26 @@ impl RdpStream {
                 bi.bmiHeader.biWidth != width as i32 || bi.bmiHeader.biHeight != -(height as i32)
             } {
                 if let Some((_, mem_dc, _, _, _)) = state.take() {
-                    win32::ffi::DeleteDC(mem_dc);
+                    windows::Win32::Graphics::Gdi::DeleteDC(mem_dc);
                 }
 
-                let hwnd_dc = win32::ffi::GetDC(hwnd);
-                let mem_dc = win32::ffi::CreateCompatibleDC(hwnd_dc);
-                let bmp = win32::ffi::CreateCompatibleBitmap(hwnd_dc, width as i32, height as i32);
-                win32::ffi::ReleaseDC(hwnd, hwnd_dc);
+                let hwnd_dc = windows::Win32::Graphics::Gdi::GetDC(hwnd);
+                let mem_dc = windows::Win32::Graphics::Gdi::CreateCompatibleDC(hwnd_dc);
+                let bmp = windows::Win32::Graphics::Gdi::CreateCompatibleBitmap(hwnd_dc, width as i32, height as i32);
+                windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, hwnd_dc);
 
-                let mut bi = std::mem::zeroed::<BITMAPINFO>();
-                bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                let mut bi = std::mem::zeroed::<windows::Win32::Graphics::Gdi::BITMAPINFO>();
+                bi.bmiHeader.biSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
                 bi.bmiHeader.biWidth = width as i32;
                 bi.bmiHeader.biHeight = -(height as i32); // top-down
                 bi.bmiHeader.biPlanes = 1;
                 bi.bmiHeader.biBitCount = 32;
-                bi.bmiHeader.biCompression = win32::ffi::BI_RGB;
+                bi.bmiHeader.biCompression = windows::Win32::Graphics::Gdi::BI_RGB.0;
 
                 let buf = vec![0u8; stride * height as usize];
-                win32::ffi::SelectObject(mem_dc, bmp as *mut _);
+                
+                // SelectObject automatically accepts HBITMAP in the modern crate
+                windows::Win32::Graphics::Gdi::SelectObject(mem_dc, bmp);
 
                 *state = Some((hwnd_dc, mem_dc, bmp, bi, buf));
             }
@@ -499,21 +508,58 @@ impl RdpStream {
             let (hwnd_dc, mem_dc, bmp, bi, ref mut buf) = state.as_mut().unwrap();
 
             // Use PrintWindow with PW_RENDERFULLCONTENT for windows that may be occluded
-            win32::ffi::PrintWindow(hwnd, *mem_dc, 3 /* PW_RENDERFULLCONTENT */);
+            PrintWindow(hwnd, *mem_dc, 3);
 
             // Copy pixels from the memory DC
-            let hwnd_dc_real = win32::ffi::GetDC(hwnd);
-            win32::ffi::GetDIBits(
+            let hwnd_dc_real = windows::Win32::Graphics::Gdi::GetDC(hwnd);
+            windows::Win32::Graphics::Gdi::GetDIBits(
                 hwnd_dc_real,
                 *bmp,
                 0,
                 height as u32,
-                buf.as_mut_ptr() as *mut _,
-                bi as *mut BITMAPINFO,
-                win32::ffi::DIB_RGB_COLORS,
+                Some(buf.as_mut_ptr() as *mut _), // Wrap in Some() for Option<*mut c_void>
+                bi as *mut windows::Win32::Graphics::Gdi::BITMAPINFO,
+                windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
             );
-            win32::ffi::ReleaseDC(hwnd, hwnd_dc_real);
+            windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, hwnd_dc_real);
 
             Ok((buf.clone(), width, height, stride))
         }
     }
+}
+
+fn capture_dxgi_frame(
+    duplication: &IDXGIOutputDuplication,
+    width: &mut u32,
+    height: &mut u32,
+) -> Result<(Vec<u8>, u32), StreamError> {
+    let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+    let mut resource: Option<IDXGIResource> = None;
+
+    unsafe {
+        duplication
+            .AcquireNextFrame(100, &mut frame_info, &mut resource)
+            .map_err(|e| StreamError::FrameTimeout)?;
+    }
+
+    let texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D = resource
+        .and_then(|r| r.cast().ok())
+        .ok_or(StreamError::CaptureFailed("resource cast failed".into()))?;
+
+    let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+    unsafe {
+        texture.GetDesc(&mut desc);
+    }
+
+    *width = desc.Width;
+    *height = desc.Height;
+    let stride = desc.Width * 4;
+
+    let mut pixel_data = vec![0u8; (stride * desc.Height) as usize];
+
+    unsafe {
+        duplication.ReleaseFrame().ok();
+    }
+
+    Ok((pixel_data, stride))
+}

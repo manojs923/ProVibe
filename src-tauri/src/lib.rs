@@ -13,22 +13,60 @@ async fn launch_stealth_vm(target: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn capture_rdp_window(ip: String) -> Result<String, String> {
-    // high-iq tip: to maintain the optical air-gap, you can't just take a normal screenshot.
-    // use win32 `PrintWindow` with the `PW_RENDERFULLCONTENT` (0x00000002) flag.
-    // this lets you scrape the rdp client's hwnd directly from the dwm frame buffer,
-    // even if it is entirely occluded by your host-side cheat ui.
-
-    // 1. find hwnd of "Virtual Machine Connection" or mstsc.exe
-    // 2. PrintWindow -> memory dc -> bitmap
-    // 3. encode to base64 jpeg
-
-    Ok("base64_encoded_jpeg_data_here".to_string())
+   use winapi::um::winuser::{FindWindowA, GetWindowRect, PrintWindow};
+use winapi::um::wingdi::{CreateCompatibleDC, CreateCompatibleBitmap, SelectObject, DeleteObject};
+use winapi::shared::windef::{HWND, RECT};
+use std::ptr;
+use image::{ImageBuffer, Rgba};
+// 1. find hwnd of "Virtual Machine Connection" or mstsc.exe
+let hwnd = unsafe { FindWindowA(ptr::null(), format!("Virtual Machine Connection - {}", ip).as_ptr() as *const i8) };
+if hwnd.is_null() {
+    return Err("could not find rdp window".to_string());
 }
+
+// 2. PrintWindow -> memory dc -> bitmap
+let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+unsafe { GetWindowRect(hwnd, &mut rect) };
+let width = (rect.right - rect.left) as i32;
+let height = (rect.bottom - rect.top) as i32;
+
+let hdc = unsafe { CreateCompatibleDC(ptr::null_mut()) };
+let hbitmap = unsafe { CreateCompatibleBitmap(hdc, width, height) };
+unsafe { SelectObject(hdc, hbitmap as *mut _) };
+
+if unsafe { PrintWindow(hwnd, hdc, 0x00000002) } == 0 {
+    return Err("failed to print window".to_string());
+}
+
+// convert bitmap to image buffer
+let mut buf = vec![0u8; (width * height * 4) as usize];
+for y in 0..height {
+    for x in 0..width {
+        let pixel = unsafe { *(hdc.offset((y * width + x) as isize)) };
+        buf[(y * width + x) as usize] = pixel;
+    }
+}
+// encode to base64 jpeg
+let img = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, buf).unwrap();
+let mut jpeg_buf = Vec::new();
+image::jpeg::JPEGEncoder::new(&mut jpeg_buf).encode_image(&img).unwrap();
+
+Ok(base64::encode(jpeg_buf))
+}
+
+// 🔥 NEW: Module declarations for the lockdown-bypass subsystem
+mod target_id;
+mod vm;
+mod rdp;
+mod patches;
+mod stealth;
+// 🛡️ CRITICAL: Manager is required to interact with the OS window
+use tauri::{Emitter, Manager};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 🛡️ CRITICAL: Manager is required to interact with the OS window
-    use tauri::{Emitter, Manager};
-    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
     // conditionally compile Windows native APIs only when building for Windows
     #[cfg(target_os = "windows")]
@@ -36,12 +74,6 @@ pub fn run() {
     #[cfg(target_os = "windows")]
     use windows::Win32::Foundation::HWND;
 
-    // 🔥 NEW: Module declarations for the lockdown-bypass subsystem
-    mod target_id;
-    mod vm;
-    mod rdp;
-    mod patches;
-    mod stealth;
 
     tauri::Builder::default()
         // 1. Native Window Tracker (Remembers position and size across reboots)
@@ -162,7 +194,8 @@ pub fn run() {
 
             Ok(())
         })
-                // 🔥 NEW: Tauri commands exposed to the frontend for manual control
+        
+        // 🔥 NEW: Tauri commands exposed to the frontend for manual control
         .invoke_handler(tauri::generate_handler![
             target_id::scan_for_lockdown_browsers,
             vm::get_vm_status,

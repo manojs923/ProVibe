@@ -63,7 +63,29 @@ pub struct RdpClient {
     connected_once: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RDPClientHandle {
+    pub pid: u32,
+    pub window_title: String,
+    pub loopback_addr: String,
+}
+
+impl RDPClientHandle {
+    pub fn get_window_handle(&self) -> Result<HWND, windows::core::Error> {
+        self.find_rdp_window()
+    }
+
+    pub fn get_guest_resolution(&self) -> (u32, u32) {
+        (self.guest_width, self.guest_height)
+    }
+}
+
 impl RdpClient {
+    
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
     pub fn new(tunnel: &TunnelConfig) -> Self {
         Self {
             config: RdpClientConfig::default(),
@@ -376,7 +398,7 @@ extern "system" fn enum_cb(hwnd: isize, _lparam: isize) -> i32 {
         }
         let title = String::from_utf16_lossy(&buf[..len as usize]);
         // Live mstsc window: "<full address> - Remote Desktop Connection"
-        if title.starts_with(SEARCH_PREFIX.with(|p| p.borrow().clone()))
+        if title.starts_with(&SEARCH_PREFIX.with(|p| p.borrow().clone()))
             && title.contains("Remote Desktop Connection")
         {
             SEARCH_RESULT.with(|r| r.set(Some(hwnd)));

@@ -45,8 +45,7 @@
     ],
     "resources": [
       "resources/base.vhdx",
-      "resources/patches/*.bin",
-      "scripts/*.ps1"
+      "../scripts/*.ps1"
     ],
     "windows": {
       "webviewInstallMode": {

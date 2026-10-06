@@ -1,6 +1,6 @@
-<#
+﻿<#
 .SYNOPSIS
-    One-time setup — creates a sysprep'd Windows 11 base VHDX with RDP enabled,
+    One-time setup  creates a sysprep'd Windows 11 base VHDX with RDP enabled,
     minimal services, no Hyper-V guest tools.
 .DESCRIPTION
     Builds a clean Windows 11 VHDX by installing from ISO, applying post-install
@@ -17,43 +17,43 @@ param(
     [string]$WorkDir       = "C:\VMBase",
     [string]$VMSwitchName = "Default Switch",
     [string]$BaseVHDX     = "C:\VMBase\Images\Win11-Base.vhdx",
-    [int]$   DiskGB       = 64,
-    [int]$   MemGB        = 8,
-    [int]$   VCpuCount    = 4,
+    [int]$DiskGB       = 64,
+    [int]$MemGB        = 8,
+    [int]$VCpuCount    = 4,
     [string]$BuildVmName = "Win11-BaseBuild"
 )
 
 $ErrorActionPreference = "Stop"
 $transcriptLog = Join-Path $WorkDir "build-base.log"
 
-# ── ──────────────────────────────── ──────────
+# -- -------------------------------- ----------
 # 0. Bootstrap / validation
-# ── ──────────────────────────────── ──────────
+# -- -------------------------------- ----------
 function Assert-Prereqs {
     if (-not (Test-Path $WinISO)) {
-        throw "ISO not found: $WinISO — update -WinISO param"
+        throw "ISO not found: $WinISO  update -WinISO param"
     }
     if (-not (Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -ErrorAction SilentlyContinue)) {
         throw "Hyper-V not enabled on host"
     }
     if (-not (Get-VMSwitch -Name $VMSwitchName -ErrorAction SilentlyContinue)) {
-        throw "No VM switch '$VMSwitchName' — create one first or pass -VMSwitchName"
+        throw "No VM switch '$VMSwitchName'  create one first or pass -VMSwitchName"
     }
     New-Item -ItemType Directory -Force -Path "$WorkDir\Images","$WorkDir\Mount","$WorkDir\Unattend" | Out-Null
     Start-Transcript -Path $transcriptLog -Force | Out-Null
-    Write-Host "[*] Prereqs OK — ISO: $WinISO"
+    Write-Host "[*] Prereqs OK  ISO: $WinISO"
 }
 
-# ── ──────────────────────────────── ──────────
+# -- -------------------------------- ----------
 # 1. Mount ISO + extract install.wim
-# ────────────────────────────────
+# --------------------------------
 function Get-InstallWim {
     $isoDriveLetter = (Mount-DiskImage -ImagePath $WinISO -PassThru | Get-Volume).DriveLetter
     if (-not $isoDriveLetter) { throw "Failed to mount ISO" }
     $wimSrc = "$($isoDriveLetter):\sources\install.wim"
 
     if (-not (Test-Path $wimSrc)) {
-        Write-Host "[*] No install.wim found — checking install.esd"
+        Write-Host "[*] No install.wim found  checking install.esd"
         $wimSrc = "$($isoDriveLetter):\sources\install.esd"
         if (-not (Test-Path $wimSrc)) { throw "Neither install.wim nor install.esd found in ISO" }
     }
@@ -64,10 +64,17 @@ function Get-InstallWim {
     return "$WorkDir\install.wim"
 }
 
-# ── ──────────────────────────────── ──────────
+# -- -------------------------------- ----------
 # 2. Generate unattend.xml for OOBE bypass
-# ────────────────────────────────
+# --------------------------------
 function New-UnattendXml {
+
+   # Ensure the destination directory exists before writing
+    $targetDir = "$WorkDir\Unattend"
+    if (-not (Test-Path -LiteralPath $targetDir)) {
+        New-Item -Path $targetDir -ItemType Directory -Force | Out-Null
+    }
+
     $unattend = @'
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -128,13 +135,13 @@ function New-UnattendXml {
     Write-Host "[*] unattend.xml generated"
 }
 
-# ── ──────────────────────────────── ──────────
+# -- -------------------------------- ----------
 # 3. Generate post-install config script
 #    (embedded into VHDX, runs during specialize pass)
-# ────────────────────────────────
+# --------------------------------
 function New-BaseConfigScript {
     $cfg = @'
-# base-config.ps1 — runs during specialize pass
+# base-config.ps1  runs during specialize pass
 $ErrorActionPreference = "Continue"
 
 # Enable RDP
@@ -144,7 +151,7 @@ Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 # Allow RDP with NLA (matches host tunnel config)
 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
 
-# ── Service trimming ──
+# -- Service trimming --
 $servicesToDisable = @(
     "DiagTrack",           # Connected User Experiences & Telemetry
     "dmwappushservice",    # WAP Push
@@ -175,7 +182,7 @@ foreach ($svc in $servicesToDisable) {
     }
 }
 
-# ── Scheduled task trimming (reduce background noise) ──
+# -- Scheduled task trimming (reduce background noise) --
 $tasksToDisable = @(
     "\Microsoft\Windows\Customer Experience Improvement Program\*",
     "\Microsoft\Windows\Application Experience\*",
@@ -188,7 +195,7 @@ foreach ($taskPath in $tasksToDisable) {
         Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
 }
 
-# ── Registry tweaks for minimal footprint ──
+# -- Registry tweaks for minimal footprint --
 # Disable telemetry
 New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Force | Out-Null
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Name AllowTelemetry -Value 0
@@ -208,7 +215,7 @@ powercfg.exe /change standby-timeout-ac 0
 powercfg.exe /change monitor-timeout-ac 0
 powercfg.exe /change hibernate-timeout-ac 0
 
-# ── Remove Hyper-V Guest Integration Services ──
+# -- Remove Hyper-V Guest Integration Services --
 # The base image does NOT include ICs. If present from ISO, remove.
 $icFeatures = Get-WindowsOptionalFeature -Online |
     Where-Object { $_.FeatureName -like "*Hyper-V*Guest*" -or $_.FeatureName -like "*Integration*" }
@@ -226,28 +233,28 @@ if ($icMsi) {
     $icMsi | ForEach-Object { $_.Uninstall() }
 }
 
-# ── Disable pagefile (reduces disk footprint, faster checkpoint ops) ──
+# -- Disable pagefile (reduces disk footprint, faster checkpoint ops) --
 $computersys = Get-WmiObject Win32_ComputerSystem -EnableAllPrivileges
 $computersys.AutomaticManagedPagefile = $false
 $computersys.Put() | Out-Null
 $pagefile = Get-WmiObject Win32_PageFileSetting
 if ($pagefile) { $pagefile.Delete() }
 
-# ── Windows Update: defer/pause (base image gets updates via rebuild) ──
+# -- Windows Update: defer/pause (base image gets updates via rebuild) --
 New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Force | Out-Null
 New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Force | Out-Null
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name NoAutoUpdate -Value 1
 
-# ── Disable Defender real-time (base image is offline; reduces CPU during use) ──
+# -- Disable Defender real-time (base image is offline; reduces CPU during use) --
 # Note: leave service intact, just reduce real-time scanning overhead
 Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
 Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
 Set-MpPreference -ScanAvgCPULoadFactor 10 -ErrorAction SilentlyContinue
 
-# ── Clear event logs (clean slate for the sealed image) ──
+# -- Clear event logs (clean slate for the sealed image) --
 wevtutil.exe el | ForEach-Object { wevtutil.exe cl $_ 2>$null }
 
-# ── Disable Cortana startup ──
+# -- Disable Cortana startup --
 Get-AppxPackage -Name "*Cortana*" -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue
 
 # Remove bloatware AppX packages
@@ -277,9 +284,9 @@ Write-Host "  [cfg] Base config complete"
     Write-Host "[*] base-config.ps1 generated"
 }
 
-# ── ──────────────────────────────── ──────────
+# -- -------------------------------- ----------
 # 4. Create target VHDX from install.wim
-# ────────────────────────────────
+# --------------------------------
 function New-BaseDisk {
     $wimFile = "$WorkDir\install.wim"
     $vhdxPath = "$WorkDir\Images\build-raw.vhdx"
@@ -309,11 +316,27 @@ function New-BaseDisk {
     $sysVol  = Format-Volume -Partition $sysPart  -FileSystem FAT32 -NewFileSystemLabel "System"
     $mainVol = Format-Volume -Partition $mainPart -FileSystem NTFS -NewFileSystemLabel "Windows"
 
-    # Get drive letters
+# Give Windows a few seconds to process the new partitions
+    Start-Sleep -Seconds 3
+
+    # Attempt to get drive letters
     $sysLetter  = ($sysPart  | Get-Partition).DriveLetter
     $mainLetter = ($mainPart | Get-Partition).DriveLetter
-    if (-not $sysLetter)  { $sysLetter  = ($sysPart  | Get-Volume).DriveLetter }
-    if (-not $mainLetter) { $mainLetter = ($mainPart | Get-Volume).DriveLetter }
+
+    # If still empty, explicitly force Windows to assign drive letters using the correct cmdlet
+    if (-not $sysLetter)  { 
+        $sysPart | Add-PartitionAccessPath -AssignDriveLetter
+        $sysLetter = ($sysPart | Get-Partition).DriveLetter 
+    }
+    if (-not $mainLetter) { 
+        $mainPart | Add-PartitionAccessPath -AssignDriveLetter
+        $mainLetter = ($mainPart | Get-Partition).DriveLetter 
+    }
+
+    # Final safety check before applying WIM
+    if (-not $mainLetter) {
+        throw "Error: Could not assign a drive letter to the main partition."
+    }
 
     Write-Host "[*] Applying WIM to $($mainLetter):\ ..."
     Expand-WindowsImage -ImagePath $wimFile -ApplyPath "$($mainLetter):\" -Index $proIndex
@@ -323,10 +346,13 @@ function New-BaseDisk {
     New-Item -ItemType Directory -Force -Path "$($mainLetter):\Windows\Setup\Scripts" | Out-Null
     Copy-Item "$WorkDir\Unattend\base-config.ps1" "$($mainLetter):\Windows\Setup\Scripts\base-config.ps1" -Force
 
-        # Copy boot files to EFI partition
+    # Copy boot files to EFI partition
     if ($sysLetter) {
-        Copy-Item "$($mainLetter):\Windows\Boot\EFI\bootmgfw.efi" "$($sysLetter):\EFI\Microsoft\Boot\bootmgfw.efi" -Force
+        # 1. Create the destination folders FIRST
         New-Item -ItemType Directory -Force -Path "$($sysLetter):\EFI\Microsoft\Boot" | Out-Null
+        New-Item -ItemType Directory -Force -Path "$($sysLetter):\EFI\Boot" | Out-Null
+
+        # 2. Copy the files into the newly created folders
         Copy-Item "$($mainLetter):\Windows\Boot\EFI\bootmgfw.efi" "$($sysLetter):\EFI\Microsoft\Boot\bootmgfw.efi" -Force
         Copy-Item "$($mainLetter):\Windows\Boot\EFI\bootx64.efi" "$($sysLetter):\EFI\Boot\bootx64.efi" -Force
     }
@@ -340,13 +366,13 @@ function New-BaseDisk {
     Write-Host "[*] Dismounting VHDX..."
     Dismount-VHD -Path $vhdxPath
 
-    Write-Host "[✓] Base disk created: $vhdxPath" -ForegroundColor Green
+    Write-Host "[?] Base disk created: $vhdxPath" -ForegroundColor Green
     return $vhdxPath
 }
 
-# ── ──────────────────────────────── ──────────
+# -- -------------------------------- ----------
 # 5. Create stealth VM from base disk
-# ────────────────────────────────
+# --------------------------------
 function New-StealthVM {
     param([string]$VhdxPath)
 
@@ -401,14 +427,14 @@ function New-StealthVM {
 
     # Start VM
     Start-VM -Name $vmName
-    Write-Host "[✓] VM created and started: $vmName" -ForegroundColor Green
+    Write-Host "[?] VM created and started: $vmName" -ForegroundColor Green
 
     return $vmName
 }
 
-# ── ──────────────────────────────── ──────────
+# -- -------------------------------- ----------
 # 6. Create RDP loopback connection
-# ────────────────────────────────
+# --------------------------------
 function Connect-RDP {
     param([string]$VMName)
 
@@ -484,16 +510,16 @@ redirectposdevices:i:0
 "@
     Set-Content -Path $rdpFile -Value $rdpContent
 
-    Write-Host "[✓] RDP connection file created: $rdpFile" -ForegroundColor Green
+    Write-Host "[?] RDP connection file created: $rdpFile" -ForegroundColor Green
     return $rdpFile
 }
 
-# ── ──────────────────────────────── ──────────
+# -------------------------------- ----------
 # MAIN EXECUTION
-# ────────────────────────────────
-Write-Host "╔════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║   STEALTH VM DEPLOYMENT PIPELINE v1.0         ║" -ForegroundColor Cyan
-Write-Host "╚════════════════════════════════════════════════╝" -ForegroundColor Cyan
+# --------------------------------
+Write-Host "+------------------------------------------------+" -ForegroundColor Cyan
+Write-Host "   STEALTH VM DEPLOYMENT PIPELINE v1.0         " -ForegroundColor Cyan
+Write-Host "+------------------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
 
 # Check prerequisites
@@ -510,38 +536,51 @@ if (-not (Test-Path "$WorkDir\install.wim")) {
     exit 1
 }
 
+# Generate unattend.xml if it doesn't exist
 if (-not (Test-Path "$WorkDir\Unattend\unattend.xml")) {
-    Write-Host "[!] unattend.xml not found." -ForegroundColor Red
+    Write-Host "[*] Generating unattend.xml..." -ForegroundColor Yellow
+    New-UnattendXml | Out-Null
+}
+
+# Generate base-config.ps1 if it doesn't exist
+if (-not (Test-Path "$WorkDir\Unattend\base-config.ps1")) {
+    Write-Host "[*] Generating base-config.ps1..." -ForegroundColor Yellow
+    New-BaseConfigScript | Out-Null
+}
+
+# Validate generated files exist
+if (-not (Test-Path "$WorkDir\Unattend\unattend.xml")) {
+    Write-Host "[!] unattend.xml not found or failed to generate." -ForegroundColor Red
     exit 1
 }
 
 if (-not (Test-Path "$WorkDir\Unattend\base-config.ps1")) {
-    Write-Host "[!] base-config.ps1 not found." -ForegroundColor Red
+    Write-Host "[!] base-config.ps1 not found or failed to generate." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "[✓] All prerequisites satisfied." -ForegroundColor Green
+Write-Host "[+] All prerequisites satisfied." -ForegroundColor Green
 Write-Host ""
 
 # Execute pipeline
 try {
     # Step 1: Create base disk
-    Write-Host "── Step 1: Creating Base Disk ──" -ForegroundColor Magenta
+    Write-Host "-- Step 1: Creating Base Disk --" -ForegroundColor Magenta
     $baseDisk = New-BaseDisk
 
     # Step 2: Create VM from base disk
-    Write-Host "── Step 2: Creating Stealth VM ──" -ForegroundColor Magenta
+    Write-Host "-- Step 2: Creating Stealth VM --" -ForegroundColor Magenta
     $vmName = New-StealthVM -VhdxPath $baseDisk
 
     # Step 3: Create RDP connection
-    Write-Host "── Step 3: Creating RDP Connection ──" -ForegroundColor Magenta
+    Write-Host "-- Step 3: Creating RDP Connection --" -ForegroundColor Magenta
     $rdpPath = Connect-RDP -VMName $vmName
 
     # Summary
     Write-Host ""
-    Write-Host "╔════════════════════════════════════════════════╗" -ForegroundColor Green
-    Write-Host "║   DEPLOYMENT COMPLETE                          ║" -ForegroundColor Green
-    Write-Host "╚════════════════════════════════════════════════╝" -ForegroundColor Green
+    Write-Host "+------------------------------------------------+" -ForegroundColor Green
+    Write-Host "   DEPLOYMENT COMPLETE                          " -ForegroundColor Green
+    Write-Host "+------------------------------------------------+" -ForegroundColor Green
     Write-Host ""
     Write-Host "  VM Name:     $vmName"
     Write-Host "  Base Disk:   $baseDisk"

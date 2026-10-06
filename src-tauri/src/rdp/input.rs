@@ -7,17 +7,19 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyboardState, MapVirtualKeyW, SendInput, SetCursorPos,
+    GetAsyncKeyState, GetKeyboardState, MapVirtualKeyW, SendInput, KEYBD_EVENT_FLAGS,
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEEVENTF_HWHEEL, VIRTUAL_KEY,MOUSE_EVENT_FLAGS
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEEVENTF_HWHEEL, VIRTUAL_KEY,MOUSE_EVENT_FLAGS, MAPVK_VK_TO_VSC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetClientRect, GetForegroundWindow, GetWindowRect,
-    ScreenToClient, SetForegroundWindow, MAPVK_VK_TO_VSC,
+    SetForegroundWindow,
 };
+
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use rand::Rng;
 
 use crate::target_id::TargetProfile;
@@ -141,7 +143,7 @@ pub struct InputForwarder {
     /// Active input configuration.
     config: InputConfig,
     /// Random state for timing jitter.
-    rng: rand::thread_rng(),
+    // rng: rand::thread_rng(),  <- commented this
     /// Track burst state for natural typing rhythm.
     burst_remaining: u32,
     /// Last input timestamp.
@@ -150,6 +152,7 @@ pub struct InputForwarder {
     held_modifiers: Vec<VIRTUAL_KEY>,
     /// Pending verification keys.
     pending_verify: HashMap<VIRTUAL_KEY, bool>,
+    rng: rand::rngs::ThreadRng,
 }
 
 impl InputForwarder {
@@ -164,13 +167,14 @@ impl InputForwarder {
         };
 
         let guest_res = client.get_guest_resolution();
+        let rng = rand::thread_rng();
 
         Ok(Self {
+            rng,
             client_hwnd: Some(hwnd),
             client_rect,
             guest_resolution: guest_res,
             config,
-            rng: rand::thread_rng(),
             burst_remaining: 0,
             last_input: None,
             held_modifiers: Vec::new(),
@@ -184,7 +188,9 @@ impl InputForwarder {
         let hwnd = self.client_hwnd.ok_or(InputError::ClientNotRunning)?;
 
         unsafe {
-            SetForegroundWindow(hwnd).map_err(|_| InputError::FocusFailed)?;
+            if !SetForegroundWindow(hwnd).as_bool() {
+    return Err(InputError::FocusFailed);
+}
         }
 
         Ok(())
@@ -208,7 +214,9 @@ impl InputForwarder {
         // Convert client coordinates to screen coordinates.
         let mut point = POINT { x: local_x, y: local_y };
         unsafe {
-            ScreenToClient(hwnd, &mut point).map_err(|_| InputError::CoordinateTranslationFailed)?;
+            if !ScreenToClient(hwnd, &mut point).as_bool() {
+                return Err(InputError::CoordinateTranslationFailed);
+            }
         }
 
         Ok((point.x, point.y))
@@ -296,7 +304,7 @@ impl InputForwarder {
         Ok(())
     }
 
-    /// Move mouse to guest coordinates with humanized path.
+/// Move mouse to guest coordinates with humanized path.
     pub fn move_mouse(&mut self, guest_x: u32, guest_y: u32) -> Result<(), InputError> {
         if self.config.mode == InputMode::Disabled {
             return Err(InputError::InputDisabled);
@@ -308,9 +316,10 @@ impl InputForwarder {
         let current = self.get_cursor_position()?;
 
         if self.config.mode == InputMode::Standard {
-            // Direct move.
+            // Direct move. Use the full path and cast coordinates to i32.
             unsafe {
-                SetCursorPos(host_x, host_y).map_err(|_| InputError::CursorMoveFailed)?;
+                windows::Win32::UI::WindowsAndMessaging::SetCursorPos(host_x as i32, host_y as i32)
+                    .map_err(|_| InputError::CursorMoveFailed)?;
             }
             return Ok(());
         }
@@ -326,9 +335,9 @@ impl InputForwarder {
 
         // Quadratic Bezier with random control point deviation.
         let ctrl_x = (start_x + end_x) / 2.0
-            + self.rng.gen_range(-deviation as f64..=deviation as f64);
+            + self.rng.gen_range(-(deviation as f64)..=deviation as f64);
         let ctrl_y = (start_y + end_y) / 2.0
-            + self.rng.gen_range(-deviation as f64..=deviation as f64);
+            + self.rng.gen_range(-(deviation as f64)..=deviation as f64);
 
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
@@ -341,8 +350,9 @@ impl InputForwarder {
                 + 2.0 * one_minus_t * t * ctrl_y
                 + t * t * end_y;
 
+            // Interpolated move. Use the full path here as well.
             unsafe {
-                SetCursorPos(x.round() as i32, y.round() as i32)
+                windows::Win32::UI::Input::KeyboardAndMouse::SetCursorPos(x.round() as i32, y.round() as i32)
                     .map_err(|_| InputError::CursorMoveFailed)?;
             }
 
@@ -558,7 +568,7 @@ impl InputForwarder {
 
         if scan_code == 0 {
             // Fall back to VK-based injection if no scancode exists.
-            let flags = if key_up { KEYEVENTF_KEYUP } else { 0 };
+            let flags = if key_up { KEYEVENTF_KEYUP } else { windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0) };
             let input = INPUT {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
@@ -602,7 +612,7 @@ impl InputForwarder {
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(0),
-                    wScan: scan_code,
+                    wScan: scan_code as u16,
                     dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,
@@ -670,7 +680,7 @@ impl InputForwarder {
         };
 
         // If any tracked key is stuck down unexpectedly, roll it back.
-        for (vk, expected_down) in self.pending_verify.iter() {
+        for (vk, expected_down) in self.pending_verify.clone().iter() {
             let vk_index = vk.0 as usize;
             if vk_index < 256 {
                 let is_down = (state_ok[vk_index] & 0x80) != 0;
@@ -745,11 +755,11 @@ impl InputForwarder {
             )
         };
 
-        if hwnd.0 == 0 {
-            return Err(InputError::ClientNotRunning);
+        let hwnd = hwnd.map_err(|e| InputError::WindowNotFound(e.to_string()))?;
+        if hwnd.0.is_null() {
+        return Err(InputError::WindowNotFound("null handle".into()));
         }
-
-        self.client_hwnd = Some(hwnd);
+    self.client_hwnd = Some(hwnd);
         self.refresh_client_rect()?;
         Ok(())
     }
@@ -758,6 +768,7 @@ impl InputForwarder {
 /// Errors that can occur during input forwarding.
 #[derive(Debug)]
 pub enum InputError {
+    WindowNotFound(String),
     ClientNotRunning,
     WindowQueryFailed,
     FocusFailed,

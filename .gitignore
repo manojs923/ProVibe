@@ -22,6 +22,7 @@ src-tauri/Cargo.lock
 # Keys and Secrets
 .env
 .env.local
+*.vhdx
 
 # Node/React
 node_modules/
@@ -29,6 +30,8 @@ dist/
 
 # Tauri/Rust builds (These are MASSIVE)
 src-tauri/target/
+node_modules/
+*.exe
 
 # Python
 __pycache__/
