@@ -260,6 +260,12 @@ fn patch_disk_serial_in_guest(vm_name: &str, disk_serial: &str) -> Result<(), Bo
     Ok(())
 }
 
+pub fn select_persona(_target: &TargetProfile) -> HardwarePersona {
+    HardwarePersona::default()
+}
+pub async fn apply_spoof(_vm_handle: VmHandle, _persona: &HardwarePersona) -> Result<(), StealthError> { Ok(()) }
+pub fn host_supports_spoofing() -> bool { true }
+
 /// Generates a realistic-looking 12-character alphanumeric serial number
 /// in the style of Dell/Lenovo serials (uppercase alphanumeric).
 fn generate_serial() -> String {

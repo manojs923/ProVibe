@@ -41,6 +41,9 @@ const VIRTUAL_ADAPTER_MATCHES: &[&str] = &[
     "Virtual Display Adapter",
 ];
 
+pub async fn cleanup_vm_artifacts(_vm_handle: VmHandle) -> Result<(), StealthError> { Ok(()) }
+pub async fn restore_artifacts(_vm_handle: VmHandle) -> Result<(), StealthError> { Ok(()) }
+
 /// Result of the artifact cleanup pass.
 #[derive(Debug, Clone)]
 pub struct CleanupReport {

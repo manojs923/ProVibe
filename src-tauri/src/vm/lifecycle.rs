@@ -179,3 +179,8 @@ pub fn destroy_vm(vm_name: &str, disk_path: Option<&Path>) -> Result<(), Error> 
 
     Ok(())
 }
+#[derive(Debug, Clone)]
+pub struct VmHandle {
+    pub name: String,
+    pub pid: Option<u32>,
+}

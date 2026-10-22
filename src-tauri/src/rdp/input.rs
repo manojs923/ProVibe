@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow,
 };
 
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::UI::WindowsAndMessaging::ScreenToClient;
 use rand::Rng;
 
 use crate::target_id::TargetProfile;
@@ -134,6 +134,7 @@ impl InputConfig {
 
 /// Manages input forwarding into the RDP client window.
 pub struct InputForwarder {
+    pub running: std::sync::atomic::AtomicBool,
     /// Handle to the mstsc client window.
     client_hwnd: Option<HWND>,
     /// Client window client rect (guest viewport on host screen).
@@ -155,10 +156,16 @@ pub struct InputForwarder {
     rng: rand::rngs::ThreadRng,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputPolicy {
+    Forbidden,
+    Allowed { humanized: bool },
+}
+
 impl InputForwarder {
     pub fn new(client: &RDPClientHandle, config: InputConfig) -> Result<Self, InputError> {
         let hwnd = client.get_window_handle()
-            .ok_or(InputError::ClientNotRunning)?;
+            .map_err(|_| InputError::ClientNotRunning)?;
 
         let client_rect = unsafe {
             let mut rect = RECT::default();
@@ -763,6 +770,140 @@ impl InputForwarder {
         self.refresh_client_rect()?;
         Ok(())
     }
+
+        /// Gracefully stops the input forwarder, releasing any held keys/buttons
+    /// and resetting internal state. Safe to call multiple times.
+    pub fn stop(&mut self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+            KEYBDINPUT, MOUSEINPUT, KEYEVENTF_KEYUP,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP,
+            VIRTUAL_KEY,
+        };
+
+        // Release common modifier keys that may have been left pressed.
+        let modifiers: [u16; 8] = [
+            0x10, // VK_SHIFT
+            0x11, // VK_CONTROL
+            0x12, // VK_MENU (Alt)
+            0x5B, // VK_LWIN
+            0x5C, // VK_RWIN
+            0xA0, // VK_LSHIFT
+            0xA2, // VK_LCONTROL
+            0xA4, // VK_LMENU
+        ];
+
+        let mut inputs: Vec<INPUT> = Vec::with_capacity(modifiers.len() + 3);
+
+        for vk in modifiers.iter() {
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(*vk),
+                        wScan: 0,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        // Release any held mouse buttons.
+        for flag in [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP] {
+            inputs.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: 0,
+                        dwFlags: flag,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        unsafe {
+            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        }
+
+        // Reset internal pacing state so the next session starts clean.
+        self.burst_remaining = 0;
+    }
+
+    /// Sends a single virtual-key press+release to the focused RDP window.
+    /// Returns `Ok(())` on success, `InputError` if the window handle is invalid
+    /// or the Windows API call fails.
+    pub fn send_key(
+        &mut self,
+        _client: &crate::rdp::client::RDPClientHandle,
+        vk: u16,
+    ) -> Result<(), InputError> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
+            KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+        };
+
+        if self.client_hwnd.0.is_null() {
+            return Err(InputError::WindowNotFound("null hwnd on send_key".into()));
+        }
+
+        // Optional humanizer: tiny pre-keystroke pause.
+        let pre_delay = self.rng.gen_range(8..=22);
+        std::thread::sleep(std::time::Duration::from_millis(pre_delay));
+
+        let key_down = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    wScan: 0,
+                    dwFlags: Default::default(),
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+
+        let key_up = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+
+        // Press
+        let sent_down = unsafe {
+            SendInput(&[key_down], std::mem::size_of::<INPUT>() as i32)
+        };
+        if sent_down == 0 {
+            return Err(InputError::CoordinateTranslationFailed);
+        }
+
+        // Realistic hold duration (25–55 ms, matches your existing pacing).
+        let hold = self.rng.gen_range(25..=55);
+        std::thread::sleep(std::time::Duration::from_millis(hold));
+
+        // Release
+        let sent_up = unsafe {
+            SendInput(&[key_up], std::mem::size_of::<INPUT>() as i32)
+        };
+        if sent_up == 0 {
+            return Err(InputError::CoordinateTranslationFailed);
+        }
+
+        Ok(())
+    }
 }
 
 /// Errors that can occur during input forwarding.
@@ -796,6 +937,7 @@ impl std::fmt::Display for InputError {
             InputError::VerificationFailed => {
                 write!(f, "Key state verification failed after injection")
             }
+            InputError::WindowNotFound(msg) => write!(f, "Window not found: {}", msg),
         }
     }
 }

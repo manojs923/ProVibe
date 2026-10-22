@@ -1,1 +1,11 @@
-	// RDP audio redirection capture — intercepts audio stream from the RDP session for the speech-to-text pipeline (interview scenarios where questions are spoken)
+#[derive(Debug, Clone)]
+pub struct AudioSegment {
+    pub data: Vec<u8>,
+}
+
+pub struct AudioTap;
+
+impl AudioTap {
+    pub fn new(_enabled: bool) -> Self { Self }
+    pub fn drain(&mut self) -> Vec<AudioSegment> { Vec::new() }
+}

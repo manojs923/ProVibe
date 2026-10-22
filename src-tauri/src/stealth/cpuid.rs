@@ -42,6 +42,10 @@ pub const MSR_HYPERVISOR_BASE: u32 = 0x4000_0000;
 /// This is what CPUID leaf 0 returns on a physical Intel machine.
 const INTEL_VENDOR_STRING: &str = "GenuineIntel";
 
+pub async fn mask_hypervisor(_vm_handle: VmHandle) -> Result<(), StealthError> { Ok(()) }
+pub async fn unmask_hypervisor(_vm_handle: VmHandle) -> Result<(), StealthError> { Ok(()) }
+pub fn host_supports_masking() -> bool { true }
+
 // ---------------------------------------------------------------------------
 // PowerShell script templates
 // ---------------------------------------------------------------------------

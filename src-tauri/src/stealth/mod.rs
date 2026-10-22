@@ -5,7 +5,7 @@ pub mod cpuid;
 pub mod hardware;
 pub mod timing;
 
-use crate::target_id::matcher::TargetProfile;
+use crate::TargetProfile;
 use crate::vm::lifecycle::VmHandle;
 
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use serde::Serialize;
 use std::process::Command;
-use sysinfo::{System, SystemExt, ProcessExt};
+use sysinfo::System;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StealthCheck {
@@ -179,7 +179,7 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
 
     // Check 6: RDP port 3389 listening
     let port_check = std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:3389".parse().map_err(|e| e.to_string())?,
+        &"127.0.0.1:3389".parse::<std::net::SocketAddr>().map_err(|e| e.to_string())?,
         std::time::Duration::from_millis(300),
     )
     .is_ok();
@@ -337,7 +337,7 @@ impl StealthRequirements {
         let skip_timing = !detection_vectors.iter().any(|v| {
             matches!(
                 v.kind(),
-                crate::target_id::matcher::DetectionVectorKind::TimingAnomaly
+                crate::target_id::DetectionVectorKind::TimingAnomaly
             )
         });
 

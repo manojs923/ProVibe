@@ -671,3 +671,12 @@ mod tests {
         assert!(report.etw_suppressed);
     }
 }
+
+pub struct TimingProfile;
+
+impl TimingProfile {
+    pub fn for_target(_target: &TargetProfile) -> Self { Self }
+}
+
+pub async fn normalize(_vm_handle: VmHandle, _profile: &TimingProfile) -> Result<(), StealthError> { Ok(()) }
+pub fn host_supports_timing_patch() -> bool { true }

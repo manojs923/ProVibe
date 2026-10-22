@@ -7,10 +7,13 @@ pub mod sandbox;
 
 use crate::target_id::TargetProfile;
 use serde::{Deserialize, Serialize};
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::process::Command;
 
+// ---------------------------------------------------------------------------
+// VM STATUS QUERY
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VmStatus {
@@ -25,19 +28,17 @@ pub struct VmStatus {
 
 #[tauri::command]
 pub fn get_vm_status(vm_name: String) -> Result<VmStatus, String> {
+    let ps_cmd = format!(
+        "Get-VM -Name '{}' | Select-Object State, Uptime, ProcessorUsage, MemoryAssigned, MemoryDemand | ConvertTo-Json",
+        vm_name
+    );
+
     let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "Get-VM -Name '{}' | Select-Object State, Uptime, ProcessorUsage, MemoryAssigned, MemoryDemand | ConvertTo-Json",
-                vm_name
-            ),
-        ])
+        .args(["-NoProfile", "-Command", &ps_cmd])
         .output()
         .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
     if stdout.trim().is_empty() || stdout.contains("not found") {
         return Ok(VmStatus {
@@ -51,13 +52,8 @@ pub fn get_vm_status(vm_name: String) -> Result<VmStatus, String> {
         });
     }
 
-    // Parse the JSON-like PowerShell output
     let running = stdout.contains("Running");
-    let uptime = if running {
-        extract_uptime(&stdout)
-    } else {
-        0
-    };
+    let uptime = if running { extract_uptime(&stdout) } else { 0 };
 
     Ok(VmStatus {
         running,
@@ -77,7 +73,7 @@ fn extract_uptime(output: &str) -> u64 {
         .find(|l| l.contains("Uptime"))
         .unwrap_or("");
 
-    let parts: Vec<&str> = time_section
+    let parts: Vec<u64> = time_section
         .split(':')
         .filter_map(|s| s.trim().parse::<u64>().ok())
         .collect();
@@ -89,6 +85,9 @@ fn extract_uptime(output: &str) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VM SPAWN
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VmSpawnResult {
@@ -103,67 +102,82 @@ pub fn spawn_stealth_vm_cmd(
     vm_name: String,
     stealth_profile: Option<String>,
 ) -> Result<VmSpawnResult, String> {
-    let profile = stealth_profile.unwrap_or_else(|| "default".to_string());
+    // Prefixed with `_` because the profile hook isn't wired yet — kept so the
+    // frontend contract stays stable.
+    let _profile = stealth_profile.unwrap_or_else(|| "default".to_string());
 
-    // Apply stealth configuration before starting
+    // Apply stealth hardening before boot.
     let harden_script = format!(
         r#"
         Set-VMProcessor -VMName '{vm}' -HypervisorProtectionExposedToGuests $false
         Set-VM -VMName '{vm}' -EnhancedSessionModeType None
         Set-VMMemory -VMName '{vm}' -DynamicMemoryEnabled $false
         "#,
-        vm = vm_name
+        vm = &vm_name
     );
 
     Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &harden_script])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &harden_script,
+        ])
         .output()
         .map_err(|e| format!("Failed to harden VM: {}", e))?;
 
-    // Start VM with vmconnect (opens console window)
+    // Launch the console. vmconnect spawns detached; we keep the PID for telemetry.
     let child = Command::new("vmconnect.exe")
         .arg("localhost")
         .arg(&vm_name)
         .spawn()
-        .map_err(|e| format!("Failed to launch vmconnect: {}. Ensure Hyper-V management tools are installed.", e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to launch vmconnect: {}. Ensure Hyper-V management tools are installed.",
+                e
+            )
+        })?;
 
-    // Wait briefly for VM to register as starting
+    let pid = Some(child.id());
+
+    // Give Hyper-V a moment to register state transition.
     std::thread::sleep(std::time::Duration::from_secs(2));
 
-    // Verify it's starting
+    let state_cmd = format!("(Get-VM -Name '{}').State.ToString()", &vm_name);
     let status_output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("(Get-VM -Name '{}').State.ToString()", vm_name),
-        ])
+        .args(["-NoProfile", "-Command", &state_cmd])
         .output()
         .map_err(|e| format!("Status check failed: {}", e))?;
 
-    let state = String::from_utf8_lossy(&status_output.stdout).trim().to_string();
+    let state = String::from_utf8_lossy(&status_output.stdout)
+        .trim()
+        .to_string();
+
+    let success = state == "Running" || state == "Starting";
+    let message = format!("VM state: {}", state);
 
     Ok(VmSpawnResult {
-        success: state == "Running" || state == "Starting",
+        success,
         vm_name,
-        pid: child.id(),
-        message: format!("VM state: {}", state),
+        pid,
+        message,
     })
 }
+
+// ---------------------------------------------------------------------------
+// VM SHUTDOWN
+// ---------------------------------------------------------------------------
 
 #[tauri::command]
 pub fn shutdown_vm(vm_name: String, force: Option<bool>) -> Result<String, String> {
     let force_flag = force.unwrap_or(false);
 
-    let (cmd, verb) = if force_flag {
-        ("Stop-VM", "-Force")
+    let script = if force_flag {
+        format!("Stop-VM -Name '{}' -Force -ErrorAction Stop", vm_name)
     } else {
-        ("Stop-VM", "")
+        format!("Stop-VM -Name '{}' -ErrorAction Stop", vm_name)
     };
-
-    let script = format!(
-        "{} -Name '{}' {} -ErrorAction Stop",
-        cmd, vm_name, verb
-    );
 
     let output = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
@@ -178,7 +192,11 @@ pub fn shutdown_vm(vm_name: String, force: Option<bool>) -> Result<String, Strin
     }
 }
 
-/// represents the lifecycle state of the ephemeral sandbox
+// ---------------------------------------------------------------------------
+// ORCHESTRATOR STATE MACHINE
+// ---------------------------------------------------------------------------
+
+/// Represents the lifecycle state of the ephemeral sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum VmState {
     Offline,
@@ -190,7 +208,8 @@ pub enum VmState {
     Error(String),
 }
 
-/// the central controller for spinning up and tearing down the localized matrix.
+/// The central controller for spinning up and tearing down the localized matrix.
+#[allow(dead_code)]
 pub struct VmOrchestrator {
     pub profile: TargetProfile,
     pub vm_name: String,
@@ -199,10 +218,10 @@ pub struct VmOrchestrator {
 }
 
 impl VmOrchestrator {
-    /// initializes a new orchestrator for a specific proctoring target
+    /// Initializes a new orchestrator for a specific proctoring target.
     pub fn new(profile: TargetProfile) -> Self {
-        // generate a pseudo-random name to avoid hyper-v collisions 
-        // and avoid static string detection by host-level scans
+        // Pseudo-random name to avoid Hyper-V collisions and defeat
+        // static-string host scans.
         let entropy = uuid::Uuid::new_v4().to_string();
         let vm_name = format!("win_sys_{}", &entropy[..8]);
 
@@ -210,60 +229,71 @@ impl VmOrchestrator {
             profile,
             vm_name,
             state: Arc::new(Mutex::new(VmState::Offline)),
-            loopback_ip: "127.0.0.2".to_string(), // hardcoded internal loopback route
+            loopback_ip: "127.0.0.2".to_string(),
         }
     }
 
-    /// the main ignition sequence. executes the full deployment pipeline.
+    /// Main ignition sequence — full deployment pipeline.
     pub async fn engage(&self) -> Result<(), String> {
-        let mut state = self.state.lock().await;
-        *state = VmState::Provisioning;
-        
-        // 1. generate config based on target requirements
-        let _cfg = config::build_config(&self.profile.name); // Use whatever the string field is
-        
-        // 2. clone base vhdx to a fast differencing disk
+        {
+            let mut state = self.state.lock().await;
+            *state = VmState::Provisioning;
+        }
+
+        // 1. Generate config based on target requirements.
+        let _cfg = config::build_config(&self.profile.name);
+
+        // 2. Clone base VHDX to a fast differencing disk.
         clone::create_differencing_disk(&self.vm_name).map_err(|e| e.to_string())?;
-        
-        // 3. setup isolated virtual switch mapped to loopback
-        network::configure_loopback_adapter(&self.vm_name, &self.loopback_ip).map_err(|e| e.to_string())?;
 
-        *state = VmState::Booting;
-        
-        // 4. register and boot the vm via hyper-v wmi
+        // 3. Set up isolated virtual switch mapped to loopback.
+        network::configure_loopback_adapter(&self.vm_name, &self.loopback_ip)
+            .map_err(|e| e.to_string())?;
+
+        {
+            let mut state = self.state.lock().await;
+            *state = VmState::Booting;
+        }
+
+        // 4. Register and boot the VM via Hyper-V WMI.
         hyperv::start_vm(&self.vm_name).map_err(|e| e.to_string())?;
-        
-        // 5. wait for rdp port 3389 to become responsive on 127.0.0.2
-        lifecycle::wait_for_boot(&self.loopback_ip).await.map_err(|e| e.to_string())?;
 
-        *state = VmState::Running;
+        // 5. Wait for RDP :3389 on the loopback bind.
+        lifecycle::wait_for_boot(&self.loopback_ip)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        {
+            let mut state = self.state.lock().await;
+            *state = VmState::Running;
+        }
 
         Ok(())
     }
 
-    /// injects the target-specific kernel and registry patches via powershell remoting
+    /// Injects target-specific kernel and registry patches via PowerShell remoting.
+    #[allow(unused_mut)]
     pub async fn apply_stealth_hooks(&self) -> Result<(), String> {
         let mut state = self.state.lock().await;
-        
-        // this would call into the `patches/` module we'll build later
+
+        // Hook into the patches module once implemented:
         // crate::patches::loader::inject_payload(&self.loopback_ip, &self.profile.patch_set_id)?;
 
         *state = VmState::Hooked;
         Ok(())
     }
 
-    /// completely obliterates the vm, differencing disk, and vswitch. leaves no host artifacts.
+    /// Completely obliterates the VM, differencing disk, and vSwitch. No host artifacts remain.
     pub async fn teardown(&self) -> Result<(), String> {
-        let mut state = self.state.lock().await;
-        
         lifecycle::destroy_vm(&self.vm_name, None).map_err(|e| e.to_string())?;
         network::teardown_vswitch(&self.vm_name).map_err(|e| e.to_string())?;
-        
+
+        let mut state = self.state.lock().await;
         *state = VmState::Nuked;
         Ok(())
     }
 
-    /// returns the current state for the frontend telemetry feed
+    /// Returns current state for the frontend telemetry feed.
     pub async fn get_status(&self) -> VmState {
         self.state.lock().await.clone()
     }

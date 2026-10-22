@@ -32,6 +32,11 @@ use std::net::TcpStream;
 use std::time::Duration;
 use std::process::Command;
 
+use crate::rdp::input::{InputForwarder, InputPolicy};
+use crate::rdp::stream::RdpStream as StreamCapture;
+use crate::rdp::audio::AudioTap;  // or wherever AudioTap/AudioSegment lives
+use crate::rdp::audio::AudioSegment;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelStatus {
     pub active: bool,
@@ -48,7 +53,9 @@ pub fn get_tunnel_status(local_port: Option<u16>) -> Result<TunnelStatus, String
 
     // Check if something is listening on the RDP port
     let listener_active = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", port).parse().map_err(|e| e.to_string())?,
+        &format!("127.0.0.1:{}", port)
+    .parse::<std::net::SocketAddr>()
+    .map_err(|e| e.to_string())?,
         Duration::from_millis(500),
     )
     .is_ok();
@@ -303,19 +310,18 @@ pub struct RDPTunnel {
 }
 
 impl RDPTunnel {
-    /// Build a tunnel from config. Does not spawn anything yet.
-    pub fn new(config: TunnelConfig) -> Self {
-        let running = Arc::new(AtomicBool::new(false));
-        Self {
-            client: RdpClient::new(&config),
-            stream: StreamCapture::new(),
-            audio: AudioTap::new(config.audio_redirection),
-            input: InputForwarder::new(&client, config.input_policy)
-    .expect("Failed to create InputForwarder"),
-            config,
-            running,
-        }
-    }
+pub fn new(config: TunnelConfig) -> Self {
+    let running = Arc::new(AtomicBool::new(false));
+    let client = RdpClient::new(&config);
+    let handle = RDPClientHandle {
+        pid: 0,
+        window_title: String::new(),
+        loopback_addr: config.loopback_addr.clone(),
+    };
+    let input = InputForwarder::new(&handle, InputConfig::default())
+        .expect("Failed to create InputForwarder");
+    Self { client, stream: StreamCapture::new(StreamConfig::default()), audio: AudioTap::new(config.audio_redirection), input, config, running }
+}
 
     /// Current lifecycle state, derived from subsystem health.
     pub fn state(&mut self) -> TunnelState {
@@ -378,15 +384,17 @@ impl RDPTunnel {
         self.audio.drain()
     }
 
-    /// Attempt to forward a keystroke into the RDP session.
-    /// Fails closed if the target profile's InputPolicy forbids it.
-    pub fn send_key(&mut self, vk: u16) -> Result<(), RdpError> {
-        if !self.running.load(Ordering::SeqCst) {
-            return Err(RdpError::AlreadyDisconnected);
-        }
-        self.input
-            .send_key(&self.client, vk)
-            .map_err(|_| RdpError::InputPolicyDenied)
+  pub fn send_key(&mut self, vk: u16) -> Result<(), RdpError> {
+    if !self.running.load(Ordering::SeqCst) {
+        return Err(RdpError::AlreadyDisconnected);
+    }
+    self.input
+        .press_key(windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk))
+        .map_err(|_| RdpError::InputPolicyDenied)
+}
+
+    pub fn stop(&mut self) {
+    self.running.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Graceful teardown: stop capture, kill mstsc, free the audio endpoint.
