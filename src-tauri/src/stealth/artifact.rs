@@ -1,6 +1,8 @@
 // src-tauri/src/stealth/artifact.rs
 use crate::stealth::{StealthError};
 use std::time::Duration;
+use rand::Rng;
+use std::process::Command;
 
 /// Artifact cleanup — removes VM-specific registry keys, uninstalls Hyper-V Integration Services,
 /// stops/disables Hyper-V guest services, removes virtual device drivers, clears Hyper-V event logs,
@@ -10,16 +12,8 @@ use std::time::Duration;
 /// Every destructive operation is backed up to C:\ProgramData\StealthBackup\ inside the guest so
 /// `run_full_restore` can roll everything back.
 
-use rand::Rng;
-use std::time::Duration;
-
-use crate::stealth::StealthError;
-use crate::vm::lifecycle::VmHandle;
-
-/// Guest-side directory where all pre-cleanup state is snapshotted.
 const BACKUP_ROOT: &str = r"C:\ProgramData\StealthBackup";
 
-/// Keys that scream "I'm a VM" if left behind.
 const VM_REGISTRY_KEYS: &[&str] = &[
     r"HKLM\SYSTEM\CurrentControlSet\Services\vmguest",
     r"HKLM\SOFTWARE\Microsoft\Virtual Machine",
@@ -36,7 +30,6 @@ const VM_REGISTRY_KEYS: &[&str] = &[
     r"HKLM\SOFTWARE\Microsoft\Virtual Machine\Guest",
 ];
 
-/// Hyper-V guest services to stop, disable, and later restore.
 const VM_SERVICES: &[&str] = &[
     "vmicguestinterface",
     "vmicheartbeat",
@@ -48,9 +41,7 @@ const VM_SERVICES: &[&str] = &[
     "vmicvss",
 ];
 
-/// Physical GPU entries to impersonate — DeviceDescription values pulled from real hardware inf files.
 const GPU_PROFILES: &[(&str, &str)] = &[
-    // (DriverDesc, MatchingDeviceId-style hardware string)
     ("NVIDIA GeForce RTX 3070", r"PCI\VEN_10DE&DEV_2484"),
     ("NVIDIA GeForce RTX 3060", r"PCI\VEN_10DE&DEV_2503"),
     ("AMD Radeon RX 6700 XT", r"PCI\VEN_1002&DEV_73DF"),
@@ -58,18 +49,14 @@ const GPU_PROFILES: &[(&str, &str)] = &[
     ("Intel(R) Iris(R) Xe Graphics", r"PCI\VEN_8086&DEV_46A6"),
 ];
 
-/// Virtual display adapter identifiers — what the VM exposes by default.
 const VIRTUAL_ADAPTER_MATCHES: &[&str] = &[
     "Microsoft Hyper-V Video",
     "Microsoft Basic Display Adapter",
     "Virtual Display Adapter",
 ];
 
-/// How long we wait for a single PowerShell Direct invocation before giving up. Pnputil walks and
-/// event-log clears can be slow on first-generation disks, so we're generous.
 const PS_DIRECT_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Result of the artifact cleanup pass.
 #[derive(Debug, Clone, Default)]
 pub struct CleanupReport {
     pub registry_keys_removed: Vec<String>,
@@ -95,7 +82,6 @@ impl CleanupReport {
         Self::default()
     }
 
-    /// True when nothing hard-failed. Soft misses (keys already absent, services already stopped) don't count against us.
     pub fn is_clean(&self) -> bool {
         self.errors.is_empty()
             && self.registry_keys_failed.is_empty()
@@ -103,7 +89,6 @@ impl CleanupReport {
     }
 }
 
-/// Result of the restore pass.
 #[derive(Debug, Clone, Default)]
 pub struct RestoreReport {
     pub services_restarted: Vec<String>,
@@ -116,52 +101,24 @@ pub struct RestoreReport {
     pub errors: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Public entry points
-// ---------------------------------------------------------------------------
-
-/// Full async cleanup pipeline. Call this from your Tauri command layer.
-///
-/// Order matters: backup state first (so restore is possible), then cheap registry ops, then services,
-/// then drivers/logs/tasks/rules, and the display-adapter rename last because it walks the whole PCI enum tree.
 pub async fn cleanup_vm_artifacts(vm_handle: VmHandle) -> Result<CleanupReport, StealthError> {
     let vm_name = vm_handle.name();
     let mut report = CleanupReport::new();
 
-    // Step 0 — snapshot everything we're about to destroy.
     backup_guest_state(&vm_name, &mut report);
-
-    // Step 1 — delete VM-identifying registry keys.
     scrub_registry(&vm_name, &mut report);
-
-    // Step 2 — strip VMBus service values (belt-and-suspenders; the service itself can't be deleted while the VM runs, but its identifying values can).
     strip_vmbus_values(&vm_name, &mut report);
-
-    // Step 3 — stop + disable every Hyper-V guest service.
     stop_vm_services(&vm_name, &mut report);
-
-    // Step 4 — kill Integration Services (MSI path, then DISM path).
     uninstall_integration_services(&vm_name, &mut report);
-
-    // Step 5 — remove virtual device drivers (pnputil, from backup list).
     remove_virtual_drivers(&vm_name, &mut report);
-
-    // Step 6 — clear Hyper-V event logs.
     clear_hyper_v_event_logs(&vm_name, &mut report);
-
-    // Step 7 — unregister Hyper-V scheduled tasks.
     unregister_hyper_v_tasks(&vm_name, &mut report);
-
-    // Step 8 — remove Hyper-V firewall rules.
     remove_hyper_v_firewall_rules(&vm_name, &mut report);
-
-    // Step 9 — rename the virtual display adapter to a real GPU.
     rename_display_adapter(&vm_name, &mut report);
 
     Ok(report)
 }
 
-/// Restore everything `cleanup_vm_artifacts` tore down, using the backup snapshot written to the guest's BACKUP_ROOT.
 pub async fn restore_artifacts(vm_handle: VmHandle) -> Result<RestoreReport, StealthError> {
     let vm_name = vm_handle.name();
     let mut report = RestoreReport::new();
@@ -176,7 +133,6 @@ pub async fn restore_artifacts(vm_handle: VmHandle) -> Result<RestoreReport, Ste
     Ok(report)
 }
 
-/// Legacy sync wrappers around the async pipeline, for callers that haven't migrated to async yet. These block the current thread.
 pub fn run_full_cleanup(vm_name: &str) -> Result<CleanupReport, String> {
     let handle = VmHandle::open(vm_name).map_err(|e| e.to_string())?;
     crate::stealth::block_on(cleanup_vm_artifacts(handle)).map_err(|e| e.to_string())
@@ -187,11 +143,6 @@ pub fn run_full_restore(vm_name: &str) -> Result<RestoreReport, String> {
     crate::stealth::block_on(restore_artifacts(handle)).map_err(|e| e.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// Step 0 — Backup
-// ---------------------------------------------------------------------------
-
-/// Snapshots services, drivers, tasks, firewall rules, and event log state into BACKUP_ROOT inside the guest. Runs as one PowerShell session to keep PowerShell Direct round-trips down.
 fn backup_guest_state(vm_name: &str, report: &mut CleanupReport) {
     let script = format!(
         r#"
@@ -269,10 +220,6 @@ fn backup_guest_state(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step 1 — Registry scrub
-// ---------------------------------------------------------------------------
-
 fn scrub_registry(vm_name: &str, report: &mut CleanupReport) {
     for key in VM_REGISTRY_KEYS {
         let script = format!(
@@ -296,20 +243,15 @@ fn scrub_registry(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step 2 — VMBus value stripping
-// ---------------------------------------------------------------------------
-
-/// The VMBus service itself can't be removed on a running Hyper-V guest, but we strip the identifying values that leak its presence.
 fn strip_vmbus_values(vm_name: &str, report: &mut CleanupReport) {
     let values = ["ImagePath", "Start", "Type"];
     for value in values {
         let script = format!(
             "if (Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\VMBus' \
-             -Name '{value}' -ErrorAction SilentlyContinue) {{ \
-              Remove-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\VMBus' \
-              -Name '{value}' -Force; Write-Output 'VMBUS_STRIPPED:{value}' \
-             }} else {{ Write-Output 'VMBUS_ABSENT:{value}' }}"
+            -Name '{value}' -ErrorAction SilentlyContinue) {{ \
+             Remove-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\VMBus' \
+             -Name '{value}' -Force; Write-Output 'VMBUS_STRIPPED:{value}' \
+            }} else {{ Write-Output 'VMBUS_ABSENT:{value}' }}"
         );
         match run_in_guest(vm_name, &script) {
             Ok((stdout, _)) if stdout.contains("VMBUS_STRIPPED") => {
@@ -327,10 +269,6 @@ fn strip_vmbus_values(vm_name: &str, report: &mut CleanupReport) {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Step 3 — Service stop/disable
-// ---------------------------------------------------------------------------
 
 fn stop_vm_services(vm_name: &str, report: &mut CleanupReport) {
     for svc in VM_SERVICES {
@@ -367,11 +305,6 @@ fn stop_vm_services(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step 4 — Driver removal
-// ---------------------------------------------------------------------------
-
-/// Remove virtual device drivers (pnputil, from backup list).
 fn remove_virtual_drivers(vm_name: &str, report: &mut CleanupReport) {
     let script = r#"
     // Remove device drivers:
@@ -387,11 +320,6 @@ fn remove_virtual_drivers(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step 5 — Event log clearing
-// ---------------------------------------------------------------------------
-
-/// Clear Hyper-V event logs.
 fn clear_hyper_v_event_logs(vm_name: &str, report: &mut CleanupReport) {
     let script = r#"
     // Remove event logs:
@@ -407,11 +335,6 @@ fn clear_hyper_v_event_logs(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step 6 — Scheduled task unregistration
-// ---------------------------------------------------------------------------
-
-/// Unregister Hyper-V scheduled tasks.
 fn unregister_hyper_v_tasks(vm_name: &str, report: &mut CleanupReport) {
     let script = r#"
     // Remove scheduled tasks:
@@ -427,11 +350,6 @@ fn unregister_hyper_v_tasks(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step 7 — Firewall rule removal
-// ---------------------------------------------------------------------------
-
-/// Remove Hyper-V firewall rules.
 fn remove_hyper_v_firewall_rules(vm_name: &str, report: &mut CleanupReport) {
     let script = r#"
     // Remove firewall rules:
@@ -447,11 +365,6 @@ fn remove_hyper_v_firewall_rules(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step 8 — Display adapter renaming
-// ---------------------------------------------------------------------------
-
-/// Rename the virtual display adapter to a real GPU.
 fn rename_display_adapter(vm_name: &str, report: &mut CleanupReport) {
     let script = r#"
     // Rename the virtual display adapter to match physical GPU entries.
@@ -478,36 +391,29 @@ fn rename_display_adapter(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helper functions
-// ---------------------------------------------------------------------------
-
-use powershell_dscc::PowerShellDscc;
-
-/// Helper function to run PowerShell commands inside guest via PowerShell Direct.
 fn run_powershell_in_guest(script: &str, vm_name: &str) -> Result<(), StealthError> {
-    let dscc = PowerShellDscc::new(vm_name)?;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .map_err(|e| StealthError::from(format!("Failed to run PowerShell script: {e}")))?;
 
-    // Execute the PowerShell script
-    if let Err(e) = dscc.run_script(script) {
-        return Err(StealthError::from(format!("Failed to run PowerShell script: {e}")));
+    if !output.status.success() {
+        return Err(StealthError::from(format!(
+            "PowerShell script failed with stdout: {} and stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
 
     Ok(())
 }
 
-/// Helper function to run PowerShell commands inside the guest VM.
 fn run_in_guest(vm_name: &str, script: &str) -> Result<(String, String), StealthError> {
-    // Execute PowerShell script directly and capture stdout/stderr
     let output = run_powershell_in_guest(script, vm_name)?;
-    Ok((output.stdout, output.stderr))
+    Ok((String::from_utf8_lossy(&output.stdout).to_string(), String::from_utf8_lossy(&output.stderr).to_string()))
 }
 
-// ---------------------------------------------------------------------------
-// Step 9 — Integration Services uninstallation
-// ---------------------------------------------------------------------------
-
-/// Kill Integration Services (MSI path, then DISM path).
 fn uninstall_integration_services(vm_name: &str, report: &mut CleanupReport) {
     let script = r#"
     // Uninstall Integration Services:
@@ -524,26 +430,6 @@ fn uninstall_integration_services(vm_name: &str, report: &mut CleanupReport) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Step 10 — Restore
-// ---------------------------------------------------------------------------
-
-/// Restore everything `cleanup_vm_artifacts` tore down, using the backup snapshot written to the guest's BACKUP_ROOT.
-pub async fn restore_artifacts(vm_handle: VmHandle) -> Result<RestoreReport, StealthError> {
-    let vm_name = vm_handle.name();
-    let mut report = RestoreReport::new();
-
-    restore_scheduled_tasks(&vm_name, &mut report);
-    restore_firewall_rules(&vm_name, &mut report);
-    restore_event_logs(&vm_name, &mut report);
-    restore_drivers(&vm_name, &mut report);
-    restart_vm_services(&vm_name, &mut report);
-    restore_registry_keys(&vm_name, &mut report);
-
-    Ok(report)
-}
-
-/// Helper function to restore scheduled tasks.
 fn restore_scheduled_tasks(vm_name: &str, report: &mut RestoreReport) {
     let script = r#"
     # Restore scheduled tasks
@@ -559,7 +445,6 @@ fn restore_scheduled_tasks(vm_name: &str, report: &mut RestoreReport) {
     }
 }
 
-/// Helper function to restore firewall rules.
 fn restore_firewall_rules(vm_name: &str, report: &mut RestoreReport) {
     let script = r#"
     # Restore firewall rules
@@ -578,7 +463,6 @@ fn restore_firewall_rules(vm_name: &str, report: &mut RestoreReport) {
     }
 }
 
-/// Helper function to restore event logs.
 fn restore_event_logs(vm_name: &str, report: &mut RestoreReport) {
     let script = r#"
     # Restore event log configuration
@@ -594,7 +478,6 @@ fn restore_event_logs(vm_name: &str, report: &mut RestoreReport) {
     }
 }
 
-/// Helper function to restore drivers.
 fn restore_drivers(vm_name: &str, report: &mut RestoreReport) {
     let script = r#"
     # Restore drivers
@@ -610,7 +493,6 @@ fn restore_drivers(vm_name: &str, report: &mut RestoreReport) {
     }
 }
 
-/// Helper function to restore registry keys.
 fn restore_registry_keys(vm_name: &str, report: &mut RestoreReport) {
     let script = r#"
     # Restore full registry keys
@@ -626,7 +508,6 @@ fn restore_registry_keys(vm_name: &str, report: &mut RestoreReport) {
     }
 }
 
-/// Helper function to restart VM services.
 fn restart_vm_services(vm_name: &str, report: &mut RestoreReport) {
     for svc in VM_SERVICES {
         let script = format!(
