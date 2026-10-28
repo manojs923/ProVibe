@@ -17,11 +17,14 @@
 // the above automatically. For defense in depth, we also apply WMI-level
 // CPUID mask overrides and verify the result.
 
+use crate::stealth::StealthError;
 use crate::vm::lifecycle::VmHandle;
-use super::StealthError;
 
 use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -40,11 +43,109 @@ pub const MSR_HYPERVISOR_BASE: u32 = 0x4000_0000;
 
 /// Default vendor string we want the VM to report (Intel bare metal).
 /// This is what CPUID leaf 0 returns on a physical Intel machine.
+#[allow(dead_code)]
 const INTEL_VENDOR_STRING: &str = "GenuineIntel";
 
-pub async fn mask_hypervisor(_vm_handle: VmHandle) -> Result<(), StealthError> { Ok(()) }
-pub async fn unmask_hypervisor(_vm_handle: VmHandle) -> Result<(), StealthError> { Ok(()) }
-pub fn host_supports_masking() -> bool { true }
+/// Default timeout for a PowerShell host invocation.
+const HOST_PS_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Deadline for the post-unmask verification loop.
+const UNMASK_VERIFY_TIMEOUT_SECS: u64 = 120;
+
+// ---------------------------------------------------------------------------
+// Public async API
+// ---------------------------------------------------------------------------
+
+/// Apply hypervisor masking to the target VM.
+///
+/// Combines the Hyper-V first-class `HideHypervisorPresent` toggle with a
+/// WMI defense-in-depth pass that scrubs `Msvm_ProcessorSettingData`.
+///
+/// Safe to invoke while the VM is running (live update) or offline.
+pub async fn mask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> {
+    let vm_name = vm_handle.name();
+    let script = build_mask_script(vm_name);
+
+    let output = run_powershell_on_host(&script).await?;
+
+    if !output.contains("MASK_COMPLETE") {
+        return Err(StealthError::ScriptFailure(format!(
+            "mask_hypervisor: script did not reach MASK_COMPLETE sentinel. \
+             Output:\n{}",
+            output
+        )));
+    }
+
+    if output.contains("MASK_FAILED:HideHypervisorPresent") {
+        return Err(StealthError::ScriptFailure(format!(
+            "mask_hypervisor: HideHypervisorPresent failed. Output:\n{}",
+            output
+        )));
+    }
+
+    Ok(())
+}
+
+/// Remove hypervisor masking and restore the guest's visibility of the
+/// virtualization layer. Used during rollback or VM teardown.
+///
+/// This performs a hard power cycle so the guest re-enumerates CPUID and
+/// ACPI tables from scratch, then verifies via `Win32_ComputerSystem` that
+/// `HypervisorPresent` is `True` before returning success.
+pub async fn unmask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> {
+    let vm_name = vm_handle.name();
+    let script = build_unmask_script(vm_name);
+
+    let output = run_powershell_on_host(&script).await?;
+
+    if output.contains("Unmask verification failed") {
+        return Err(StealthError::VerificationFailed(format!(
+            "unmask_hypervisor: guest did not re-report HypervisorPresent \
+             within {}s. Output:\n{}",
+            UNMASK_VERIFY_TIMEOUT_SECS, output
+        )));
+    }
+
+    Ok(())
+}
+
+/// Capability check: can the current host apply CPUID masking?
+///
+/// Requires Hyper-V PowerShell module and the `Set-VMProcessor` cmdlet to
+/// expose the `HideHypervisorPresent` parameter (Windows 10 1803+ /
+/// Windows Server 2019+).
+pub fn host_supports_masking() -> bool {
+    let probe = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    $cmd = Get-Command Set-VMProcessor -ErrorAction Stop
+    if ($cmd.Parameters.ContainsKey('HideHypervisorPresent')) {
+        Write-Output 'SUPPORTED'
+    } else {
+        Write-Output 'UNSUPPORTED'
+    }
+} catch {
+    Write-Output 'UNSUPPORTED'
+}
+"#;
+
+    match std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            probe,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("SUPPORTED"),
+        Err(_) => false,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PowerShell script templates
@@ -53,7 +154,7 @@ pub fn host_supports_masking() -> bool { true }
 /// Primary masking script — sets HideHypervisorPresent and clears
 /// virtualization extension exposure. Can apply while VM is running
 /// (live update) or offline.
-fn build_mask_script(vm_name: &str) -> String {
+pub fn build_mask_script(vm_name: &str) -> String {
     format!(
         r#"
 $ErrorActionPreference = 'Stop'
@@ -78,6 +179,14 @@ try {{
     Write-Output "MASK_SKIPPED:ExposeVirtualizationExtensions"
 }}
 
+# --- Disable resource metering so RDTSC/temperature counters look native ---
+try {{
+    Set-VMMemory -VMName $vmName -ResourceMeteringEnabled $false
+    Write-Output "MASK_APPLIED:ResourceMetering"
+}} catch {{
+    Write-Output "MASK_SKIPPED:ResourceMetering:$($_.Exception.Message)"
+}}
+
 # --- Clear hypervisor present bit in CPUID leaf 0x1 via WMI ---
 try {{
     $vm = Get-CimInstance -Namespace 'root\virtualization\v2' `
@@ -89,19 +198,25 @@ try {{
             -ResultClassName 'Msvm_ProcessorSettingData'
 
         if ($null -ne $procSD) {{
-            # For additional leaf-level masking, we patch the
-            # LimitProcessorFeatures to strip hypervisor hints
+            # Strip hypervisor hints from the processor setting data
             $procSD.HideHypervisorPresent = $true
+            $procSD.ExposeVirtualizationExtensions = $false
 
-            # Apply via VSMS
             $vmms = Get-CimInstance -Namespace 'root\virtualization\v2' `
                 -ClassName 'Msvm_VirtualSystemManagementService'
 
             if ($null -ne $vmms) {{
-                $sdText = $procSD | ConvertTo-CimInstanceString
-                # Use ModifySystemSettings to apply
-                $result = $vmms.ModifySystemSettings($sdText)
-                Write-Output "MASK_APPLIED:WmiProcessorSettings"
+                $cimSerializer = [Microsoft.Management.Infrastructure.Serialization.CimSerializer]::Create()
+                $sdBytes = $cimSerializer.Serialize($procSD, [Microsoft.Management.Infrastructure.Serialization.InstanceSerializationOptions]::None)
+                $sdText = [System.Text.Encoding]::Unicode.GetString($sdBytes)
+                $result = Invoke-CimMethod -InputObject $vmms `
+                    -MethodName 'ModifyResourceSettings' `
+                    -Arguments @{{ ResourceSettings = @($sdText) }}
+                if ($result.ReturnValue -eq 0 -or $result.ReturnValue -eq 4096) {{
+                    Write-Output "MASK_APPLIED:WmiProcessorSettings"
+                }} else {{
+                    Write-Output "MASK_SKIPPED:WmiProcessorSettings:ReturnValue=$($result.ReturnValue)"
+                }}
             }}
         }}
     }}
@@ -118,25 +233,33 @@ Write-Output "MASK_COMPLETE"
 
 /// Unmask script — restores hypervisor visibility. Used during rollback
 /// or when destroying VM.
-fn build_unmask_script(vm_name: &str) -> String {
+pub fn build_unmask_script(vm_name: &str) -> String {
     let mut s = String::new();
 
+    s.push_str("$ErrorActionPreference = 'Stop'\n\n");
     s.push_str("# Unmask script — restoring hypervisor presence\n");
     s.push_str("# Target VM: ");
     s.push_str(vm_name);
     s.push_str("\n\n");
 
-    // 1. Re-enable hypervisor CPUID leaf reporting
+    // 1. Re-enable hypervisor CPUID leaf reporting (clear HideHypervisorPresent)
     s.push_str("# Restore CPUID leaf 0x40000000+ disclosures\n");
     s.push_str(&format!(
-        "Set-VMProcessor -VMName \"{}\" -ExposeVirtualizationExtensions $true\n",
+        "try {{ Set-VMProcessor -VMName \"{}\" -HideHypervisorPresent $false }} \
+         catch {{ Write-Output \"UNMASK_SKIPPED:HideHypervisorPresent:$($_.Exception.Message)\" }}\n",
+        vm_name
+    ));
+    s.push_str(&format!(
+        "try {{ Set-VMProcessor -VMName \"{}\" -ExposeVirtualizationExtensions $true }} \
+         catch {{ Write-Output \"UNMASK_SKIPPED:ExposeVirtualizationExtensions:$($_.Exception.Message)\" }}\n\n",
         vm_name
     ));
 
-    // 2. Clear the timing-side-channel mitigations we added during masking
+    // 2. Restore RDTSC/temperature counters by re-enabling resource metering
     s.push_str("# Restore RDTSC/temperature counters\n");
     s.push_str(&format!(
-        "Set-VMMemory -VMName \"{}\" -ResourceMeteringEnabled $false\n",
+        "try {{ Set-VMMemory -VMName \"{}\" -ResourceMeteringEnabled $true }} \
+         catch {{ Write-Output \"UNMASK_SKIPPED:ResourceMetering:$($_.Exception.Message)\" }}\n\n",
         vm_name
     ));
 
@@ -144,56 +267,197 @@ fn build_unmask_script(vm_name: &str) -> String {
     //    storage controller becomes visible inside the guest again.
     s.push_str("# Remove disk pass-through shim\n");
     s.push_str(&format!(
-        "Get-VMHardDiskDrive -VMName \"{}\" | ",
+        "try {{ Get-VMHardDiskDrive -VMName \"{}\" | ",
         vm_name
     ));
     s.push_str("Where-Object { $_.Path -like '*shim*.vhdx' } | ");
-    s.push_str("Remove-VMHardDiskDrive\n");
+    s.push_str("Remove-VMHardDiskDrive } catch { Write-Output \"UNMASK_SKIPPED:ShimRemoval:$($_.Exception.Message)\" }\n\n");
 
-    // 4. Reattach the original disk image
+    // 4. Reattach the original disk image (if the canonical path is present)
+    s.push_str("# Reattach original disk image if canonical path exists\n");
     s.push_str(&format!(
-        "Add-VMHardDiskDrive -VMName \"{}\" -Path \"$env:VM_DISKS\\{}.vhdx\"\n",
-        vm_name, vm_name
-    ));
-
-    // 5. Remove registry keys inside the guest that suppressed
-    //    hypervisor artifacts (the guest agent handles the merge).
-    s.push_str("# Signal guest-side agent to undo registry edits\n");
-    s.push_str(&format!(
-        "Set-ItemProperty -Path \"HKLM:\\SOFTWARE\\MaskAgent\\{}\" ",
+        "$origDisk = Join-Path $env:VM_DISKS \"{}.vhdx\"\n",
         vm_name
     ));
-    s.push_str("-Name \"State\" -Value \"Unmasking\" -Type String\n");
+    s.push_str("if (Test-Path $origDisk) {\n");
+    s.push_str(&format!(
+        "    $already = Get-VMHardDiskDrive -VMName \"{}\" | Where-Object {{ $_.Path -eq $origDisk }}\n",
+        vm_name
+    ));
+    s.push_str("    if (-not $already) {\n");
+    s.push_str(&format!(
+        "        try {{ Add-VMHardDiskDrive -VMName \"{}\" -Path $origDisk }} \
+         catch {{ Write-Output \"UNMASK_SKIPPED:AddOrigDisk:$($_.Exception.Message)\" }}\n",
+        vm_name
+    ));
+    s.push_str("    }\n");
+    s.push_str("}\n\n");
+
+    // 5. Signal guest-side agent to undo registry edits.
+    s.push_str("# Signal guest-side agent to undo registry edits\n");
+    s.push_str(&format!(
+        "try {{\n    $maskKey = \"HKLM:\\SOFTWARE\\MaskAgent\\{}\"\n",
+        vm_name
+    ));
+    s.push_str("    if (-not (Test-Path $maskKey)) { New-Item -Path $maskKey -Force | Out-Null }\n");
+    s.push_str("    Set-ItemProperty -Path $maskKey -Name \"State\" -Value \"Unmasking\" -Type String\n");
+    s.push_str("} catch { Write-Output \"UNMASK_SKIPPED:MaskAgentState:$($_.Exception.Message)\" }\n\n");
 
     // 6. Full power cycle so the guest actually re-enumerates
     //    CPUID and ACPI tables from scratch.
     s.push_str("# Hard reset required for CPUID re-enumeration\n");
     s.push_str(&format!(
-        "Stop-VM -Name \"{}\" -TurnOff -Force -Confirm:$false\n",
+        "try {{ Stop-VM -Name \"{}\" -TurnOff -Force -Confirm:$false }} \
+         catch {{ Write-Output \"UNMASK_SKIPPED:StopVM:$($_.Exception.Message)\" }}\n",
         vm_name
     ));
     s.push_str("Start-Sleep -Seconds 3\n");
-    s.push_str(&format!("Start-VM -Name \"{}\"\n", vm_name));
+    s.push_str(&format!(
+        "try {{ Start-VM -Name \"{}\" }} catch {{ Write-Error \"Unmask failed: cannot start VM: $($_.Exception.Message)\" }}\n\n",
+        vm_name
+    ));
 
     // 7. Verification pass — confirm the hypervisor bit is back.
-    //    The guest will report \"A hypervisor has been detected\" in
-    //    its boot log, which is exactly what we want post-rollback.
-    s.push_str("# Verify unmask succeeded (timeout 120s)\n");
     s.push_str(&format!(
-        "$deadline = (Get-Date).AddSeconds(120)\n\
-         $ok = $false\n\
-         while ((Get-Date) -lt $deadline) {{\n\
-             $state = (Get-VM -Name \"{}\").State\n\
-             if ($state -eq 'Running') {{\n\
-                 $probe = Invoke-Command -VMName \"{}\" ", 
-        vm_name, vm_name
+        "# Verify unmask succeeded (timeout {}s)\n",
+        UNMASK_VERIFY_TIMEOUT_SECS
     ));
-    s.push_str("-ScriptBlock { (Get-CimInstance Win32_ComputerSystem).HypervisorPresent }\n");
-    s.push_str("                 if ($probe) { $ok = $true; break }\n\
-             }\n\
-             Start-Sleep -Seconds 5\n\
-         }\n");
-    s.push_str("if (-not $ok) { Write-Error 'Unmask verification failed' }\n");
+    s.push_str(&format!(
+        "$deadline = (Get-Date).AddSeconds({})\n",
+        UNMASK_VERIFY_TIMEOUT_SECS
+    ));
+    s.push_str("$ok = $false\n");
+    s.push_str("while ((Get-Date) -lt $deadline) {\n");
+    s.push_str(&format!(
+        "    $state = (Get-VM -Name \"{}\").State\n",
+        vm_name
+    ));
+    s.push_str("    if ($state -eq 'Running') {\n");
+    s.push_str("        try {\n");
+    s.push_str(&format!(
+        "            $probe = Invoke-Command -VMName \"{}\" ",
+        vm_name
+    ));
+    s.push_str("-ScriptBlock { (Get-CimInstance Win32_ComputerSystem).HypervisorPresent } -ErrorAction Stop\n");
+    s.push_str("            if ($probe) { $ok = $true; break }\n");
+    s.push_str("        } catch {\n");
+    s.push_str("            # Guest may not have WinRM ready yet; retry\n");
+    s.push_str("        }\n");
+    s.push_str("    }\n");
+    s.push_str("    Start-Sleep -Seconds 5\n");
+    s.push_str("}\n\n");
+    s.push_str("if (-not $ok) {\n");
+    s.push_str("    Write-Error 'Unmask verification failed'\n");
+    s.push_str("} else {\n");
+    s.push_str("    Write-Output 'UNMASK_COMPLETE'\n");
+    s.push_str("}\n");
 
     s
+}
+
+// ---------------------------------------------------------------------------
+// Host PowerShell invocation
+// ---------------------------------------------------------------------------
+
+/// Run a PowerShell script on the host and capture combined stdout/stderr.
+///
+/// The script is passed via stdin (`-Command -`) so we never hit command-line
+/// length limits and quoting rules stay simple. A hard timeout guards against
+/// hung WinRM/VSMS calls.
+async fn run_powershell_on_host(script: &str) -> Result<String, StealthError> {
+    let mut child = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            StealthError::HostInvocation(format!("failed to spawn powershell.exe: {}", e))
+        })?;
+
+    // Feed the script over stdin.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes()).await.map_err(|e| {
+            StealthError::HostInvocation(format!("failed to write script to stdin: {}", e))
+        })?;
+        // Dropping stdin closes the pipe, signalling EOF to PowerShell.
+        drop(stdin);
+    }
+
+    let output = match timeout(HOST_PS_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return Err(StealthError::HostInvocation(format!(
+                "powershell.exe wait failed: {}",
+                e
+            )))
+        }
+        Err(_) => {
+            return Err(StealthError::HostInvocation(format!(
+                "powershell.exe timed out after {:?}",
+                HOST_PS_TIMEOUT
+            )))
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Combine stdout and stderr so callers can inspect error output
+    // from PowerShell alongside the normal sentinel lines.
+    let combined = if stderr.is_empty() {
+        stdout
+    } else {
+        format!("{}\n[STDERR]\n{}", stdout, stderr)
+    };
+
+    Ok(combined)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_mask_unmask_cycle() {
+        // This test assumes a Hyper-V host with a test VM named "TestVM"
+        let vm_handle = VmHandle::new("TestVM");
+
+        // Mask the hypervisor
+        let mask_result = mask_hypervisor(vm_handle.clone()).await;
+        assert!(mask_result.is_ok(), "Masking failed: {:?}", mask_result);
+
+        // Unmask the hypervisor
+        let unmask_result = unmask_hypervisor(vm_handle.clone()).await;
+        assert!(unmask_result.is_ok(), "Unmasking failed: {:?}", unmask_result);
+    }
+
+    #[test]
+    fn test_host_supports_masking() {
+        let supported = host_supports_masking();
+        assert!(supported, "Host does not support masking");
+    }
+
+    #[test]
+    fn test_build_mask_script() {
+        let script = build_mask_script("TestVM");
+        assert!(script.contains("Set-VMProcessor -VMName $vmName -HideHypervisorPresent $true"));
+    }
+
+    #[test]
+    fn test_build_unmask_script() {
+        let script = build_unmask_script("TestVM");
+        assert!(script.contains("Set-VMProcessor -VMName \"TestVM\" -HideHypervisorPresent $false"));
+    }
 }

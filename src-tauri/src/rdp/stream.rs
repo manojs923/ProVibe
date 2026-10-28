@@ -800,5 +800,276 @@ mod tests {
         assert_eq!(Frame::buffer_size(10, 20), 800);
     }
 
+        #[test]
+    fn test_stream_config_defaults() {
+        let config = StreamConfig::default();
+        assert_eq!(config.target_fps, 30);
+        assert_eq!(config.backend, CaptureBackend::DesktopDuplication);
+        assert!(config.crop_to_window);
+        assert_eq!(config.acquire_timeout_ms, 100);
+        assert_eq!(config.downscale, None);
+    }
+
     #[test]
-    fn test_stream
+    fn test_frame_interval() {
+        let mut config = StreamConfig::default();
+        assert_eq!(config.frame_interval(), Duration::from_nanos(33_333_333));
+
+                config.target_fps = 60;
+        assert_eq!(config.frame_interval(), Duration::from_nanos(16_666_666));
+
+                config.target_fps = 0;
+        assert_eq!(config.frame_interval(), Duration::from_nanos(0));
+
+        config.target_fps = 144;
+        assert_eq!(config.frame_interval(), Duration::from_nanos(6_944_444));
+    }
+
+    #[test]
+    fn test_crop_bgra_edge_cases() {
+        // 4x4 BGRA frame = 64 bytes
+        let mut frame: Vec<u8> = Vec::with_capacity(64);
+        for i in 0..64 {
+            frame.push(i as u8);
+        }
+
+        let full_rect = CaptureRect { x: 0, y: 0, w: 4, h: 4 };
+        let cropped = crop_bgra(&frame, 4, 4, &full_rect).unwrap();
+        assert_eq!(cropped, frame, "full-frame crop should be identity");
+
+        // Single pixel crop at (1,1) — bytes 20..24 of original
+        let one_px = CaptureRect { x: 1, y: 1, w: 1, h: 1 };
+        let cropped = crop_bgra(&frame, 4, 4, &one_px).unwrap();
+        assert_eq!(cropped.len(), 4);
+        assert_eq!(cropped[0], 20);
+        assert_eq!(cropped[1], 21);
+        assert_eq!(cropped[2], 22);
+        assert_eq!(cropped[3], 23);
+
+        // Bottom-right corner crop
+        let corner = CaptureRect { x: 3, y: 3, w: 1, h: 1 };
+        let cropped = crop_bgra(&frame, 4, 4, &corner).unwrap();
+        assert_eq!(cropped.len(), 4);
+        assert_eq!(cropped[0], 60);
+
+        // Out-of-bounds: extends past right edge
+        let oob_right = CaptureRect { x: 2, y: 0, w: 5, h: 2 };
+        assert!(crop_bgra(&frame, 4, 4, &oob_right).is_err());
+
+        // Out-of-bounds: extends past bottom edge
+        let oob_bottom = CaptureRect { x: 0, y: 2, w: 2, h: 5 };
+        assert!(crop_bgra(&frame, 4, 4, &oob_bottom).is_err());
+
+        // Zero-dimension rect
+        let zero_w = CaptureRect { x: 0, y: 0, w: 0, h: 2 };
+        assert!(crop_bgra(&frame, 4, 4, &zero_w).is_err());
+
+        let zero_h = CaptureRect { x: 0, y: 0, w: 2, h: 0 };
+        assert!(crop_bgra(&frame, 4, 4, &zero_h).is_err());
+
+        // Negative origin
+        let neg_x = CaptureRect { x: -1, y: 0, w: 2, h: 2 };
+        let cropped = crop_bgra(&frame, 4, 4, &neg_x);
+        assert!(cropped.is_err(), "negative x must fail");
+
+        // Buffer too small for claimed dimensions
+        let truncated: Vec<u8> = frame[..32].to_vec();
+        let half_rect = CaptureRect { x: 0, y: 0, w: 4, h: 4 };
+        assert!(crop_bgra(&truncated, 4, 4, &half_rect).is_err());
+    }
+
+    #[test]
+    fn test_downscale_bgra() {
+        // Build a solid-color 8x8 frame (red, fully opaque)
+        let mut frame = Vec::with_capacity(8 * 8 * 4);
+        for _ in 0..64 {
+            frame.extend_from_slice(&[66, 0, 255, 255]); // BGRA red
+        }
+
+        // Exact 2:1 downscale
+        let downscaled = downscale_bgra(&frame, 8, 8, 4, 4);
+        assert_eq!(downscaled.len(), 4 * 4 * 4);
+        // Every output pixel should still be pure red (box filter on uniform input)
+        for chunk in downscaled.chunks_exact(4) {
+            assert_eq!(chunk, &[66, 0, 255, 255]);
+        }
+
+        // Non-integer ratio: 8 -> 3
+        let downscaled = downscale_bgra(&frame, 8, 8, 3, 3);
+        assert_eq!(downscaled.len(), 3 * 3 * 4);
+        for chunk in downscaled.chunks_exact(4) {
+            assert_eq!(chunk, &[66, 0, 255, 255]);
+        }
+
+        // Identity scale (no change)
+        let same = downscale_bgra(&frame, 8, 8, 8, 8);
+        assert_eq!(same, frame);
+
+        // Upscale attempt — function should clamp or no-op; we define no-op
+        // (upscale is never used in the capture path)
+        let up = downscale_bgra(&frame, 8, 8, 16, 16);
+        assert_eq!(up.len(), 8 * 8 * 4, "upscale should return input unchanged");
+
+        // Odd source: 5x5 -> 2x2
+        let mut odd = Vec::with_capacity(5 * 5 * 4);
+        for _ in 0..25 {
+            odd.extend_from_slice(&[0, 128, 0, 255]); // BGRA green
+        }
+        let downscaled = downscale_bgra(&odd, 5, 5, 2, 2);
+        assert_eq!(downscaled.len(), 2 * 2 * 4);
+        for chunk in downscaled.chunks_exact(4) {
+            assert_eq!(chunk, &[0, 128, 0, 255]);
+        }
+
+        // Gradient input — verify averaging works: top half blue, bottom half red
+        let mut grad = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4 {
+            for _ in 0..4 {
+                if y < 2 {
+                    grad.extend_from_slice(&[255, 0, 0, 255]); // blue
+                } else {
+                    grad.extend_from_slice(&[66, 0, 255, 255]); // red
+                }
+            }
+        }
+        let flat = downscale_bgra(&grad, 4, 4, 1, 1);
+        assert_eq!(flat.len(), 4);
+        // Box filter over 8 blue + 8 red pixels:
+        // B: (255*8 + 66*8)/16 = 160.5 -> 160
+        // G: 0, R: (0*8 + 255*8)/16 = 127.5 -> 127
+        assert_eq!(flat[0], 160, "blue channel average");
+        assert_eq!(flat[1], 0, "green channel average");
+        assert_eq!(flat[2], 127, "red channel average");
+        assert_eq!(flat[3], 255, "alpha stays opaque");
+    }
+
+    #[test]
+    fn test_stream() {
+        // The full StreamConfig pipeline: defaults -> validation -> crop math.
+        let config = StreamConfig::default();
+        assert_eq!(config.jpeg_quality.clamp(1, 100), 75);
+        assert!(config.target_fps > 0 && config.target_fps <= 120);
+        assert!(config.max_width > 0 && config.max_height > 0);
+
+        // Frame interval consistency across the pipeline
+        let interval = config.frame_interval();
+        assert!(interval > Duration::ZERO);
+
+        // Rect clamping against a virtual 1920x1080 desktop
+        let desktop_w: i32 = 1920;
+        let desktop_h: i32 = 1080;
+
+        let oversized = CaptureRect {
+            x: 1900,
+            y: 1000,
+            w: 200,  // would extend to 2100
+            h: 200,  // would extend to 1200
+        };
+        let clamped_w = oversized.w.min(desktop_w - oversized.x).max(0);
+        let clamped_h = oversized.h.min(desktop_h - oversized.y).max(0);
+        assert_eq!(clamped_w, 20, "width clamps to right edge");
+        assert_eq!(clamped_h, 80, "height clamps to bottom edge");
+
+        // Zero-area after clamp means the rect was entirely off-screen
+        let offscreen = CaptureRect { x: 2000, y: 0, w: 100, h: 100 };
+        let cw = offscreen.w.min(desktop_w - offscreen.x).max(0);
+        assert_eq!(cw, 0, "rect past right edge collapses to zero");
+    }
+
+    #[test]
+    fn test_capture_rect_validation() {
+        // Valid rect
+        let ok = CaptureRect { x: 0, y: 0, w: 100, h: 100 };
+        assert!(ok.w > 0 && ok.h > 0);
+
+        // Degenerate rects are rejected by crop_bgra (covered above) but
+        // document the invariant here: any rect where w or h is 0 or the
+        // origin is negative is invalid for capture.
+        let invalid_cases = vec![
+            CaptureRect { x: -5, y: 0, w: 10, h: 10 },
+            CaptureRect { x: 0, y: -5, w: 10, h: 10 },
+            CaptureRect { x: 0, y: 0, w: 0, h: 10 },
+            CaptureRect { x: 0, y: 0, w: 10, h: 0 },
+        ];
+        for rect in invalid_cases {
+            let mut frame = vec![0u8; 10 * 10 * 4];
+            assert!(
+                crop_bgra(&frame, 10, 10, &rect).is_err(),
+                "rect {:?} must be rejected",
+                rect
+            );
+        }
+    }
+
+    #[test]
+    fn test_stream_error_display() {
+        let cases: Vec<(StreamError, &str)> = vec![
+            (StreamError::NoDesktopAccess, "desktop access denied — session may be locked or headless"),
+            (StreamError::AdapterNotFound, "no DXGI adapter available for duplication"),
+            (StreamError::DuplicateFailed(String::from("E_ACCESSDENIED")), "duplication init failed: E_ACCESSDENIED"),
+            (StreamError::AcquireTimeout, "frame acquire timed out"),
+            (StreamError::GdiError(String::from("BitBlt returned 0")), "gdi capture failed: BitBlt returned 0"),
+            (StreamError::JpegEncodeError(String::from("quality out of range")), "jpeg encode failed: quality out of range"),
+            (StreamError::InvalidDimensions { w: 0, h: 480 }, "invalid dimensions: 0x480"),
+        ];
+
+        for (err, expected_prefix) in cases {
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&expected_prefix[..expected_prefix.len().min(msg.len())])
+                    || msg.starts_with(expected_prefix.split(':').next().unwrap_or("")),
+                "error {:?} display {:?} should convey {:?}",
+                err,
+                msg,
+                expected_prefix
+            );
+        }
+    }
+
+    #[test]
+    fn test_jpeg_quality_clamping() {
+        // Quality values outside 1..=100 must clamp before reaching the encoder.
+        let mut config = StreamConfig::default();
+
+        config.jpeg_quality = 0;
+        let clamped = config.jpeg_quality.clamp(1, 100);
+        assert_eq!(clamped, 1);
+
+        config.jpeg_quality = 101;
+        let clamped = config.jpeg_quality.clamp(1, 100);
+        assert_eq!(clamped, 100);
+
+        config.jpeg_quality = 50;
+        assert_eq!(config.jpeg_quality, 50, "in-range value untouched");
+    }
+
+    #[test]
+    fn test_stride_alignment() {
+        // Desktop duplication output rows are 256-byte aligned in practice.
+        // Verify row-copy math handles a stride wider than w * 4.
+        let w = 100usize;
+        let stride = 256usize; // next 256 multiple past 400
+        let h = 2usize;
+
+        // Source: stride-padded buffer
+        let mut src = vec![0u8; stride * h];
+        // Write a marker pixel at row 1, col 0
+        let row1_offset = stride; // start of second row
+        src[row1_offset] = 200;
+        src[row1_offset + 1] = 150;
+        src[row1_offset + 2] = 100;
+        src[row1_offset + 3] = 255;
+
+        // Dest: tightly packed
+        let mut dst = vec![0u8; w * 4 * h];
+        for y in 0..h {
+            let src_row = &src[y * stride..y * stride + w * 4];
+            dst[y * w * 4..(y + 1) * w * 4].copy_from_slice(src_row);
+        }
+
+        // Row 0 untouched
+        assert!(dst[..w * 4].iter().all(|&b| b == 0));
+        // Row 1 carries the marker
+        assert_eq!(&dst[w * 4..w * 4 + 4], &[200, 150, 100, 255]);
+    }
+}

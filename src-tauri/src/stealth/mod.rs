@@ -3,12 +3,17 @@
 pub mod artifact;
 pub mod cpuid;
 pub mod hardware;
+pub mod profiles;
+pub mod matcher;
+pub mod scanner;
 pub mod timing;
 
-use crate::TargetProfile;
+pub use crate::target_id::{DetectionVector, DetectionVectorKind, TargetId, TargetProfile, VMConfigOverride};
+
 use crate::vm::lifecycle::VmHandle;
 
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use thiserror::Error;
 
@@ -332,14 +337,20 @@ impl Default for StealthRequirements {
 
 impl StealthRequirements {
     pub fn from_profile(profile: &TargetProfile) -> Self {
-        let detection_vectors = &profile.detection_vectors;
+        let dv = &profile.detection_vectors;
+        let dv_kinds = dv.kinds();
 
-        let skip_timing = !detection_vectors.iter().any(|v| {
-            matches!(
-                v.kind(),
-                crate::target_id::DetectionVectorKind::TimingAnomaly
-            )
-        });
+        // Timing anomaly detection isn't a field on DetectionVector —
+        // it's a behavioral check the target performs during the exam,
+        // not an artifact it leaves on the host. So we derive timing
+        // requirements from the VM config override instead.
+        let needs_timing_spoof = profile
+            .vm_config_override
+            .as_ref()
+            .map(|c| c.strict_timing_spoof)
+            .unwrap_or(false);
+
+        let skip_timing = !needs_timing_spoof;
 
         let mut layers: Vec<StealthLayer> = StealthLayer::ALL.to_vec();
 
@@ -347,15 +358,27 @@ impl StealthRequirements {
             layers.retain(|l| *l != StealthLayer::TimingNormalize);
         }
 
-        if profile.patch_set_id == "generic" {
-            // Generic profile: no targeted patches, lean on stealth hard
-            layers.push(StealthLayer::TimingNormalize); // generic always includes timing
+        // The four StealthLayer variants are coarse-grained. Artifact cleanup
+        // covers process/registry/service/window-class traces the target looks
+        // for — if the target checks ANY of those vectors, we need it.
+        // If the target checks NOTHING (generic profile with empty vectors),
+        // we still keep artifact cleanup as baseline defense.
+
+        // Hardware spoof: force for generic profile (broad-spectrum evasion),
+        // or if the target checks anything at all (defense in depth).
+        let force_hardware_spoof = profile.patch_set_id == "generic"
+            || profile.target_id == TargetId::Generic
+            || dv_kinds.is_empty();
+
+        if !force_hardware_spoof && dv_kinds.is_empty() && profile.patch_set_id != "generic" {
+            // Target checks nothing host-side — hardware spoof optional.
+            // Keep it anyway; safer default. No-op branch for clarity.
         }
 
         Self {
             layers: Some(layers),
             skip_timing,
-            force_hardware_spoof: profile.patch_set_id == "generic",
+            force_hardware_spoof,
         }
     }
 
@@ -424,9 +447,7 @@ impl StealthSession {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public API entry point
-// ---------------------------------------------------------------------------
+// src-tauri/src/stealth/mod.rs
 
 /// Apply full stealth configuration to a running VM based on target profile.
 ///
@@ -435,130 +456,110 @@ impl StealthSession {
 ///
 ///   1. CPUID hypervisor masking (must happen before VM boots fully — see note)
 ///   2. Hardware ID spoofing (BIOS/SMBIOS/MAC/disk serials)
-///   3. VM artifact cleanup (registry keys, guest services, device names)
-///   4. Timing normalization (QPC/TSC/TickCount consistency)
+///   3. VM artifact cleanup (removes Hyper-V registry keys, disables services, etc.)
 ///
-/// NOTE: If the VM is already running, CPUID masking is applied as a
-/// processor setting + live update where Hyper-V supports it. For cold VMs,
-/// the mask is applied pre-boot and requires a restart flag.
+/// NOTE: The CPUID mask must be applied before the guest OS boots, otherwise
+///       Windows will cache the hypervisor bit and never clear it again.
+///       For this reason, we require that the VM is in a stopped state before
+///       applying the mask. If you want to apply stealth to a running VM,
+///       you'll need to stop it first.
 ///
-/// Returns a StealthReport detailing exactly which layers landed.
-pub async fn apply_stealth_config(
-    vm_handle: &VmHandle,
-    target_profile: &TargetProfile,
-) -> StealthResult<StealthReport> {
-    let start = std::time::Instant::now();
+/// # Arguments
+///
+/// * `vm_id` - The unique identifier of the target VM.
+/// * `profile` - The hardware profile to spoof.
+///
+/// # Returns
+///
+/// * `Result<(), StealthError>` - Ok if successful, Err otherwise.
+pub async fn apply_stealth(vm_id: &str, profile: &HardwareProfile) -> Result<(), StealthError> {
+    // Step 1: Mask CPUID hypervisor bit before booting guest OS.
+    mask_hypervisor(vm_id)?;
 
-    if !vm_handle.is_alive().await {
-        return Err(StealthError::InvalidHandle(vm_handle.vm_name().to_string()));
-    }
+    // Step 2: Spoof hardware IDs inside guest.
+    apply_spoof(vm_id, profile).await?;
 
-    let requirements = StealthRequirements::from_profile(target_profile);
-    let layers = requirements.ordered_layers();
+    // Step 3: Clean up any remaining Hyper-V artifacts.
+    cleanup_vm_artifacts(vm_id).await?;
 
-    if layers.is_empty() {
-        return Err(StealthError::MissingConfig(format!(
-            "profile '{}' produced empty stealth layer set",
-            target_profile.target_id
-        )));
-    }
-
-    let session = StealthSession::new(&target_profile.target_id);
-    let total = layers.len();
-
-    for layer in layers {
-        let result = match layer {
-            StealthLayer::CpuIdMask => cpuid::mask_hypervisor(vm_handle).await,
-
-            StealthLayer::HardwareSpoof => {
-                let persona = hardware::select_persona(target_profile);
-                hardware::apply_spoof(vm_handle, &persona).await
-            }
-
-            StealthLayer::ArtifactCleanup => artifact::cleanup_vm_artifacts(vm_handle).await,
-
-            StealthLayer::TimingNormalize => {
-                let profile_timing = timing::TimingProfile::for_target(target_profile);
-                timing::normalize(vm_handle, &profile_timing).await
-            }
-        };
-
-        match result {
-            Ok(()) => session.record_success(layer).await,
-            Err(e) => {
-                tracing::error!(
-                    layer = layer.as_str(),
-                    target = %target_profile.target_id,
-                    error = %e,
-                    "stealth layer failed"
-                );
-                session.record_failure(layer, e.to_string()).await;
-            }
-        }
-
-        // Bail if VM died mid-application
-        if !vm_handle.is_alive().await {
-            session.set_duration(start.elapsed().as_millis()).await;
-            return Err(StealthError::VmLost);
-        }
-    }
-
-    session.set_duration(start.elapsed().as_millis()).await;
-    let report = session.snapshot().await;
-
-    if report.failed_layers.is_empty() {
-        tracing::info!(
-            target = %target_profile.target_id,
-            layers = ?report.applied_layers.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-            duration_ms = report.duration_ms,
-            "stealth config fully applied"
-        );
-        Ok(report)
-    } else if report.applied_layers.len() < total {
-        Err(StealthError::PartialApplication {
-            applied: report.applied_layers.len(),
-            total,
-        })
-    } else {
-        // Some failed but enough applied to proceed with warnings
-        tracing::warn!(
-            target = %target_profile.target_id,
-            failed = ?report.failed_layers,
-            "stealth config partially applied, proceeding with degraded coverage"
-        );
-        Ok(report)
-    }
-}
-
-/// Rollback stealth changes — restores VM to pre-stealth state.
-/// Used when destroying VMs that failed mid-pipeline, to keep the base
-/// differencing disk clean.
-pub async fn rollback_stealth_config(vm_handle: &VmHandle) -> StealthResult<()> {
-    artifact::restore_artifacts(vm_handle).await?;
-    cpuid::unmask_hypervisor(vm_handle).await?;
     Ok(())
 }
 
-/// Quick pre-flight check: does the host environment support the stealth
-/// layers this profile needs? Run before spawning VM to fail fast.
-pub fn validate_host_support(target_profile: &TargetProfile) -> StealthResult<()> {
-    let requirements = StealthRequirements::from_profile(target_profile);
+/// Remove all traces of stealth from a running VM and restore original state.
+///
+/// This is the inverse of `apply_stealth`. It will:
+///
+///   1. Unmask CPUID hypervisor bit (restore default behavior)
+///   2. Restore original hardware IDs inside guest
+///   3. Re-enable any disabled Hyper-V services/artifacts
+///
+/// # Arguments
+///
+/// * `vm_id` - The unique identifier of the target VM.
+/// * `profile` - The hardware profile to restore.
+///
+/// # Returns
+///
+/// * `Result<(), StealthError>` - Ok if successful, Err otherwise.
+pub async fn remove_stealth(vm_id: &str, profile: &HardwareProfile) -> Result<(), StealthError> {
+    // Step 1: Unmask CPUID hypervisor bit.
+    unmask_hypervisor(vm_id)?;
 
-    for layer in requirements.ordered_layers() {
-        let supported = match layer {
-            StealthLayer::CpuIdMask => cpuid::host_supports_masking(),
-            StealthLayer::HardwareSpoof => hardware::host_supports_spoofing(),
-            StealthLayer::ArtifactCleanup => true, // registry work always available
-            StealthLayer::TimingNormalize => timing::host_supports_timing_patch(),
-        };
+    // Step 2: Restore original hardware IDs inside guest.
+    restore_spoof(vm_id, profile).await?;
 
-        if !supported {
-            return Err(StealthError::MissingConfig(format!(
-                "host does not support required stealth layer '{}'",
-                layer.as_str()
-            )));
-        }
-    }
+    // Step 3: Restore any previously cleaned up Hyper-V artifacts.
+    restore_vm_artifacts(vm_id).await?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers for orchestrating each layer.
+// ---------------------------------------------------------------------------
+
+fn mask_hypervisor(vm_id: &str) -> Result<(), StealthError> {
+    let script = build_mask_script();
+    run_powershell_on_host(&script)?;
+    Ok(())
+}
+
+fn unmask_hypervisor(vm_id: &str) -> Result<(), StealthError> {
+    let script = build_unmask_script();
+    run_powershell_on_host(&script)?;
+    Ok(())
+}
+
+async fn apply_spoof(
+        vm_id: &str,
+        profile: &HardwareProfile,
+) -> Result<(), StealthError> {
+        patch_smbios_profile(profile).await?;
+        patch_disk_serials(profile).await?;
+        patch_mac_addresses(profile).await?;
+        Ok(())
+}
+
+async fn restore_spoof(
+        vm_id: &str,
+        profile: &HardwareProfile,
+) -> Result<(), StealthError> {
+        restore_smbios_profile().await?;
+        restore_disk_serials().await?;
+        restore_mac_addresses().await?;
+        Ok(())
+}
+
+async fn cleanup_vm_artifacts(
+        vm_id: &str,
+) -> Result<CleanupReport, StealthError> {
+        let report = run_full_cleanup().await?;
+        Ok(report)
+}
+
+async fn restore_vm_artifacts(
+        vm_id: &str,
+) -> Result<CleanupReport, StealthError> {
+        let report = run_full_restore().await?;
+        Ok(report)
 }

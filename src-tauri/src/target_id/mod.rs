@@ -37,8 +37,7 @@ const LOCKDOWN_SIGNATURES: &[(&str, LockdownType)] = &[
     ("proctoru", LockdownType::ProctorU),
     ("examity", LockdownType::Examity),
     ("testinvite", LockdownType::TestInvite),
-]
-
+];
 
 #[tauri::command]
 pub fn scan_for_lockdown_browsers() -> Vec<LockdownDetection> {
@@ -96,7 +95,7 @@ impl TargetId {
             TargetId::Proctorio => "proctorio",
             TargetId::Honorlock => "honorlock",
             TargetId::Respondus => "respondus",
-            TargetId::Unknown => "unknown",
+            TargetId::Generic => "generic",
         }
     }
 }
@@ -114,11 +113,15 @@ impl fmt::Display for TargetId {
     }
 }
 
-pub struct InputForwarder {
-    client: Option<RDPClientHandle>,
-    config: InputConfig,
-    rng: rand::rngs::ThreadRng,  // This fixes the thread_rng() error at line 144
-    running: Arc<AtomicBool>,
+/// enum representing the kind of detection vector
+/// used by stealth module to determine what evasion measures are needed
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DetectionVectorKind {
+    ProcessPresent,
+    RegistryKey,
+    ServiceRunning,
+    WindowClass,
+    TimingAnomaly,
 }
 
 /// detection vectors used by the matcher to identify the target
@@ -128,6 +131,37 @@ pub struct DetectionVector {
     pub registry_keys: Vec<String>,
     pub service_names: Vec<String>,
     pub window_classes: Vec<String>,
+}
+
+impl DetectionVector {
+    /// returns all detection vector kinds that this vector covers
+    pub fn kinds(&self) -> Vec<DetectionVectorKind> {
+        let mut kinds = Vec::new();
+        if !self.process_names.is_empty() {
+            kinds.push(DetectionVectorKind::ProcessPresent);
+        }
+        if !self.registry_keys.is_empty() {
+            kinds.push(DetectionVectorKind::RegistryKey);
+        }
+        if !self.service_names.is_empty() {
+            kinds.push(DetectionVectorKind::ServiceRunning);
+        }
+        if !self.window_classes.is_empty() {
+            kinds.push(DetectionVectorKind::WindowClass);
+        }
+        kinds
+    }
+
+    /// checks if this vector contains a specific kind
+    pub fn has_kind(&self, kind: DetectionVectorKind) -> bool {
+        match kind {
+            DetectionVectorKind::ProcessPresent => !self.process_names.is_empty(),
+            DetectionVectorKind::RegistryKey => !self.registry_keys.is_empty(),
+            DetectionVectorKind::ServiceRunning => !self.service_names.is_empty(),
+            DetectionVectorKind::WindowClass => !self.window_classes.is_empty(),
+            DetectionVectorKind::TimingAnomaly => false,
+        }
+    }
 }
 
 /// defines how the vm should be configured to evade this specific target
@@ -153,21 +187,16 @@ pub struct TargetProfile {
 /// warning: if the architecture is purely vm-based, this will only detect
 /// if the user accidentally launched the exam on the bare metal host.
 pub fn identify_target() -> Option<TargetProfile> {
-    // scan host processes, registry, and services
     let artifacts = scanner::scan_host_artifacts();
     
     if artifacts.is_empty() {
-        // host is clean. no proctoring software running locally.
         return None;
     }
 
-    // pass artifacts to the fuzzy matcher
     matcher::match_artifacts(artifacts)
 }
 
 /// retrieves the static profile for a known target.
-/// use this when the user explicitly selects the target in the c2 panel
-/// prior to spinning up the stealth vm.
 pub fn get_profile(id: TargetId) -> TargetProfile {
     profiles::fetch_profile(id)
 }
