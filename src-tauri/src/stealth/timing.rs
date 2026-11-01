@@ -5,17 +5,19 @@
 //! to return values consistent with bare metal execution.
 //!
 //! Strategy:
-//!   1. Remove guest-side "platform clock" forcing that artificially slows QPC.
-//!   2. Deploy a native hook DLL into the guest that intercepts
-//!      `QueryPerformanceCounter` / `GetTickCount64` and injects a synthetic TSC.
-//!   3. Register the hook globally via `AppInit_DLLs` so every process loads it.
-//!   4. Mask the hypervisor's presence in CPUID and timing-related registers.
-//!   5. Disable Hyper-V time synchronization (guest clock drift is a VM tell).
-//!   6. Suppress ETW timing events that leak hypervisor artifacts.
-//!   7. Verify the patched timing profile against bare-metal baselines.
+//!   1. Remove guest-side "platform clock" forcing that artificially slows QPC.
+//!   2. Deploy a native hook DLL into the guest that intercepts
+//!      `QueryPerformanceCounter` / `GetTickCount64` and injects a synthetic TSC.
+//!   3. Register the hook globally via `AppInit_DLLs` so every process loads it.
+//!   4. Mask the hypervisor's presence in CPUID and timing-related registers.
+//!   5. Disable Hyper-V time synchronization (guest clock drift is a VM tell).
+//!   6. Suppress ETW timing events that leak hypervisor artifacts.
+//!   7. Verify the patched timing profile against bare-metal baselines.
+
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use crate::stealth::StealthError;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -136,11 +138,7 @@ fn run_on_host(script: &str) -> Result<String, String> {
 
 /// Base64-encode a string as UTF-16LE (PowerShell's preferred encoding).
 fn base64_encode(s: &str) -> String {
-    let utf16: Vec<u8> = s
-        .encode_utf16()
-        .chain(std::iter::once(0u16)) // null terminator
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
+    let utf16: Vec<u8> = s.encode_utf16().chain(std::iter::once(0u16)).flat_map(|c| c.to_le_bytes()).collect();
     base64_encode_bytes(&utf16)
 }
 
@@ -214,7 +212,7 @@ fn unforce_platform_clock(vm_name: &str) -> Result<(), String> {
         if (Get-ItemProperty -Path $key -Name ForcePlatformClock -ErrorAction SilentlyContinue) {
             Remove-ItemProperty -Path $key -Name ForcePlatformClock -ErrorAction Stop
         }
-                bcdedit /deletevalue useplatformclock 2>$null
+              bcdedit /deletevalue useplatformclock 2>$null
         ",
     )
     .map(|_| ())

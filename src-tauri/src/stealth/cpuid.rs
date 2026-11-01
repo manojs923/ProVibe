@@ -63,7 +63,7 @@ const UNMASK_VERIFY_TIMEOUT_SECS: u64 = 120;
 ///
 /// Safe to invoke while the VM is running (live update) or offline.
 pub async fn mask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> {
-    let vm_name = vm_handle.name();
+    let vm_name = &vm_handle.name;
     let script = build_mask_script(vm_name);
 
     let output = run_powershell_on_host(&script).await?;
@@ -93,7 +93,7 @@ pub async fn mask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> {
 /// ACPI tables from scratch, then verifies via `Win32_ComputerSystem` that
 /// `HypervisorPresent` is `True` before returning success.
 pub async fn unmask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> {
-    let vm_name = vm_handle.name();
+    let vm_name = &vm_handle.name;
     let script = build_unmask_script(vm_name);
 
     let output = run_powershell_on_host(&script).await?;

@@ -11,6 +11,7 @@ pub mod generic;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::process::Command;
+use crate::stealth::VmHandle;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PatchResult {

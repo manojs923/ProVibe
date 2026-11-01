@@ -1,8 +1,10 @@
-// src-tauri/src/stealth/artifact.rs
 use crate::stealth::{StealthError};
 use std::time::Duration;
 use rand::Rng;
 use std::process::Command;
+use crate::stealth::VmHandle;
+use crate::stealth::TargetProfile;
+use crate::vm::lifecycle::spawn_stealth_vm;
 
 /// Artifact cleanup — removes VM-specific registry keys, uninstalls Hyper-V Integration Services,
 /// stops/disables Hyper-V guest services, removes virtual device drivers, clears Hyper-V event logs,
@@ -99,6 +101,22 @@ pub struct RestoreReport {
     pub firewall_rules_restored: Vec<String>,
     pub registry_keys_restored: Vec<String>,
     pub errors: Vec<String>,
+}
+
+impl RestoreReport {
+    pub fn new() -> Self {
+        // Initialize fields as needed
+        RestoreReport { 
+            services_restarted: Vec::new(),
+            services_failed: Vec::new(),
+            drivers_restored: Vec::new(),
+            event_logs_restored: Vec::new(),
+            scheduled_tasks_restored: Vec::new(),
+            firewall_rules_restored: Vec::new(),
+            registry_keys_restored: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
 }
 
 pub async fn cleanup_vm_artifacts(vm_handle: VmHandle) -> Result<CleanupReport, StealthError> {
@@ -251,7 +269,7 @@ fn strip_vmbus_values(vm_name: &str, report: &mut CleanupReport) {
             -Name '{value}' -ErrorAction SilentlyContinue) {{ \
              Remove-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\VMBus' \
              -Name '{value}' -Force; Write-Output 'VMBUS_STRIPPED:{value}' \
-            }} else {{ Write-Output 'VMBUS_ABSENT:{value}' }}"
+             }} else {{ Write-Output 'VMBUS_ABSENT:{value}' }}"
         );
         match run_in_guest(vm_name, &script) {
             Ok((stdout, _)) if stdout.contains("VMBUS_STRIPPED") => {
@@ -392,6 +410,8 @@ fn rename_display_adapter(vm_name: &str, report: &mut CleanupReport) {
 }
 
 fn run_powershell_in_guest(script: &str, vm_name: &str) -> Result<(), StealthError> {
+    use std::os::windows::process::CommandExt;
+
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
@@ -401,8 +421,8 @@ fn run_powershell_in_guest(script: &str, vm_name: &str) -> Result<(), StealthErr
     if !output.status.success() {
         return Err(StealthError::from(format!(
             "PowerShell script failed with stdout: {} and stderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            output.stdout,
+            output.stderr
         )));
     }
 

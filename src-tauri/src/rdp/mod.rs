@@ -9,19 +9,17 @@
 // what RDP draws on our screen and what audio it redirects back to us.
 //
 // Pipeline:
-//   client.rs  -> spawns mstsc.exe with a generated .rdp config
-//   stream.rs  -> captures the mstsc window's rendered output (optical gap)
-//   audio.rs   -> taps RDP audio redirection for speech-to-text
-//   input.rs   -> optional synthetic input forwarding (per-profile gated)
+//   client.rs  -> spawns mstsc.exe with a generated .rdp config
+//   stream.rs  -> captures the mstsc window's rendered output (optical gap)
+//   audio.rs   -> taps RDP audio redirection for speech-to-text
+//   input.rs   -> optional synthetic input forwarding (per-profile gated)
+
 
 pub mod client;
 pub mod stream;
 pub mod audio;
 pub mod input;
 
-pub use client::{RdpClient, RdpClientConfig};
-pub use stream::{Frame};
-pub use input::{InputForwarder};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,8 +32,11 @@ use std::process::Command;
 
 use crate::rdp::input::{InputForwarder, InputPolicy};
 use crate::rdp::stream::RdpStream as StreamCapture;
-use crate::rdp::audio::AudioTap;  // or wherever AudioTap/AudioSegment lives
+use crate::rdp::audio::AudioTap;  // or wherever AudioTap/AudioSegment lives
 use crate::rdp::audio::AudioSegment;
+use crate::rdp::input::InputConfig;
+use crate::rdp::stream::StreamConfig;
+use crate::patches::generic::get_patches;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelStatus {
@@ -56,7 +57,7 @@ pub fn get_tunnel_status(local_port: Option<u16>) -> Result<TunnelStatus, String
         &format!("127.0.0.1:{}", port)
     .parse::<std::net::SocketAddr>()
     .map_err(|e| e.to_string())?,
-        Duration::from_millis(500),
+    Duration::from_millis(500),
     )
     .is_ok();
 
@@ -130,7 +131,6 @@ pub enum RdpError {
     #[error("tunnel already torn down")]
     AlreadyDisconnected,
 }
-
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelStartResult {
@@ -310,18 +310,18 @@ pub struct RDPTunnel {
 }
 
 impl RDPTunnel {
-pub fn new(config: TunnelConfig) -> Self {
-    let running = Arc::new(AtomicBool::new(false));
-    let client = RdpClient::new(&config);
-    let handle = RDPClientHandle {
-        pid: 0,
-        window_title: String::new(),
-        loopback_addr: config.loopback_addr.clone(),
-    };
-    let input = InputForwarder::new(&handle, InputConfig::default())
-        .expect("Failed to create InputForwarder");
-    Self { client, stream: StreamCapture::new(StreamConfig::default()), audio: AudioTap::new(config.audio_redirection), input, config, running }
-}
+    pub fn new(config: TunnelConfig) -> Self {
+        let running = Arc::new(AtomicBool::new(false));
+        let client = RdpClient::new(&config);
+        let handle = RDPClientHandle {
+            pid: 0,
+            window_title: String::new(),
+            loopback_addr: config.loopback_addr.clone(),
+        };
+        let input = InputForwarder::new(&handle, InputConfig::default())
+            .expect("Failed to create InputForwarder");
+        Self { client, stream: StreamCapture::new(StreamConfig::default()), audio: AudioTap::new(config.audio_redirection), input, config, running }
+    }
 
     /// Current lifecycle state, derived from subsystem health.
     pub fn state(&mut self) -> TunnelState {
@@ -384,17 +384,17 @@ pub fn new(config: TunnelConfig) -> Self {
         self.audio.drain()
     }
 
-  pub fn send_key(&mut self, vk: u16) -> Result<(), RdpError> {
-    if !self.running.load(Ordering::SeqCst) {
-        return Err(RdpError::AlreadyDisconnected);
+    pub fn send_key(&mut self, vk: u16) -> Result<(), RdpError> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(RdpError::AlreadyDisconnected);
+        }
+        self.input
+            .press_key(windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk))
+            .map_err(|_| RdpError::InputPolicyDenied)
     }
-    self.input
-        .press_key(windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk))
-        .map_err(|_| RdpError::InputPolicyDenied)
-}
 
     pub fn stop(&mut self) {
-    self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Graceful teardown: stop capture, kill mstsc, free the audio endpoint.

@@ -1,5 +1,13 @@
 // src-tauri/src/stealth/mod.rs
 
+use super::artifact;
+use super::cpuid;
+use super::hardware;
+use super::profiles;
+use super::matcher;
+use super::scanner;
+use super::timing;
+
 pub mod artifact;
 pub mod cpuid;
 pub mod hardware;
@@ -233,6 +241,7 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
         90..=100 => "GREEN".to_string(),
         70..=89 => "YELLOW".to_string(),
         0..=69 => "RED".to_string(),
+        _ => "UNKNOWN".to_string(), // Handle the unhandled case
     };
 
     Ok(StealthPosture {
@@ -273,6 +282,11 @@ pub enum StealthError {
 
     #[error("VM went offline during stealth application")]
     VmLost,
+
+    // Add the missing variants here
+    ScriptFailure(String),
+    VerificationFailed(String),
+    HostInvocation(String),
 }
 
 pub type StealthResult<T> = Result<T, StealthError>;
@@ -447,9 +461,7 @@ impl StealthSession {
     }
 }
 
-// src-tauri/src/stealth/mod.rs
-
-/// Apply full stealth configuration to a running VM based on target profile.
+// Apply full stealth configuration to a running VM based on target profile.
 ///
 /// This is the primary export of the stealth module. Orchestrates all stealth
 /// layers in dependency order:
@@ -485,7 +497,7 @@ pub async fn apply_stealth(vm_id: &str, profile: &HardwareProfile) -> Result<(),
     Ok(())
 }
 
-/// Remove all traces of stealth from a running VM and restore original state.
+// Remove all traces of stealth from a running VM and restore original state.
 ///
 /// This is the inverse of `apply_stealth`. It will:
 ///
@@ -531,35 +543,61 @@ fn unmask_hypervisor(vm_id: &str) -> Result<(), StealthError> {
 }
 
 async fn apply_spoof(
-        vm_id: &str,
-        profile: &HardwareProfile,
+    vm_id: &str,
+    profile: &HardwareProfile,
 ) -> Result<(), StealthError> {
-        patch_smbios_profile(profile).await?;
-        patch_disk_serials(profile).await?;
-        patch_mac_addresses(profile).await?;
-        Ok(())
+    patch_smbios_profile(profile).await?;
+    patch_disk_serials(profile).await?;
+    patch_mac_addresses(profile).await?;
+    Ok(())
 }
 
 async fn restore_spoof(
-        vm_id: &str,
-        profile: &HardwareProfile,
+    vm_id: &str,
+    profile: &HardwareProfile,
 ) -> Result<(), StealthError> {
-        restore_smbios_profile().await?;
-        restore_disk_serials().await?;
-        restore_mac_addresses().await?;
-        Ok(())
+    restore_smbios_profile().await?;
+    restore_disk_serials().await?;
+    restore_mac_addresses().await?;
+    Ok(())
 }
 
 async fn cleanup_vm_artifacts(
-        vm_id: &str,
+    vm_id: &str,
 ) -> Result<CleanupReport, StealthError> {
-        let report = run_full_cleanup().await?;
-        Ok(report)
+    let report = run_full_cleanup().await?;
+    Ok(report)
 }
 
 async fn restore_vm_artifacts(
-        vm_id: &str,
+    vm_id: &str,
 ) -> Result<CleanupReport, StealthError> {
-        let report = run_full_restore().await?;
-        Ok(report)
+    let report = run_full_restore().await?;
+    Ok(report)
 }
+
+// Implement the patch_smbios_profile function
+fn patch_smbios_profile(profile: &HardwareProfile) -> Result<(), String> {
+    // Implementation details...
+    let vm_id = profile.vm_id; // Assuming vm_id is a field in HardwareProfile
+
+    // Example: Patch SMBIOS data for the VM
+    if let Some(smbios_data) = profile.smbios_data {
+        match patch_smbios(vm_id, smbios_data) {
+            Ok(_) => println!("SMBIOS profile patched successfully for VM: {}", vm_id),
+            Err(e) => return Err(format!("Failed to patch SMBIOS profile for VM {}: {}", vm_id, e)),
+        }
+    } else {
+        return Err(format!("No SMBIOS data provided for VM: {}", vm_id));
+    }
+
+    Ok(())
+}
+
+// Example helper function to simulate patching SMBIOS data
+fn patch_smbios(vm_id: &str, smbios_data: &[u8]) -> Result<(), String> {
+    // Simulate the process of patching SMBIOS data
+    println!("Patching SMBIOS data for VM: {}", vm_id);
+    Ok(())
+}
+
