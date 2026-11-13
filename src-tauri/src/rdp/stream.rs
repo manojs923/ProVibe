@@ -20,6 +20,7 @@ use crate::rdp::client::RDPClientHandle;
 use windows::core::{Interface, BOOL};
 #[cfg(windows)]
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT};
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetClientRect, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsWindowVisible,
@@ -49,11 +50,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 #[cfg(windows)]
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-#[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClientRect, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible,
-};
 
 /// DXGI_ERROR_WAIT_TIMEOUT — no new frame within the acquire window.
 const DXGI_WAIT_TIMEOUT: u32 = 0x887A_0027;
@@ -1111,55 +1107,15 @@ impl Drop for RdpStream {
 }
 
 // ---------------------------------------------------------------------------
-// One-shot capture of the RDP window as base64 JPEG
+// One-shot capture as base64 JPEG
 // ---------------------------------------------------------------------------
 
-#[cfg(windows)]
-pub fn capture_rdp_window_once(pid: u32) -> Result<String, StreamError> {
-    let hwnd = find_rdp_window(pid)?;
-    let mut state = GdiState::new(hwnd)?;
-    let raw = state.grab()?;
-    drop(state);
-
-    let (data, width, height) = (raw.data, raw.width, raw.height);
-    let stride = (width as usize) * 4;
-
-    // BGRA → RGB for JPEG encoding.
-    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
-    for y in 0..height as usize {
-        let row_start = y * stride;
-        for x in 0..width as usize {
-            let i = row_start + x * 4;
-            if i + 3 <= data.len() {
-                rgb.push(data[i + 2]);
-                rgb.push(data[i + 1]);
-                rgb.push(data[i]);
-            }
-        }
-    }
-
-    let img = image::RgbImage::from_raw(width, height, rgb)
-        .ok_or_else(|| StreamError::CaptureFailed("RgbImage::from_raw failed".into()))?;
-
-    let mut jpeg_buf = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut jpeg_buf);
-    img.write_to(&mut cursor, image::ImageFormat::Jpeg)
-        .map_err(|e| StreamError::CaptureFailed(format!("JPEG encode: {}", e)))?;
-
-    use base64::Engine;
-    Ok(base64::engine::general_purpose::STANDARD.encode(&jpeg_buf))
-}
-
-// ---------------------------------------------------------------------------
-// One-shot capture of the RDP window as base64 JPEG
-// ---------------------------------------------------------------------------
-
+/// BGRA → RGB → JPEG → base64 for a single grabbed frame.
 #[cfg(windows)]
 fn encode_raw_to_base64_jpeg(raw: RawFrame) -> Result<String, StreamError> {
     let (data, width, height) = (raw.data, raw.width, raw.height);
     let stride = (width as usize) * 4;
 
-    // BGRA -> RGB for JPEG encoding.
     let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
     for y in 0..height as usize {
         let row_start = y * stride;
@@ -1300,7 +1256,7 @@ pub fn find_console_window(hint: &str) -> Result<HWND, StreamError> {
     };
 
     unsafe {
-        let _ = EnumWindows(Some(hint_proc), LPARAM(&mut state as *mut state as isize));
+        let _ = EnumWindows(Some(hint_proc), LPARAM(&mut state as *mut HintState as isize));
     }
 
     state

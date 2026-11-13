@@ -34,7 +34,7 @@ use crate::rdp::stream::{CaptureConfig, Frame, StreamCapture, StreamError};
 //
 // client.rs:
 //   pub struct RdpClient; pub struct RDPClientHandle (Clone, Send + Sync);
-//   pub enum ClientError (thiserror, includes Spawn(String), Timeout(Duration),
+//   pub enum ClientError (thiserror: Spawn(String), Timeout(Duration),
 //       NotRunning, InvalidPath(String), StageCredentials(String), ConfigIo(String));
 //   impl RdpClient {
 //       pub fn new(cfg: &TunnelConfig) -> Self;
@@ -43,6 +43,7 @@ use crate::rdp::stream::{CaptureConfig, Frame, StreamCapture, StreamError};
 //       pub fn is_alive(&mut self) -> bool;
 //       pub fn ever_connected(&self) -> bool;
 //       pub fn handle(&self) -> Option<RDPClientHandle>;
+//       pub fn kill(&mut self) -> Result<(), ClientError>;
 //       pub async fn disconnect(&mut self) -> Result<(), ClientError>;
 //   }
 //   impl RDPClientHandle {
@@ -64,8 +65,8 @@ use crate::rdp::stream::{CaptureConfig, Frame, StreamCapture, StreamError};
 // audio.rs:
 //   impl AudioTap {
 //       pub fn new(enabled: bool) -> Self;
-//       pub fn start(&mut self, handle: &RDPClientHandle) -> Result<(), String>;
-//       pub fn stop(&mut self) -> Result<(), String>;
+//       pub fn start(&mut self, handle: &RDPClientHandle) -> Result<(), AudioError>;
+//       pub fn stop(&mut self) -> Result<(), AudioError>;
 //   }
 //
 // input.rs:
@@ -182,7 +183,13 @@ pub fn start_loopback_tunnel_cmd(
     );
 
     Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &install_script])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            install_script.as_str(),
+        ])
         .output()
         .map_err(|e| format!("Adapter installation failed: {}", e))?;
 
@@ -197,7 +204,7 @@ pub fn start_loopback_tunnel_cmd(
     );
 
     let ip_output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ip_script])
+        .args(["-NoProfile", "-Command", ip_script.as_str()])
         .output()
         .map_err(|e| format!("IP assignment failed: {}", e))?;
 
@@ -242,7 +249,7 @@ pub fn stop_loopback_tunnel(adapter_name: Option<String>) -> Result<String, Stri
     );
 
     let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
+        .args(["-NoProfile", "-Command", script.as_str()])
         .output()
         .map_err(|e| format!("Stop tunnel failed: {}", e))?;
 
@@ -381,6 +388,10 @@ impl Tunnel {
     }
 
     /// Spawn mstsc.exe, wait for the desktop, then attach capture and audio.
+    ///
+    /// wait_for_desktop() is synchronous and blocks up to its configured
+    /// timeout, so call this off the main UI thread (a Tauri command or a
+    /// spawn_blocking task), not from an executor-critical path.
     pub async fn connect(&mut self) -> Result<(), RdpError> {
         if self.stream.is_some() {
             return Err(RdpError::AlreadyInitialized("stream"));
@@ -478,5 +489,20 @@ impl Tunnel {
         self.state = TunnelState::Closed;
         result?;
         Ok(())
+    }
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        // shutdown() is async, so Drop can only do the synchronous half.
+        // Both of these are idempotent and both are also covered by the
+        // subsystems' own Drop impls — this just makes the ordering explicit
+        // for a Tunnel dropped without an awaited shutdown().
+        if let Some(mut fwd) = self.input_forwarder.take() {
+            let _ = fwd.shutdown();
+        }
+        self.stream.take();
+        let _ = self.audio.stop();
+        let _ = self.client.kill();
     }
 }

@@ -1,16 +1,16 @@
-use serde::{Deserialize, Serialize};
-use sysinfo::{System, Process};
 use std::fmt;
 
-use crate::app_handle::AppHandle;
-use self::scanner::scan_host_artifacts;
-use self::matcher::match_artifacts;
-pub use self::profiles::{fetch_profile, fetch_all};
+use serde::{Deserialize, Serialize};
+use sysinfo::System;
 use tokio::task;
 
-pub mod scanner;
+use self::matcher::match_artifacts;
+use self::scanner::scan_host_artifacts;
+pub use self::profiles::{fetch_all, fetch_profile};
+
 pub mod matcher;
 pub mod profiles;
+pub mod scanner;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LockdownDetection {
@@ -61,7 +61,10 @@ pub fn scan_for_lockdown_browsers() -> Vec<LockdownDetection> {
                     detected: true,
                     process_name: process.name().to_string(),
                     pid: process.pid().as_u32(),
-                    window_title: process.cmd().first().map(|s| s.to_string()),
+                    // argv[0] — exe path, not a real window title. Good enough
+                    // to fingerprint which binary it is; swap for EnumWindows
+                    // if the UI ever needs to display a title.
+                    window_title: process.cmd().first().map(|s| s.clone()),
                     detection_type: ld_type.clone(),
                 });
                 break;
@@ -82,29 +85,32 @@ pub fn scan_for_lockdown_browsers() -> Vec<LockdownDetection> {
     detections
 }
 
-pub async fn start_detection_loop(app_handle: &AppHandle) {
-    println!("Starting detection loop...");
-
-    // Simulate some initialization logic
+/// Kick off a one-shot host scan and profile resolution off the caller's
+/// thread. Returns immediately; the work happens on a background task.
+pub async fn start_detection_loop(_app_handle: &tauri::AppHandle) {
     let artifacts = scan_host_artifacts();
     let profiles = fetch_all();
 
-    // Spawn a task to handle the detection logic
     task::spawn(async move {
-        for profile in profiles {
-            if let Some(matched_artifact) = match_artifacts(artifacts.clone()) {
-                println!("Matched artifact: {:?}", matched_artifact);
-                let _ = fetch_profile(matched_artifact.target_id.clone());
-            }
+        if artifacts.is_empty() {
+            return;
         }
 
-        println!("Detection loop completed.");
-    });
+        // One host scan, matched once, then each candidate profile resolved.
+        if let Some(matched) = match_artifacts(artifacts) {
+            println!("Matched artifact: {:?}", matched);
+            let _ = fetch_profile(matched.target_id);
+        }
 
-    println!("Detection loop started.");
+        // Profiles drive the override set; nothing to do with them directly
+        // yet beyond enumerating them for the caller's logging.
+        for profile in &profiles {
+            println!("considered profile: {}", profile.display_name);
+        }
+    });
 }
 
-/// represents a specific lockdown browser or proctoring system
+/// A specific lockdown browser or proctoring system.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TargetId {
     Respondus,
@@ -141,8 +147,8 @@ impl fmt::Display for TargetId {
     }
 }
 
-/// enum representing the kind of detection vector
-/// used by stealth module to determine what evasion measures are needed
+/// The kind of detection vector.
+/// Used by the stealth module to decide what evasion measures are needed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DetectionVectorKind {
     ProcessPresent,
@@ -152,7 +158,7 @@ pub enum DetectionVectorKind {
     TimingAnomaly,
 }
 
-/// detection vectors used by the matcher to identify the target
+/// Detection vectors used by the matcher to identify the target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionVector {
     pub process_names: Vec<String>,
@@ -162,7 +168,7 @@ pub struct DetectionVector {
 }
 
 impl DetectionVector {
-    /// returns all detection vector kinds that this vector covers
+    /// Returns all detection vector kinds this vector covers.
     pub fn kinds(&self) -> Vec<DetectionVectorKind> {
         let mut kinds = Vec::new();
         if !self.process_names.is_empty() {
@@ -180,7 +186,7 @@ impl DetectionVector {
         kinds
     }
 
-    /// checks if this vector contains a specific kind
+    /// Checks if this vector contains a specific kind.
     pub fn has_kind(&self, kind: DetectionVectorKind) -> bool {
         match kind {
             DetectionVectorKind::ProcessPresent => !self.process_names.is_empty(),
@@ -192,7 +198,7 @@ impl DetectionVector {
     }
 }
 
-/// defines how the vm should be configured to evade this specific target
+/// How the VM should be configured to evade this specific target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VMConfigOverride {
     pub requires_internet: bool,
@@ -201,7 +207,7 @@ pub struct VMConfigOverride {
     pub strict_timing_spoof: bool,
 }
 
-/// the complete profile for a target, defining how to detect it and how to patch the vm for it
+/// Complete profile for a target: how to detect it, and how to patch the VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetProfile {
     pub target_id: TargetId,
@@ -211,9 +217,10 @@ pub struct TargetProfile {
     pub vm_config_override: Option<VMConfigOverride>,
 }
 
-/// attempts to identify a running proctoring system on the host os.
-/// warning: if the architecture is purely vm-based, this will only detect
-/// if the user accidentally launched the exam on the bare metal host.
+/// Attempt to identify a running proctoring system on the host OS.
+///
+/// Warning: if the architecture is purely VM-based, this only detects a
+/// target the user accidentally launched on the bare metal host.
 pub fn identify_target() -> Option<TargetProfile> {
     let artifacts = scanner::scan_host_artifacts();
 
@@ -224,12 +231,12 @@ pub fn identify_target() -> Option<TargetProfile> {
     matcher::match_artifacts(artifacts)
 }
 
-/// retrieves the static profile for a known target.
+/// Retrieve the static profile for a known target.
 pub fn get_profile(id: TargetId) -> TargetProfile {
     profiles::fetch_profile(id)
 }
 
-/// returns a list of all supported target profiles for the frontend ui
+/// All supported target profiles, for the frontend UI.
 pub fn get_all_supported_profiles() -> Vec<TargetProfile> {
     profiles::fetch_all()
 }

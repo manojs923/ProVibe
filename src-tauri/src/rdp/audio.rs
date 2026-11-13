@@ -6,6 +6,11 @@
 //! This module opens that endpoint in loopback mode and captures the PCM
 //! stream — that's the audio half of the optical air-gap. We never touch
 //! the VM; we only record what the host speakers would have played.
+//!
+//! Scope note: the tap is endpoint-scoped, not process-scoped. Anything else
+//! on the host rendering to the same endpoint lands in the buffer too. That is
+//! acceptable because the tunnel owns the endpoint for the duration of a
+//! session; the handle is used for validation and telemetry only.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -98,7 +103,7 @@ impl AudioTap {
             return Ok(());
         }
 
-        if self.running.load(Ordering::SeqCst) {
+        if self.worker.is_some() {
             // Idempotent — already capturing.
             return Ok(());
         }
@@ -186,11 +191,13 @@ impl AudioTap {
     }
 
     /// Stop capture and flush any in-flight segment. Safe to call repeatedly.
+    ///
+    /// The join is keyed off the worker handle rather than the running flag:
+    /// the capture loop clears that flag itself when it exits, so a
+    /// self-terminated worker would otherwise leave an unjoined handle behind.
     /// Segments captured up to shutdown remain available via `drain()`.
     pub fn stop(&mut self) -> Result<(), AudioError> {
-        if !self.running.swap(false, Ordering::SeqCst) {
-            return Ok(());
-        }
+        self.running.store(false, Ordering::SeqCst);
 
         if let Some(worker) = self.worker.take() {
             // The loop notices the flag within one poll interval.

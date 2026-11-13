@@ -149,10 +149,7 @@ pub enum InputEvent {
     /// Single key press (down + up).
     KeyPress { vk: u16 },
     /// Key chord, e.g. Ctrl+C.
-    KeyCombo {
-        modifiers: Vec<u16>,
-        key: u16,
-    },
+    KeyCombo { modifiers: Vec<u16>, key: u16 },
     /// Move the cursor along a humanized path.
     MouseMove { x: u32, y: u32 },
     /// Left click.
@@ -184,6 +181,7 @@ pub struct InputForwarder {
     /// Handle to the mstsc client window.
     client_hwnd: Option<HWND>,
     /// Client window client rect (guest viewport on host screen).
+    /// Refreshed on every coordinate translation — the window moves.
     client_rect: RECT,
     /// Guest screen resolution (e.g., 1920x1080).
     guest_resolution: (u32, u32),
@@ -199,7 +197,9 @@ pub struct InputForwarder {
     /// Currently held modifier keys.
     held_modifiers: Vec<VIRTUAL_KEY>,
     /// Keys awaiting state verification, mapped to the expected down state.
-    pending_verify: HashMap<VIRTUAL_KEY, bool>,
+    /// Keyed by raw virtual-key code: VIRTUAL_KEY implements neither Hash nor
+    /// Eq, so it cannot be a HashMap key directly.
+    pending_verify: HashMap<u16, bool>,
 }
 
 impl InputForwarder {
@@ -253,6 +253,11 @@ impl InputForwarder {
 
     /// Bring the RDP client window to the foreground and ensure it
     /// receives input.
+    ///
+    /// SetForegroundWindow can return false while the foreground lock is
+    /// held even though the window does get raised, so this is reported as an
+    /// error rather than silently swallowed — a caller that genuinely needs
+    /// focus should retry.
     pub fn focus_client(&mut self) -> Result<(), InputError> {
         let hwnd = self.client_hwnd.ok_or(InputError::ClientNotRunning)?;
 
@@ -268,7 +273,12 @@ impl InputForwarder {
     /// Translate guest coordinates to host screen coordinates.
     /// Guest (x, y) in guest resolution → host screen pixels where mstsc
     /// renders the guest viewport.
-    fn guest_to_host(&self, guest_x: u32, guest_y: u32) -> Result<(i32, i32), InputError> {
+    ///
+    /// The client rect is re-read first: the window can be moved or resized
+    /// between calls, and a stale rect puts every click at the wrong offset.
+    fn guest_to_host(&mut self, guest_x: u32, guest_y: u32) -> Result<(i32, i32), InputError> {
+        self.refresh_client_rect()?;
+
         let hwnd = self.client_hwnd.ok_or(InputError::ClientNotRunning)?;
 
         let client_width = (self.client_rect.right - self.client_rect.left).max(1);
@@ -686,7 +696,7 @@ impl InputForwarder {
         let needs_shift = ch.is_ascii_uppercase()
             || matches!(ch,
                 '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')'
-                | '_' | '+' | '{' | '}' | '|' | ':' | '"' | '<' | '>' | '?'
+                | '_' | '+' | '{' | '}' | '|' | ':' | '"' | '<' | '>' | '?' | '~'
             );
 
         if needs_shift {
@@ -785,7 +795,7 @@ impl InputForwarder {
             if result == 0 {
                 return Err(InputError::SendInputFailed);
             }
-            self.pending_verify.insert(vk, !key_up);
+            self.pending_verify.insert(vk.0, !key_up);
             return Ok(());
         }
 
@@ -826,7 +836,7 @@ impl InputForwarder {
             return Err(InputError::SendInputFailed);
         }
 
-        self.pending_verify.insert(vk, !key_up);
+        self.pending_verify.insert(vk.0, !key_up);
         Ok(())
     }
 
@@ -900,18 +910,20 @@ impl InputForwarder {
         }
 
         // Any tracked key stuck down against expectation gets rolled back.
-        let pending: Vec<(VIRTUAL_KEY, bool)> = self
+        // Snapshot first — the rollback path re-enters send_key_event, which
+        // writes to pending_verify.
+        let pending: Vec<(u16, bool)> = self
             .pending_verify
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
 
         for (vk, expected_down) in pending {
-            let idx = vk.0 as usize;
+            let idx = vk as usize;
             if idx < keyboard_state.len() {
                 let is_down = (keyboard_state[idx] & 0x80) != 0;
                 if is_down != expected_down {
-                    self.send_key_event(vk, is_down)?;
+                    self.send_key_event(VIRTUAL_KEY(vk), is_down)?;
                 }
             }
         }

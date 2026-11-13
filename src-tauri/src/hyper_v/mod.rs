@@ -93,6 +93,10 @@ impl GuestCredentials {
     pub fn username(&self) -> &str {
         &self.username
     }
+
+    pub fn password(&self) -> &str {
+        &self.password
+    }
 }
 
 impl Default for GuestCredentials {

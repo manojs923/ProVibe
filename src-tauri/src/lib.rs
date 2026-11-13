@@ -200,7 +200,7 @@ pub fn run() {
             {
                 let app_handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    target_id::start_detection_loop(app_handle);
+                    tauri::async_runtime::block_on(target_id::start_detection_loop(&app_handle));
                 });
             }
 

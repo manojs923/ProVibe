@@ -17,12 +17,17 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+// Re-exported for downstream consumers; the kind/override pair is not read
+// inside this module, hence the allow.
+#[allow(unused_imports)]
 pub use crate::target_id::{
     DetectionVector, DetectionVectorKind, TargetId, TargetProfile, VMConfigOverride,
 };
 
 use crate::patches::loader;
-use crate::stealth::artifact::{run_full_cleanup, run_full_restore, CleanupReport};
+use crate::stealth::artifact::{
+    run_full_cleanup, run_full_restore, CleanupReport, GuestArtifactError,
+};
 use crate::stealth::cpuid::{
     build_mask_script, build_unmask_script, run_powershell_on_host, run_powershell_on_host_sync,
 };
@@ -87,12 +92,15 @@ pub struct StealthPosture {
     pub posture_level: String,
 }
 
-fn check_process_running(signature: &str) -> bool {
-    let mut sys = System::new_all();
-    sys.refresh_processes();
+/// Substring match against a process name, using an already-refreshed table.
+///
+/// Takes the System by reference: the posture sweep runs eleven of these, and
+/// rebuilding the table per call would re-enumerate every process each time.
+fn process_running(sys: &System, signature: &str) -> bool {
+    let needle = signature.to_lowercase();
     sys.processes()
-        .iter()
-        .any(|(_, p)| p.name().to_lowercase().contains(&signature.to_lowercase()))
+        .values()
+        .any(|p| p.name().to_lowercase().contains(&needle))
 }
 
 fn powershell_scalar(script: &str) -> String {
@@ -107,8 +115,12 @@ fn powershell_scalar(script: &str) -> String {
 pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
     let mut checks: Vec<StealthCheck> = Vec::new();
 
+    // One process snapshot for every process-based check below.
+    let mut sys = System::new_all();
+    sys.refresh_processes();
+
     // Check 1: Hyper-V management service
-    let hyperv_running = check_process_running("vmms");
+    let hyperv_running = process_running(&sys, "vmms");
     checks.push(StealthCheck {
         check_name: "hyperv_management".to_string(),
         passed: true,
@@ -126,7 +138,7 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
 
     // Check 2: RDP / VMConnect window available for optical capture
     let rdp_procs = ["mstsc", "vmconnect", "rdpclient"];
-    let rdp_found = rdp_procs.iter().any(|p| check_process_running(p));
+    let rdp_found = rdp_procs.iter().any(|p| process_running(&sys, p));
     checks.push(StealthCheck {
         check_name: "rdp_window_present".to_string(),
         passed: rdp_found,
@@ -154,7 +166,7 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
     ];
     let running_proctors: Vec<String> = proctor_sigs
         .iter()
-        .filter(|sig| check_process_running(sig))
+        .filter(|sig| process_running(&sys, sig))
         .map(|s| s.to_string())
         .collect();
 
@@ -340,6 +352,16 @@ pub enum StealthError {
 
     #[error("Host invocation error: {0}")]
     HostInvocation(String),
+
+    /// Guest artifact sweep failure. Carried as the concrete error rather
+    /// than a string so callers can inspect the variant; the conversion
+    /// itself lives in artifact.rs.
+    #[error("Guest artifact error: {0}")]
+    GuestArtifact(GuestArtifactError),
+
+    /// Guest Services / PowerShell Direct transport fault.
+    #[error("Guest services error: {0}")]
+    GuestServices(String),
 
     #[error("Session not found: {id}")]
     SessionNotFound { id: Uuid },

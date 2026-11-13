@@ -172,10 +172,8 @@ fn keystroke_thread(app: AppHandle, rx: Receiver<KeyMsg>) {
         let name = format!("{:?}", k);
         match k {
             Key::Tab => Some("Tab".to_string()),
-            Key::Minus => Some("-".to_string()),
-            Key::Dot => Some(".".to_string()),
-            Key::NumMinus => Some("-".to_string()),
-            Key::NumDot => Some(".".to_string()),
+            Key::Minus | Key::KpMinus => Some("-".to_string()),
+            Key::Dot | Key::KpDelete => Some(".".to_string()),
             _ => {
                 // allow config authors to reference keys by debug name too
                 if name.len() <= 8 { Some(name) } else { None }
