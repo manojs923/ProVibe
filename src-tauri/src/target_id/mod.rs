@@ -1,10 +1,16 @@
-pub mod scanner;
-pub mod profiles;
-pub mod matcher;
-
 use serde::{Deserialize, Serialize};
 use sysinfo::{System, Process};
 use std::fmt;
+
+use crate::app_handle::AppHandle;
+use self::scanner::scan_host_artifacts;
+use self::matcher::match_artifacts;
+pub use self::profiles::{fetch_profile, fetch_all};
+use tokio::task;
+
+pub mod scanner;
+pub mod matcher;
+pub mod profiles;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LockdownDetection {
@@ -74,6 +80,28 @@ pub fn scan_for_lockdown_browsers() -> Vec<LockdownDetection> {
     }
 
     detections
+}
+
+pub async fn start_detection_loop(app_handle: &AppHandle) {
+    println!("Starting detection loop...");
+
+    // Simulate some initialization logic
+    let artifacts = scan_host_artifacts();
+    let profiles = fetch_all();
+
+    // Spawn a task to handle the detection logic
+    task::spawn(async move {
+        for profile in profiles {
+            if let Some(matched_artifact) = match_artifacts(artifacts.clone()) {
+                println!("Matched artifact: {:?}", matched_artifact);
+                let _ = fetch_profile(matched_artifact.target_id.clone());
+            }
+        }
+
+        println!("Detection loop completed.");
+    });
+
+    println!("Detection loop started.");
 }
 
 /// represents a specific lockdown browser or proctoring system
@@ -188,7 +216,7 @@ pub struct TargetProfile {
 /// if the user accidentally launched the exam on the bare metal host.
 pub fn identify_target() -> Option<TargetProfile> {
     let artifacts = scanner::scan_host_artifacts();
-    
+
     if artifacts.is_empty() {
         return None;
     }

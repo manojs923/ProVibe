@@ -1,159 +1,173 @@
-// 🔥 NEW: the exact endpoints your react c2 panel is looking for
+mod hyper_v;
+mod patches;
+mod rdp;
+mod stealth;
+mod target_id;
+mod util;
+mod vm;
+
+pub use target_id::{fetch_all, fetch_profile};
+
+use tauri::{Emitter, Manager};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+/// Fallback guest name when `PROTOCOL_VM_NAME` is unset.
+const DEFAULT_VM_NAME: &str = "Test-Nartan-Build";
+
+// ---------------------------------------------------------------------------
+// C2 endpoints
+// ---------------------------------------------------------------------------
+
+/// Orchestrate a stealth VM for `target` and report the resulting state.
+///
+/// Spawning shells out to `vmconnect` and blocks, so it runs on the blocking
+/// pool rather than stalling the async runtime.
 #[tauri::command]
 async fn launch_stealth_vm(target: String) -> Result<String, String> {
     #[cfg(debug_assertions)]
     println!("orchestrating hyper-v container for target: {}", target);
 
-    // wire this into your existing modules
-    // e.g., vm::spawn_stealth_vm()...
-    // e.g., patches::apply_target_patches(&target)...
+    let vm_name =
+        std::env::var("PROTOCOL_VM_NAME").unwrap_or_else(|_| DEFAULT_VM_NAME.to_string());
 
-    Ok(format!("hypervisor engaged. {} is now isolated in the sandbox.", target))
+    let spawn_name = vm_name.clone();
+    let profile = target.clone();
+
+    let spawned =
+        tokio::task::spawn_blocking(move || vm::spawn_stealth_vm_cmd(spawn_name, Some(profile)))
+            .await
+            .map_err(|e| format!("spawn task panicked: {}", e))?
+            .map_err(|e| format!("spawn failed: {}", e))?;
+
+    if !spawned.success {
+        return Err(format!(
+            "VM '{}' did not reach Running ({})",
+            vm_name, spawned.message
+        ));
+    }
+
+    Ok(format!(
+        "hypervisor engaged. {} is now isolated in sandbox '{}'.",
+        target, vm_name
+    ))
 }
 
+/// Capture the guest console as a base64 JPEG.
+///
+/// `ip` doubles as a window hint: the best-scoring visible console window wins,
+/// so an IP that matches no title still resolves the only open console.
 #[tauri::command]
 async fn capture_rdp_window(ip: String) -> Result<String, String> {
-    use winapi::um::winuser::{FindWindowA, GetWindowRect, PrintWindow};
-    use winapi::um::wingdi::{CreateCompatibleDC, CreateCompatibleBitmap, SelectObject, DeleteObject};
-    use winapi::shared::windef::{HWND, RECT};
-    use std::ptr;
-    use image::{ImageBuffer, Rgba};
-
-    // 1. find hwnd of "Virtual Machine Connection" or mstsc.exe
-    let hwnd = unsafe { FindWindowA(ptr::null(), format!("Virtual Machine Connection - {}", ip).as_ptr() as *const i8) };
-    if hwnd.is_null() {
-        return Err("could not find rdp window".to_string());
-    }
-
-    // 2. PrintWindow -> memory dc -> bitmap
-    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-    unsafe { GetWindowRect(hwnd, &mut rect) };
-    let width = (rect.right - rect.left) as i32;
-    let height = (rect.bottom - rect.top) as i32;
-
-    let hdc = unsafe { CreateCompatibleDC(ptr::null_mut()) };
-    let hbitmap = unsafe { CreateCompatibleBitmap(hdc, width, height) };
-    unsafe { SelectObject(hdc, hbitmap as *mut _) };
-
-    if unsafe { PrintWindow(hwnd, hdc, 0x00000002) } == 0 {
-        return Err("failed to print window".to_string());
-    }
-
-    // convert bitmap to image buffer
-    let mut buf = vec![0u8; (width * height * 4) as usize];
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = unsafe { *(hdc.offset((y * width + x) as isize)) };
-            buf[(y * width + x) as usize] = pixel;
-        }
-    }
-
-    // encode to base64 jpeg
-    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, buf).unwrap();
-    let mut jpeg_buf = Vec::new();
-    image::jpeg::JPEGEncoder::new(&mut jpeg_buf).encode_image(&img).unwrap();
-
-    Ok(base64::encode(jpeg_buf))
+    tokio::task::spawn_blocking(move || rdp::stream::capture_window_by_hint(&ip))
+        .await
+        .map_err(|e| format!("capture task panicked: {}", e))?
+        .map_err(|e| e.to_string())
 }
 
-// 🔥 NEW: Module declarations for the lockdown-bypass subsystem
-mod target_id;
-mod vm;
-mod rdp;
-mod patches;
-mod stealth;
-
-// 🛡️ CRITICAL: Manager is required to interact with the OS window
-use tauri::{Emitter, Manager};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // conditionally compile Windows native APIs only when building for Windows
-    #[cfg(target_os = "windows")]
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+    // Windows-only imports stay inside `run` so the module compiles elsewhere.
     #[cfg(target_os = "windows")]
     use windows::Win32::Foundation::HWND;
+    #[cfg(target_os = "windows")]
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+    };
 
     tauri::Builder::default()
-        // 1. Native Window Tracker (Remembers position and size across reboots)
+        // 1. Native window tracker (remembers position and size across reboots).
         .plugin(tauri_plugin_window_state::Builder::default().build())
-
-        // 2. Global Macro Listener
+        // 2. Global macro listener.
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    if event.state == ShortcutState::Pressed {
-                        let raw_os_key = shortcut.to_string().to_lowercase();
+                    if event.state != ShortcutState::Pressed {
+                        return;
+                    }
 
-                        // 🛡️ The Summoning Protocol
-                        let unified_command = match raw_os_key.as_str() {
-                            k if k.contains("alt+-") => "SUMMON_COPILOT",
-                            k if k.contains("alt+t") => "SUMMON_COPILOT",
-                            k if k.contains("keya") => "TRIGGER_AUDIO",
-                            k if k.contains("keyh") => "TOGGLE_VISIBILITY",
-                            k if k.contains(".") || k.contains("period") => "TOGGLE_VISIBILITY",
-                            k if k.contains("arrowup") => "OPACITY_UP",
-                            k if k.contains("arrowdown") => "OPACITY_DOWN",
-                            k if k.contains("keyv") => "SPAWN_VM", // 🔥 NEW
-                            k if k.contains("keyr") => "TOGGLE_RDP_TUNNEL", // 🔥 NEW
-                            _ => "UNKNOWN_COMMAND",
-                        };
+                    let raw_os_key = shortcut.to_string().to_lowercase();
 
-                        #[cfg(debug_assertions)]
-                        println!("🔥 OS INTERCEPT: {}", unified_command);
+                    // The summoning protocol.
+                    let unified_command = match raw_os_key.as_str() {
+                        k if k.contains("alt+-") => "SUMMON_COPILOT",
+                        k if k.contains("alt+t") => "SUMMON_COPILOT",
+                        k if k.contains("keya") => "TRIGGER_AUDIO",
+                        k if k.contains("keyh") => "TOGGLE_VISIBILITY",
+                        k if k.contains(".") || k.contains("period") => "TOGGLE_VISIBILITY",
+                        k if k.contains("arrowup") => "OPACITY_UP",
+                        k if k.contains("arrowdown") => "OPACITY_DOWN",
+                        k if k.contains("keyv") => "SPAWN_VM",
+                        k if k.contains("keyr") => "TOGGLE_RDP_TUNNEL",
+                        _ => "UNKNOWN_COMMAND",
+                    };
 
-                        // 🛡️ GOD-TIER UX: Zero-Latency OS Window Summoning
-                        if unified_command == "SUMMON_COPILOT" || unified_command == "TOGGLE_VISIBILITY" {
-                            if let Some(window) = app.get_webview_window("main") {
-                                if unified_command == "TOGGLE_VISIBILITY" {
-                                    let is_visible = window.is_visible().unwrap_or(false);
-                                    if is_visible {
-                                        let _ = window.hide();
-                                    } else {
-                                        let _ = window.show();
-                                        let _ = window.set_focus();
-                                    }
-                                } else {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
+                    #[cfg(debug_assertions)]
+                    println!("OS INTERCEPT: {}", unified_command);
+
+                    // Zero-latency OS window summoning.
+                    if unified_command == "SUMMON_COPILOT"
+                        || unified_command == "TOGGLE_VISIBILITY"
+                    {
+                        if let Some(window) = app.get_webview_window("main") {
+                            if unified_command == "TOGGLE_VISIBILITY"
+                                && window.is_visible().unwrap_or(false)
+                            {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
                             }
                         }
+                    }
 
-                        // 🔥 NEW: VM spawn hotkey routes into orchestration subsystem
-                        if unified_command == "SPAWN_VM" {
-                            let app_handle = app.clone();
-                            std::thread::spawn(move || {
-                                if let Err(e) = vm::spawn_stealth_vm(&app_handle) {
-                                    #[cfg(debug_assertions)]
-                                    eprintln!("VM spawn failed: {}", e);
-                                }
-                            });
-                        }
+                    // VM spawn hotkey routes into the orchestration subsystem.
+                    if unified_command == "SPAWN_VM" {
+                        std::thread::spawn(move || {
+                            let vm_name = std::env::var("PROTOCOL_VM_NAME")
+                                .unwrap_or_else(|_| DEFAULT_VM_NAME.to_string());
 
-                        // 🔥 NEW: RDP loopback tunnel toggle
-                        if unified_command == "TOGGLE_RDP_TUNNEL" {
-                            let app_handle = app.clone();
-                            std::thread::spawn(move || {
-                                if let Err(e) = rdp::toggle_loopback_tunnel(&app_handle) {
-                                    #[cfg(debug_assertions)]
-                                    eprintln!("RDP tunnel toggle failed: {}", e);
-                                }
-                            });
-                        }
+                            if let Err(e) = vm::spawn_stealth_vm_cmd(vm_name, None) {
+                                #[cfg(debug_assertions)]
+                                eprintln!("VM spawn failed: {}", e);
+                            }
+                        });
+                    }
 
-                        // 🛡️ SENIOR ENGINEERING: Defensive Event Emission
-                        if let Err(e) = app.emit("app-command", unified_command) {
-                            #[cfg(debug_assertions)]
-                            eprintln!("WARNING: Frontend unreachable for hotkey event: {}", e);
-                        }
+                    // RDP loopback tunnel toggle — stops when live, starts when not.
+                    if unified_command == "TOGGLE_RDP_TUNNEL" {
+                        std::thread::spawn(move || {
+                            let active = rdp::get_tunnel_status(None)
+                                .map(|status| status.active)
+                                .unwrap_or(false);
+
+                            let outcome = if active {
+                                rdp::stop_loopback_tunnel(None)
+                            } else {
+                                rdp::start_loopback_tunnel_cmd(None, None)
+                                    .map(|result| result.message)
+                            };
+
+                            if let Err(e) = outcome {
+                                #[cfg(debug_assertions)]
+                                eprintln!("RDP tunnel toggle failed: {}", e);
+                            }
+                        });
+                    }
+
+                    // Defensive event emission — the frontend may not be up yet.
+                    if let Err(e) = app.emit("app-command", unified_command) {
+                        #[cfg(debug_assertions)]
+                        eprintln!("WARNING: frontend unreachable for hotkey event: {}", e);
                     }
                 })
                 .build(),
         )
         .setup(|app| {
-            // 3. Register Global Shortcuts
+            // 3. Register global shortcuts.
             let _ = app.global_shortcut().register("Alt+-");
             let _ = app.global_shortcut().register("Alt+T");
             let _ = app.global_shortcut().register("Alt+A");
@@ -161,12 +175,10 @@ pub fn run() {
             let _ = app.global_shortcut().register("Alt+Up");
             let _ = app.global_shortcut().register("Alt+Down");
             let _ = app.global_shortcut().register(".");
+            let _ = app.global_shortcut().register("Alt+V");
+            let _ = app.global_shortcut().register("Alt+R");
 
-            // 🔥 NEW: Bypass-subsystem hotkeys
-            let _ = app.global_shortcut().register("Alt+V"); // Spawn stealth VM
-            let _ = app.global_shortcut().register("Alt+R"); // Toggle RDP loopback
-
-            // 4. 🛡️ GOD-TIER FEATURE: OS-Level Screen Capture Evasion
+            // 4. OS-level screen-capture evasion.
             #[cfg(target_os = "windows")]
             {
                 if let Some(window) = app.get_webview_window("main") {
@@ -174,16 +186,16 @@ pub fn run() {
                         let hwnd = hwnd_wrapper.0 as isize;
                         unsafe {
                             let _ = SetWindowDisplayAffinity(
-                                HWND(hwnd as _),
-                                WDA_EXCLUDEFROMCAPTURE
+                                HWND(hwnd as *mut core::ffi::c_void),
+                                WDA_EXCLUDEFROMCAPTURE,
                             );
                         }
-                        println!("🛡️ Stealth Protocol: Window is now invisible to screen capture.");
+                        println!("Stealth protocol: window is now invisible to screen capture.");
                     }
                 }
             }
 
-            // 🔥 NEW: Fire off passive lockdown-browser detection at startup
+            // 5. Passive lockdown-browser detection at startup.
             #[cfg(target_os = "windows")]
             {
                 let app_handle = app.handle().clone();
@@ -194,8 +206,6 @@ pub fn run() {
 
             Ok(())
         })
-
-        // 🔥 NEW: Tauri commands exposed to the frontend for manual control
         .invoke_handler(tauri::generate_handler![
             target_id::scan_for_lockdown_browsers,
             vm::get_vm_status,
@@ -206,7 +216,6 @@ pub fn run() {
             rdp::stop_loopback_tunnel,
             patches::apply_target_patches,
             stealth::verify_stealth_posture,
-            // add the new c2 endpoints:
             launch_stealth_vm,
             capture_rdp_window,
         ])

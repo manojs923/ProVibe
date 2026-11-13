@@ -1,33 +1,73 @@
 // src-tauri/src/stealth/mod.rs
 
-use super::artifact;
-use super::cpuid;
-use super::hardware;
-use super::profiles;
-use super::matcher;
-use super::scanner;
-use super::timing;
-
 pub mod artifact;
 pub mod cpuid;
 pub mod hardware;
-pub mod profiles;
-pub mod matcher;
-pub mod scanner;
 pub mod timing;
 
-pub use crate::target_id::{DetectionVector, DetectionVectorKind, TargetId, TargetProfile, VMConfigOverride};
+use std::collections::HashMap;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+use sysinfo::System;
+use tauri::AppHandle;
+use thiserror::Error;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+pub use crate::target_id::{
+    DetectionVector, DetectionVectorKind, TargetId, TargetProfile, VMConfigOverride,
+};
+
+use crate::patches::loader;
+use crate::stealth::artifact::{run_full_cleanup, run_full_restore, CleanupReport};
+use crate::stealth::cpuid::{
+    build_mask_script, build_unmask_script, run_powershell_on_host, run_powershell_on_host_sync,
+};
+use crate::stealth::hardware::{
+    patch_disk_serials, patch_mac_addresses, restore_disk_serials, restore_mac_addresses,
+    restore_smbios_profile, HardwareProfile,
+};
+use crate::vm::config::build_config;
 use crate::vm::lifecycle::VmHandle;
 
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::RwLock;
-use thiserror::Error;
+// ---------------------------------------------------------------------------
+// Public entrypoint / bootstrapping
+// ---------------------------------------------------------------------------
 
-use serde::Serialize;
-use std::process::Command;
-use sysinfo::System;
+/// Convenience bootstrap: apply a baseline patch set using the given AppHandle.
+/// The actual target is resolved via `build_config` + the loader.
+pub async fn bootstrap_default(app_handle: &AppHandle) {
+    let target_id = "MSB"; // Default target ID — override via IPC command for real runs.
+    let vm_config = build_config(target_id);
+
+    if let Err(e) = loader::apply_patches(vec![], &vm_config).await {
+        eprintln!(
+            "[stealth::bootstrap_default] Failed to apply patches: {}",
+            e
+        );
+    } else {
+        println!(
+            "[stealth::bootstrap_default] Patches applied successfully for '{}'.",
+            target_id
+        );
+    }
+
+    // Reserved for future IPC event emission.
+    let _ = app_handle;
+}
+
+/// Block-on helper for sync contexts that need to call async code.
+/// MUST be invoked from within a Tokio runtime.
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Handle::current().block_on(fut)
+}
+
+// ---------------------------------------------------------------------------
+// StealthCheck / StealthPosture — IPC-exposed health report
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StealthCheck {
@@ -67,11 +107,11 @@ fn powershell_scalar(script: &str) -> String {
 pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
     let mut checks: Vec<StealthCheck> = Vec::new();
 
-    // Check 1: Hypervisor services not leaking to host detection tools
+    // Check 1: Hyper-V management service
     let hyperv_running = check_process_running("vmms");
     checks.push(StealthCheck {
         check_name: "hyperv_management".to_string(),
-        passed: true, // VMMS running is fine — it's the Guest that matters
+        passed: true,
         status: if hyperv_running {
             "Hyper-V VM Management running (normal)".to_string()
         } else {
@@ -84,7 +124,7 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
         },
     });
 
-    // Check 2: RDP window is available for optical capture
+    // Check 2: RDP / VMConnect window available for optical capture
     let rdp_procs = ["mstsc", "vmconnect", "rdpclient"];
     let rdp_found = rdp_procs.iter().any(|p| check_process_running(p));
     checks.push(StealthCheck {
@@ -102,7 +142,7 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
         },
     });
 
-    // Check 3: Proctoring software detection (informational — what's running)
+    // Check 3: Proctoring software detection (informational)
     let proctor_sigs = [
         "proctorio",
         "honorlock",
@@ -120,16 +160,19 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
 
     checks.push(StealthCheck {
         check_name: "proctoring_software".to_string(),
-        passed: true, // Informational — optical air-gap makes this irrelevant
+        passed: true,
         status: if running_proctors.is_empty() {
             "No proctoring software detected on Host".to_string()
         } else {
-            format!("Active proctoring: {} (Guest-side only — optical gap holds)", running_proctors.join(", "))
+            format!(
+                "Active proctoring: {} (Guest-side only — optical gap holds)",
+                running_proctors.join(", ")
+            )
         },
         remediation: None,
     });
 
-    // Check 4: Tauri overlay window flags
+    // Check 4: Overlay WDA_EXCLUDEFROMCAPTURE
     let overlay_script = r#"
         Add-Type -TypeDefinition @'
         using System;
@@ -170,14 +213,14 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
         },
     });
 
-    // Check 5: Network adapter state (loopback tunnel)
+    // Check 5: Loopback adapter
     let adapter_result = powershell_scalar(
         "(Get-NetAdapter | Where-Object { $_.Name -match 'Loopback|Protocol' } | Measure-Object).Count",
     );
     let tunnel_ready = adapter_result.parse::<u32>().unwrap_or(0) > 0;
     checks.push(StealthCheck {
         check_name: "loopback_tunnel".to_string(),
-        passed: true, // Advisory — tunnel not required for local mode
+        passed: true,
         status: if tunnel_ready {
             "Loopback adapter present — tunnel mode available".to_string()
         } else {
@@ -190,9 +233,11 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
         },
     });
 
-    // Check 6: RDP port 3389 listening
+    // Check 6: RDP listener on 3389
     let port_check = std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:3389".parse::<std::net::SocketAddr>().map_err(|e| e.to_string())?,
+        &"127.0.0.1:3389"
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| e.to_string())?,
         std::time::Duration::from_millis(300),
     )
     .is_ok();
@@ -212,14 +257,14 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
         },
     });
 
-    // Check 7: Windows Defender real-time scanning (can flag the overlay binary)
+    // Check 7: Defender real-time
     let defender_result = powershell_scalar(
         "(Get-MpPreference | Select-Object -ExpandProperty DisableRealtimeMonitoring)",
     );
     let defender_off = defender_result.contains("True");
     checks.push(StealthCheck {
         check_name: "defender_realtime".to_string(),
-        passed: true, // Informational
+        passed: true,
         status: if defender_off {
             "Defender real-time monitoring disabled".to_string()
         } else {
@@ -241,7 +286,7 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
         90..=100 => "GREEN".to_string(),
         70..=89 => "YELLOW".to_string(),
         0..=69 => "RED".to_string(),
-        _ => "UNKNOWN".to_string(), // Handle the unhandled case
+        _ => "UNKNOWN".to_string(),
     };
 
     Ok(StealthPosture {
@@ -253,6 +298,10 @@ pub fn verify_stealth_posture() -> Result<StealthPosture, String> {
         posture_level,
     })
 }
+
+// ---------------------------------------------------------------------------
+// StealthError — canonical error type for the stealth subsystem
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
 pub enum StealthError {
@@ -283,15 +332,34 @@ pub enum StealthError {
     #[error("VM went offline during stealth application")]
     VmLost,
 
-    // Add the missing variants here
+    #[error("Script execution failed: {0}")]
     ScriptFailure(String),
+
+    #[error("Verification failed: {0}")]
     VerificationFailed(String),
+
+    #[error("Host invocation error: {0}")]
     HostInvocation(String),
+
+    #[error("Session not found: {id}")]
+    SessionNotFound { id: Uuid },
+
+    #[error("Invalid transition from {from} to {to}")]
+    InvalidTransition { from: String, to: String },
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 pub type StealthResult<T> = Result<T, StealthError>;
 
-/// Stealth layer identifiers, applied in order.
+// ---------------------------------------------------------------------------
+// StealthLayer — layer identifiers + ordering
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StealthLayer {
     CpuIdMask,
@@ -317,7 +385,6 @@ impl StealthLayer {
         }
     }
 
-    /// Default application order. Layers can be reordered per target profile.
     pub fn execution_order(&self) -> u8 {
         match self {
             StealthLayer::CpuIdMask => 0,
@@ -328,14 +395,14 @@ impl StealthLayer {
     }
 }
 
-/// Which layers a target profile demands, plus any overrides.
+// ---------------------------------------------------------------------------
+// StealthRequirements — derived from TargetProfile
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 pub struct StealthRequirements {
-    /// Layers to apply. If None, apply all layers.
     pub layers: Option<Vec<StealthLayer>>,
-    /// Skip timing normalization on targets that don't do timing checks.
     pub skip_timing: bool,
-    /// Force hardware spoof even for generic profile.
     pub force_hardware_spoof: bool,
 }
 
@@ -354,10 +421,6 @@ impl StealthRequirements {
         let dv = &profile.detection_vectors;
         let dv_kinds = dv.kinds();
 
-        // Timing anomaly detection isn't a field on DetectionVector —
-        // it's a behavioral check the target performs during the exam,
-        // not an artifact it leaves on the host. So we derive timing
-        // requirements from the VM config override instead.
         let needs_timing_spoof = profile
             .vm_config_override
             .as_ref()
@@ -372,22 +435,9 @@ impl StealthRequirements {
             layers.retain(|l| *l != StealthLayer::TimingNormalize);
         }
 
-        // The four StealthLayer variants are coarse-grained. Artifact cleanup
-        // covers process/registry/service/window-class traces the target looks
-        // for — if the target checks ANY of those vectors, we need it.
-        // If the target checks NOTHING (generic profile with empty vectors),
-        // we still keep artifact cleanup as baseline defense.
-
-        // Hardware spoof: force for generic profile (broad-spectrum evasion),
-        // or if the target checks anything at all (defense in depth).
         let force_hardware_spoof = profile.patch_set_id == "generic"
             || profile.target_id == TargetId::Generic
             || dv_kinds.is_empty();
-
-        if !force_hardware_spoof && dv_kinds.is_empty() && profile.patch_set_id != "generic" {
-            // Target checks nothing host-side — hardware spoof optional.
-            // Keep it anyway; safer default. No-op branch for clarity.
-        }
 
         Self {
             layers: Some(layers),
@@ -407,7 +457,90 @@ impl StealthRequirements {
     }
 }
 
-/// Tracks which stealth layers succeeded, for rollback and reporting.
+// ---------------------------------------------------------------------------
+// Session support types — state machine, counters, detections
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Initializing,
+    Active,
+    Degraded,
+    Suspended,
+    Compromised,
+    Terminated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Countermeasure {
+    CpuidSpoof,
+    HardwareSpoof,
+    ArtifactCleanup,
+    TimingNormalize,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionEvent {
+    pub timestamp: u64,
+    pub vector: DetectionVector,
+    pub severity: Severity,
+    pub source: String,
+    pub details: String,
+}
+
+impl DetectionEvent {
+    pub fn new(
+        vector: DetectionVector,
+        severity: Severity,
+        source: impl Into<String>,
+        details: impl Into<String>,
+    ) -> Self {
+        Self {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            vector,
+            severity,
+            source: source.into(),
+            details: details.into(),
+        }
+    }
+}
+
+/// Per-session stealth profile — thresholds and defaults used by the session
+/// state machine. `Default` keeps a sane failure threshold so a session is not
+/// instantly marked compromised.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StealthProfile {
+    pub failure_threshold: u32,
+    pub patch_set_id: String,
+}
+
+impl Default for StealthProfile {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            patch_set_id: "generic".to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StealthReport / StealthSession — per-run state tracking
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Default)]
 pub struct StealthReport {
     pub target_id: String,
@@ -422,182 +555,791 @@ impl StealthReport {
     }
 }
 
-/// Active stealth session state, updated as layers apply.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct StealthSession {
-    pub report: RwLock<StealthReport>,
+    pub report: StealthReport,
+    pub session_id: Uuid,
+    pub profile: StealthProfile,
+    pub target_id: TargetId,
+    pub created_at: u64,
+    pub last_activity: u64,
+    pub active_countermeasures: Vec<Countermeasure>,
+    pub detection_events: Vec<DetectionEvent>,
+    pub success_count: u32,
+    pub failure_count: u32,
+    pub state: SessionState,
 }
 
-/// Arc wrapper so IPC commands can share the session.
-pub type SharedStealthSession = Arc<StealthSession>;
+pub type SharedSession = Arc<RwLock<StealthSession>>;
 
 impl StealthSession {
-    pub fn new(target_id: impl Into<String>) -> Self {
+    pub fn new(profile: StealthProfile, target_id: TargetId) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         Self {
-            report: RwLock::new(StealthReport {
-                target_id: target_id.into(),
-                ..Default::default()
+            report: StealthReport::default(),
+            session_id: Uuid::new_v4(),
+            profile,
+            target_id,
+            created_at: now,
+            last_activity: now,
+            active_countermeasures: Vec::new(),
+            detection_events: Vec::new(),
+            success_count: 0,
+            failure_count: 0,
+            state: SessionState::Initializing,
+        }
+    }
+
+    pub fn record_success(&mut self, countermeasure: Countermeasure) {
+        self.success_count = self.success_count.saturating_add(1);
+        self.touch();
+        if !self.active_countermeasures.contains(&countermeasure) {
+            self.active_countermeasures.push(countermeasure);
+        }
+    }
+
+    pub fn record_failure(&mut self, event: DetectionEvent) {
+        self.failure_count = self.failure_count.saturating_add(1);
+        self.detection_events.push(event);
+        self.touch();
+
+        if self.failure_count >= self.profile.failure_threshold {
+            self.state = SessionState::Compromised;
+        }
+    }
+
+    pub fn touch(&mut self) {
+        self.last_activity = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+    }
+
+    pub fn transition(&mut self, new_state: SessionState) -> Result<(), StealthError> {
+        use SessionState::*;
+
+        let valid = matches!(
+            (&self.state, &new_state),
+            (Initializing, Active)
+                | (Active, Degraded)
+                | (Active, Suspended)
+                | (Degraded, Active)
+                | (Degraded, Compromised)
+                | (Suspended, Active)
+                | (Suspended, Terminated)
+                | (_, Terminated)
+                | (_, Compromised)
+        );
+
+        if !valid {
+            return Err(StealthError::InvalidTransition {
+                from: format!("{:?}", self.state),
+                to: format!("{:?}", new_state),
+            });
+        }
+
+        self.state = new_state;
+        self.touch();
+        Ok(())
+    }
+
+    pub fn is_viable(&self) -> bool {
+        matches!(self.state, SessionState::Active | SessionState::Degraded)
+    }
+
+    pub fn success_rate(&self) -> f64 {
+        let total = self.success_count + self.failure_count;
+        if total == 0 {
+            return 1.0;
+        }
+        self.success_count as f64 / total as f64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session Manager
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct StealthManager {
+    sessions: Arc<RwLock<HashMap<Uuid, StealthSession>>>,
+    default_profile: StealthProfile,
+    metrics: Arc<RwLock<StealthMetrics>>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct StealthMetrics {
+    pub total_sessions: u64,
+    pub active_sessions: u64,
+    pub compromised_sessions: u64,
+    pub total_detections: u64,
+    pub total_successes: u64,
+}
+
+impl StealthManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_profile: StealthProfile::default(),
+            metrics: Arc::new(RwLock::new(StealthMetrics::default())),
+        }
+    }
+
+    pub fn with_profile(default_profile: StealthProfile) -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_profile,
+            metrics: Arc::new(RwLock::new(StealthMetrics::default())),
+        }
+    }
+
+    /// Create a session from the manager's default profile.
+    pub async fn create_session(&self, target_id: TargetId) -> StealthResult<Uuid> {
+        self.create_session_with_profile(target_id, self.default_profile.clone())
+            .await
+    }
+
+    /// Create a session with an explicit profile. The session starts in
+    /// `Initializing` and must be activated explicitly.
+    pub async fn create_session_with_profile(
+        &self,
+        target_id: TargetId,
+        profile: StealthProfile,
+    ) -> StealthResult<Uuid> {
+        if profile.failure_threshold == 0 {
+            return Err(StealthError::MissingConfig(
+                "failure_threshold must be greater than zero".to_string(),
+            ));
+        }
+
+        let session = StealthSession::new(profile, target_id);
+        let id = session.session_id;
+
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(id, session);
+        }
+
+        {
+            let mut m = self.metrics.write().await;
+            m.total_sessions = m.total_sessions.saturating_add(1);
+        }
+
+        Ok(id)
+    }
+
+    pub async fn get_session(&self, id: Uuid) -> StealthResult<StealthSession> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(&id)
+            .cloned()
+            .ok_or(StealthError::SessionNotFound { id })
+    }
+
+    /// Mutate a session in place under the write lock.
+    pub async fn with_session_mut<F, T>(&self, id: Uuid, f: F) -> StealthResult<T>
+    where
+        F: FnOnce(&mut StealthSession) -> T,
+    {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(&id)
+            .ok_or(StealthError::SessionNotFound { id })?;
+        Ok(f(session))
+    }
+
+    pub async fn activate_session(&self, id: Uuid) -> StealthResult<()> {
+        let previous = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(&id)
+                .ok_or(StealthError::SessionNotFound { id })?;
+            let previous = session.state;
+            session.transition(SessionState::Active)?;
+            previous
+        };
+
+        if previous == SessionState::Initializing {
+            let mut m = self.metrics.write().await;
+            m.active_sessions = m.active_sessions.saturating_add(1);
+        }
+
+        Ok(())
+    }
+
+    pub async fn terminate_session(&self, id: Uuid) -> StealthResult<()> {
+        let (was_active, was_compromised) = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(&id)
+                .ok_or(StealthError::SessionNotFound { id })?;
+            let was_active = matches!(session.state, SessionState::Active | SessionState::Degraded);
+            let was_compromised = session.state == SessionState::Compromised;
+            session.transition(SessionState::Terminated)?;
+            (was_active, was_compromised)
+        };
+
+        let mut m = self.metrics.write().await;
+        if was_active {
+            m.active_sessions = m.active_sessions.saturating_sub(1);
+        }
+        if was_compromised {
+            m.compromised_sessions = m.compromised_sessions.saturating_sub(1);
+        }
+
+        Ok(())
+    }
+
+    pub async fn remove_session(&self, id: Uuid) -> StealthResult<()> {
+        let mut sessions = self.sessions.write().await;
+        sessions
+            .remove(&id)
+            .map(|_| ())
+            .ok_or(StealthError::SessionNotFound { id })
+    }
+
+    pub async fn list_sessions(&self) -> Vec<Uuid> {
+        let sessions = self.sessions.read().await;
+        sessions.keys().copied().collect()
+    }
+
+    pub async fn session_count(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
+    // -- detection + countermeasure accounting ------------------------------
+
+    pub async fn record_detection(
+        &self,
+        id: Uuid,
+        event: DetectionEvent,
+    ) -> StealthResult<SessionState> {
+        let (state, newly_compromised) = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(&id)
+                .ok_or(StealthError::SessionNotFound { id })?;
+
+            let was_compromised = session.state == SessionState::Compromised;
+            session.record_failure(event);
+            let now_compromised = session.state == SessionState::Compromised;
+
+            (session.state, !was_compromised && now_compromised)
+        };
+
+        {
+            let mut m = self.metrics.write().await;
+            m.total_detections = m.total_detections.saturating_add(1);
+            // Only count the transition, so repeat detections don't inflate
+            // the compromised gauge.
+            if newly_compromised {
+                m.compromised_sessions = m.compromised_sessions.saturating_add(1);
+            }
+        }
+
+        Ok(state)
+    }
+
+    pub async fn record_success(
+        &self,
+        id: Uuid,
+        countermeasure: Countermeasure,
+    ) -> StealthResult<()> {
+        {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(&id)
+                .ok_or(StealthError::SessionNotFound { id })?;
+            session.record_success(countermeasure);
+        }
+
+        let mut m = self.metrics.write().await;
+        m.total_successes = m.total_successes.saturating_add(1);
+        Ok(())
+    }
+
+    // -- metrics ------------------------------------------------------------
+
+    pub async fn metrics_snapshot(&self) -> StealthMetrics {
+        self.metrics.read().await.clone()
+    }
+
+    pub async fn reset_metrics(&self) {
+        let mut m = self.metrics.write().await;
+        *m = StealthMetrics::default();
+    }
+
+    /// Recompute derived gauges (active/compromised) from live sessions rather
+    /// than trusting the incrementally maintained counters.
+    pub async fn reconcile_metrics(&self) -> StealthMetrics {
+        let sessions = self.sessions.read().await;
+
+        let active = sessions
+            .values()
+            .filter(|s| matches!(s.state, SessionState::Active | SessionState::Degraded))
+            .count() as u64;
+        let compromised = sessions
+            .values()
+            .filter(|s| s.state == SessionState::Compromised)
+            .count() as u64;
+        let detections: u64 = sessions
+            .values()
+            .map(|s| s.detection_events.len() as u64)
+            .sum();
+        let successes: u64 = sessions.values().map(|s| s.success_count as u64).sum();
+        let total = sessions.len() as u64;
+
+        drop(sessions);
+
+        let mut m = self.metrics.write().await;
+        m.total_sessions = m.total_sessions.max(total);
+        m.active_sessions = active;
+        m.compromised_sessions = compromised;
+        m.total_detections = detections;
+        m.total_successes = successes;
+        m.clone()
+    }
+}
+
+impl Default for StealthManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Posture checks against a live session
+// ---------------------------------------------------------------------------
+
+impl StealthManager {
+    pub async fn posture_for(&self, id: Uuid) -> StealthResult<StealthPosture> {
+        let session = self.get_session(id).await?;
+
+        let mut checks = Vec::new();
+
+        checks.push(StealthCheck {
+            check_name: "session_state".to_string(),
+            passed: session.is_viable(),
+            status: format!("Session state: {:?}", session.state),
+            remediation: (!session.is_viable())
+                .then(|| "Activate or restore the session before relying on it".to_string()),
+        });
+
+        checks.push(StealthCheck {
+            check_name: "failure_budget".to_string(),
+            passed: session.failure_count < session.profile.failure_threshold,
+            status: format!(
+                "{}/{} failures before compromise",
+                session.failure_count, session.profile.failure_threshold
+            ),
+            remediation: (session.failure_count >= session.profile.failure_threshold)
+                .then(|| "Reapply stealth layers or start a fresh session".to_string()),
+        });
+
+        checks.push(StealthCheck {
+            check_name: "countermeasure_coverage".to_string(),
+            passed: !session.active_countermeasures.is_empty(),
+            status: format!(
+                "{} countermeasure(s) reported",
+                session.active_countermeasures.len()
+            ),
+            remediation: session.active_countermeasures.is_empty().then(|| {
+                "Report at least one successful countermeasure application".to_string()
             }),
+        });
+
+        let total = checks.len();
+        let passed = checks.iter().filter(|c| c.passed).count();
+        let failed = total - passed;
+        let score = ((passed as f32 / total as f32) * 100.0) as u8;
+
+        let posture_level = match score {
+            90..=100 => "GREEN",
+            70..=89 => "YELLOW",
+            _ => "RED",
         }
+        .to_string();
+
+        Ok(StealthPosture {
+            overall_score: score,
+            total_checks: total,
+            passed_checks: passed,
+            failed_checks: failed,
+            checks,
+            posture_level,
+        })
     }
-
-    pub async fn record_success(&self, layer: StealthLayer) {
-        let mut guard = self.report.write().await;
-        guard.applied_layers.push(layer);
-    }
-
-    pub async fn record_failure(&self, layer: StealthLayer, reason: String) {
-        let mut guard = self.report.write().await;
-        guard.failed_layers.push((layer, reason));
-    }
-
-    pub async fn set_duration(&self, ms: u128) {
-        let mut guard = self.report.write().await;
-        guard.duration_ms = ms;
-    }
-
-    pub async fn snapshot(&self) -> StealthReport {
-        self.report.read().await.clone()
-    }
-}
-
-// Apply full stealth configuration to a running VM based on target profile.
-///
-/// This is the primary export of the stealth module. Orchestrates all stealth
-/// layers in dependency order:
-///
-///   1. CPUID hypervisor masking (must happen before VM boots fully — see note)
-///   2. Hardware ID spoofing (BIOS/SMBIOS/MAC/disk serials)
-///   3. VM artifact cleanup (removes Hyper-V registry keys, disables services, etc.)
-///
-/// NOTE: The CPUID mask must be applied before the guest OS boots, otherwise
-///       Windows will cache the hypervisor bit and never clear it again.
-///       For this reason, we require that the VM is in a stopped state before
-///       applying the mask. If you want to apply stealth to a running VM,
-///       you'll need to stop it first.
-///
-/// # Arguments
-///
-/// * `vm_id` - The unique identifier of the target VM.
-/// * `profile` - The hardware profile to spoof.
-///
-/// # Returns
-///
-/// * `Result<(), StealthError>` - Ok if successful, Err otherwise.
-pub async fn apply_stealth(vm_id: &str, profile: &HardwareProfile) -> Result<(), StealthError> {
-    // Step 1: Mask CPUID hypervisor bit before booting guest OS.
-    mask_hypervisor(vm_id)?;
-
-    // Step 2: Spoof hardware IDs inside guest.
-    apply_spoof(vm_id, profile).await?;
-
-    // Step 3: Clean up any remaining Hyper-V artifacts.
-    cleanup_vm_artifacts(vm_id).await?;
-
-    Ok(())
-}
-
-// Remove all traces of stealth from a running VM and restore original state.
-///
-/// This is the inverse of `apply_stealth`. It will:
-///
-///   1. Unmask CPUID hypervisor bit (restore default behavior)
-///   2. Restore original hardware IDs inside guest
-///   3. Re-enable any disabled Hyper-V services/artifacts
-///
-/// # Arguments
-///
-/// * `vm_id` - The unique identifier of the target VM.
-/// * `profile` - The hardware profile to restore.
-///
-/// # Returns
-///
-/// * `Result<(), StealthError>` - Ok if successful, Err otherwise.
-pub async fn remove_stealth(vm_id: &str, profile: &HardwareProfile) -> Result<(), StealthError> {
-    // Step 1: Unmask CPUID hypervisor bit.
-    unmask_hypervisor(vm_id)?;
-
-    // Step 2: Restore original hardware IDs inside guest.
-    restore_spoof(vm_id, profile).await?;
-
-    // Step 3: Restore any previously cleaned up Hyper-V artifacts.
-    restore_vm_artifacts(vm_id).await?;
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Private helpers for orchestrating each layer.
+// Layer runner
 // ---------------------------------------------------------------------------
 
-fn mask_hypervisor(vm_id: &str) -> Result<(), StealthError> {
-    let script = build_mask_script();
-    run_powershell_on_host(&script)?;
-    Ok(())
-}
-
-fn unmask_hypervisor(vm_id: &str) -> Result<(), StealthError> {
-    let script = build_unmask_script();
-    run_powershell_on_host(&script)?;
-    Ok(())
-}
-
-async fn apply_spoof(
-    vm_id: &str,
+/// Apply requested stealth layers in canonical order, recording each outcome.
+/// Partial success is reported rather than collapsed into a single error.
+///
+/// `vm_name` is taken from the handle because the CPUID and hardware layers
+/// address the guest by name, while the artifact layer needs the handle itself.
+pub async fn apply_layers(
+    requirements: &StealthRequirements,
+    vm: &VmHandle,
     profile: &HardwareProfile,
-) -> Result<(), StealthError> {
-    patch_smbios_profile(profile).await?;
-    patch_disk_serials(profile).await?;
-    patch_mac_addresses(profile).await?;
-    Ok(())
-}
+) -> StealthResult<StealthReport> {
+    let started = Instant::now();
+    let mut report = StealthReport::default();
 
-async fn restore_spoof(
-    vm_id: &str,
-    profile: &HardwareProfile,
-) -> Result<(), StealthError> {
-    restore_smbios_profile().await?;
-    restore_disk_serials().await?;
-    restore_mac_addresses().await?;
-    Ok(())
-}
+    let vm_name = vm.vm_name();
+    let layers = requirements.ordered_layers();
+    let total = layers.len();
 
-async fn cleanup_vm_artifacts(
-    vm_id: &str,
-) -> Result<CleanupReport, StealthError> {
-    let report = run_full_cleanup().await?;
-    Ok(report)
-}
+    for layer in layers {
+        let outcome: StealthResult<()> = match layer {
+            StealthLayer::CpuIdMask => {
+                let script = build_mask_script(vm_name);
+                run_powershell_on_host(&script).await.map(|_| ())
+            }
+            StealthLayer::HardwareSpoof => patch_mac_addresses(vm_name, profile)
+                .await
+                .map_err(|e| StealthError::HardwareFailure {
+                    device_class: "network".to_string(),
+                    reason: e.to_string(),
+                }),
+            StealthLayer::ArtifactCleanup => {
+                run_full_cleanup(vm)
+                    .await
+                    .map(|_: CleanupReport| ())
+                    .map_err(|e| StealthError::ArtifactFailure {
+                        key: "registry".to_string(),
+                        reason: e.to_string(),
+                    })
+            }
+            StealthLayer::TimingNormalize => patch_disk_serials(vm_name, profile)
+                .await
+                .map_err(|e| StealthError::TimingFailure(e.to_string())),
+        };
 
-async fn restore_vm_artifacts(
-    vm_id: &str,
-) -> Result<CleanupReport, StealthError> {
-    let report = run_full_restore().await?;
-    Ok(report)
-}
-
-// Implement the patch_smbios_profile function
-fn patch_smbios_profile(profile: &HardwareProfile) -> Result<(), String> {
-    // Implementation details...
-    let vm_id = profile.vm_id; // Assuming vm_id is a field in HardwareProfile
-
-    // Example: Patch SMBIOS data for the VM
-    if let Some(smbios_data) = profile.smbios_data {
-        match patch_smbios(vm_id, smbios_data) {
-            Ok(_) => println!("SMBIOS profile patched successfully for VM: {}", vm_id),
-            Err(e) => return Err(format!("Failed to patch SMBIOS profile for VM {}: {}", vm_id, e)),
+        match outcome {
+            Ok(()) => report.applied_layers.push(layer),
+            Err(e) => report.failed_layers.push((layer, e.to_string())),
         }
-    } else {
-        return Err(format!("No SMBIOS data provided for VM: {}", vm_id));
     }
 
-    Ok(())
+    report.duration_ms = started.elapsed().as_millis();
+
+    if report.applied_layers.is_empty() && total > 0 {
+        return Err(StealthError::PartialApplication {
+            applied: 0,
+            total,
+        });
+    }
+
+    Ok(report)
 }
 
-// Example helper function to simulate patching SMBIOS data
-fn patch_smbios(vm_id: &str, smbios_data: &[u8]) -> Result<(), String> {
-    // Simulate the process of patching SMBIOS data
-    println!("Patching SMBIOS data for VM: {}", vm_id);
-    Ok(())
+/// Reverse every applied layer, best-effort. Errors are collected, not fatal.
+pub async fn revert_layers(
+    report: &StealthReport,
+    vm: &VmHandle,
+    profile: &HardwareProfile,
+) -> Vec<(StealthLayer, String)> {
+    let mut errors = Vec::new();
+    let vm_name = vm.vm_name();
+
+    for layer in report.applied_layers.iter().rev() {
+        let result: Result<(), String> = match layer {
+            StealthLayer::CpuIdMask => {
+                let script = build_unmask_script(vm_name);
+                run_powershell_on_host_sync(&script)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+            StealthLayer::HardwareSpoof => {
+                async {
+                    restore_mac_addresses(vm_name)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    restore_disk_serials(vm_name)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    restore_smbios_profile(vm_name)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok::<(), String>(())
+                }
+                .await
+            }
+            StealthLayer::ArtifactCleanup => run_full_restore(vm)
+                .await
+                .map(|_: CleanupReport| ())
+                .map_err(|e| e.to_string()),
+            StealthLayer::TimingNormalize => Ok(()),
+        };
+
+        if let Err(e) = result {
+            errors.push((*layer, e));
+        }
+    }
+
+    errors
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target_id::TargetId;
+
+    fn manager() -> StealthManager {
+        StealthManager::new()
+    }
+
+    fn event() -> DetectionEvent {
+        DetectionEvent::new(
+            DetectionVector::default(),
+            Severity::High,
+            "test",
+            "synthetic detection",
+        )
+    }
+
+    #[tokio::test]
+    async fn session_creation_records_id() {
+        let m = manager();
+        let id = m.create_session(TargetId::Generic).await.unwrap();
+
+        assert_eq!(m.session_count().await, 1);
+        assert!(m.list_sessions().await.contains(&id));
+
+        let session = m.get_session(id).await.unwrap();
+        assert_eq!(session.state, SessionState::Initializing);
+        assert!(session.active_countermeasures.is_empty());
+        assert_eq!(session.success_rate(), 1.0);
+    }
+
+    #[tokio::test]
+    async fn zero_threshold_is_rejected() {
+        let m = manager();
+        let profile = StealthProfile {
+            failure_threshold: 0,
+            patch_set_id: "generic".into(),
+        };
+        let err = m
+            .create_session_with_profile(TargetId::Generic, profile)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StealthError::MissingConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn unknown_session_is_not_found() {
+        let m = manager();
+        let fake = Uuid::new_v4();
+        let err = m.get_session(fake).await.unwrap_err();
+        match err {
+            StealthError::SessionNotFound { id } => assert_eq!(id, fake),
+            other => panic!("expected SessionNotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_transitions_succeed() {
+        let m = manager();
+        let id = m.create_session(TargetId::Generic).await.unwrap();
+
+        m.activate_session(id).await.unwrap();
+        assert_eq!(m.get_session(id).await.unwrap().state, SessionState::Active);
+
+        m.with_session_mut(id, |s| s.transition(SessionState::Degraded))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            m.get_session(id).await.unwrap().state,
+            SessionState::Degraded
+        );
+
+        m.with_session_mut(id, |s| s.transition(SessionState::Active))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.get_session(id).await.unwrap().state, SessionState::Active);
+    }
+
+    #[tokio::test]
+    async fn invalid_transition_is_rejected() {
+        let m = manager();
+        let id = m.create_session(TargetId::Generic).await.unwrap();
+
+        // Initializing -> Degraded is not in the table.
+        let err = m
+            .with_session_mut(id, |s| s.transition(SessionState::Degraded))
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        match err {
+            StealthError::InvalidTransition { from, to } => {
+                assert_eq!(from, "Initializing");
+                assert_eq!(to, "Degraded");
+            }
+            other => panic!("expected InvalidTransition, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminate_moves_to_terminated_and_keeps_session() {
+        let m = manager();
+        let id = m.create_session(TargetId::Generic).await.unwrap();
+        m.activate_session(id).await.unwrap();
+        m.terminate_session(id).await.unwrap();
+
+        assert_eq!(
+            m.get_session(id).await.unwrap().state,
+            SessionState::Terminated
+        );
+        assert_eq!(m.session_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn detection_compromises_at_threshold() {
+        let m = manager();
+        let profile = StealthProfile {
+            failure_threshold: 2,
+            patch_set_id: "generic".into(),
+        };
+        let id = m
+            .create_session_with_profile(TargetId::Generic, profile)
+            .await
+            .unwrap();
+        m.activate_session(id).await.unwrap();
+
+        let state = m.record_detection(id, event()).await.unwrap();
+        assert_eq!(state, SessionState::Active);
+
+        let state = m.record_detection(id, event()).await.unwrap();
+        assert_eq!(state, SessionState::Compromised);
+
+        let metrics = m.metrics_snapshot().await;
+        assert_eq!(metrics.total_detections, 2);
+        // Gauge counts the transition once, not every detection.
+        assert_eq!(metrics.compromised_sessions, 1);
+    }
+
+    #[tokio::test]
+    async fn success_records_countermeasure_once() {
+        let m = manager();
+        let id = m.create_session(TargetId::Generic).await.unwrap();
+
+        m.record_success(id, Countermeasure::CpuidSpoof).await.unwrap();
+        m.record_success(id, Countermeasure::CpuidSpoof).await.unwrap();
+
+        let session = m.get_session(id).await.unwrap();
+        assert_eq!(session.success_count, 2);
+        assert_eq!(session.active_countermeasures.len(), 1);
+        assert_eq!(m.metrics_snapshot().await.total_successes, 2);
+    }
+
+    #[tokio::test]
+    async fn posture_is_green_for_healthy_session() {
+        let m = manager();
+        let id = m.create_session(TargetId::Generic).await.unwrap();
+        m.activate_session(id).await.unwrap();
+        m.record_success(id, Countermeasure::HardwareSpoof)
+            .await
+            .unwrap();
+
+        let posture = m.posture_for(id).await.unwrap();
+        assert_eq!(posture.passed_checks, posture.total_checks);
+        assert_eq!(posture.overall_score, 100);
+        assert_eq!(posture.posture_level, "GREEN");
+    }
+
+    #[tokio::test]
+    async fn posture_is_red_for_unactivated_session() {
+        let m = manager();
+        let id = m.create_session(TargetId::Generic).await.unwrap();
+
+        let posture = m.posture_for(id).await.unwrap();
+        assert!(posture.failed_checks > 0);
+        assert_eq!(posture.posture_level, "RED");
+    }
+
+    #[tokio::test]
+    async fn reconcile_metrics_matches_live_sessions() {
+        let m = manager();
+        let a = m.create_session(TargetId::Generic).await.unwrap();
+        let b = m.create_session(TargetId::Generic).await.unwrap();
+        m.activate_session(a).await.unwrap();
+        m.activate_session(b).await.unwrap();
+        m.terminate_session(b).await.unwrap();
+
+        let metrics = m.reconcile_metrics().await;
+        assert_eq!(metrics.active_sessions, 1);
+        assert_eq!(metrics.compromised_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn remove_session_drops_it() {
+        let m = manager();
+        let id = m.create_session(TargetId::Generic).await.unwrap();
+        m.remove_session(id).await.unwrap();
+
+        assert_eq!(m.session_count().await, 0);
+        assert!(m.get_session(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn managers_are_isolated() {
+        let a = manager();
+        let b = manager();
+        a.create_session(TargetId::Generic).await.unwrap();
+
+        assert_eq!(a.session_count().await, 1);
+        assert_eq!(b.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn session_ids_are_unique() {
+        let m = manager();
+        let a = m.create_session(TargetId::Generic).await.unwrap();
+        let b = m.create_session(TargetId::Generic).await.unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn error_messages_are_descriptive() {
+        let err = StealthError::SessionNotFound {
+            id: Uuid::new_v4(),
+        };
+        assert!(err.to_string().contains("not found"));
+
+        let err = StealthError::InvalidTransition {
+            from: "A".into(),
+            to: "B".into(),
+        };
+        assert!(err.to_string().contains('A') && err.to_string().contains('B'));
+    }
+
+    #[test]
+    fn requirements_skip_timing_by_default() {
+        let req = StealthRequirements::default();
+        let layers = req.ordered_layers();
+        assert!(layers.contains(&StealthLayer::CpuIdMask));
+        assert_eq!(
+            layers,
+            vec![
+                StealthLayer::CpuIdMask,
+                StealthLayer::HardwareSpoof,
+                StealthLayer::ArtifactCleanup,
+                StealthLayer::TimingNormalize,
+            ]
+        );
+    }
+}

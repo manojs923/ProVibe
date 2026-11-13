@@ -7,9 +7,19 @@ pub mod sandbox;
 
 use crate::target_id::TargetProfile;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use uuid::Uuid;
+
+use crate::vm::network::NetworkConfig;
+
+/// Local guest account used for PowerShell Direct. The base image must have
+/// this account with this password; override with
+/// [`VmOrchestrator::with_guest_credentials`] when it differs.
+const DEFAULT_GUEST_USER: &str = "Administrator";
+const DEFAULT_GUEST_PASSWORD: &str = "Protocol!2024";
 
 // ---------------------------------------------------------------------------
 // VM STATUS QUERY
@@ -26,11 +36,39 @@ pub struct VmStatus {
     pub memory_usage_mb: u64,
 }
 
+#[derive(Deserialize)]
+struct RawVmStatus {
+    #[serde(rename = "State")]
+    state: String,
+    #[serde(rename = "UptimeSeconds", default)]
+    uptime_seconds: i64,
+    #[serde(rename = "ProcessorUsage", default)]
+    cpu_usage: Option<f64>,
+    #[serde(rename = "MemoryAssigned", default)]
+    memory_assigned: u64,
+    #[serde(rename = "MemoryDemand", default)]
+    memory_demand: u64,
+}
+
 #[tauri::command]
 pub fn get_vm_status(vm_name: String) -> Result<VmStatus, String> {
+    let escaped_name = vm_name.replace('\'', "''");
+
+    // Emit flat primitives rather than the raw TimeSpan object, so the host
+    // side has one unambiguous shape to parse.
     let ps_cmd = format!(
-        "Get-VM -Name '{}' | Select-Object State, Uptime, ProcessorUsage, MemoryAssigned, MemoryDemand | ConvertTo-Json",
-        vm_name
+        r#"
+$ErrorActionPreference = 'Stop'
+$vm = Get-VM -Name '{vm}' -ErrorAction Stop
+[pscustomobject]@{{
+    State         = $vm.State.ToString()
+    UptimeSeconds = [int64]((Get-Date) - $vm.Uptime).TotalSeconds
+    ProcessorUsage = [double]$vm.ProcessorUsage
+    MemoryAssigned = [uint64]$vm.MemoryAssigned
+    MemoryDemand   = [uint64]$vm.MemoryDemand
+}} | ConvertTo-Json -Compress
+"#,
+        vm = escaped_name
     );
 
     let output = Command::new("powershell")
@@ -38,50 +76,39 @@ pub fn get_vm_status(vm_name: String) -> Result<VmStatus, String> {
         .output()
         .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    if stdout.trim().is_empty() || stdout.contains("not found") {
-        return Ok(VmStatus {
-            running: false,
-            vm_name,
-            state: "NotFound".to_string(),
-            uptime_seconds: 0,
-            cpu_usage: 0.0,
-            memory_assigned_mb: 0,
-            memory_usage_mb: 0,
-        });
+    if stdout.is_empty() {
+        return Ok(not_found(vm_name));
     }
 
-    let running = stdout.contains("Running");
-    let uptime = if running { extract_uptime(&stdout) } else { 0 };
+    let raw: RawVmStatus = match serde_json::from_str(&stdout) {
+        Ok(r) => r,
+        Err(_) => return Ok(not_found(vm_name)),
+    };
+
+    let running = raw.state.eq_ignore_ascii_case("Running");
 
     Ok(VmStatus {
         running,
         vm_name,
-        state: if running { "Running".to_string() } else { "Off".to_string() },
-        uptime_seconds: uptime,
-        cpu_usage: 0.0,
-        memory_assigned_mb: 0,
-        memory_usage_mb: 0,
+        state: raw.state,
+        uptime_seconds: raw.uptime_seconds.max(0) as u64,
+        cpu_usage: raw.cpu_usage.unwrap_or(0.0) as f32,
+        memory_assigned_mb: raw.memory_assigned / (1024 * 1024),
+        memory_usage_mb: raw.memory_demand / (1024 * 1024),
     })
 }
 
-fn extract_uptime(output: &str) -> u64 {
-    // PowerShell uptime format: "HH:MM:SS" or "DD.HH:MM:SS"
-    let time_section = output
-        .lines()
-        .find(|l| l.contains("Uptime"))
-        .unwrap_or("");
-
-    let parts: Vec<u64> = time_section
-        .split(':')
-        .filter_map(|s| s.trim().parse::<u64>().ok())
-        .collect();
-
-    match parts.len() {
-        3 => parts[0] * 3600 + parts[1] * 60 + parts[2],
-        4 => parts[0] * 86400 + parts[1] * 3600 + parts[2] * 60 + parts[3],
-        _ => 0,
+fn not_found(vm_name: String) -> VmStatus {
+    VmStatus {
+        running: false,
+        vm_name,
+        state: "NotFound".to_string(),
+        uptime_seconds: 0,
+        cpu_usage: 0.0,
+        memory_assigned_mb: 0,
+        memory_usage_mb: 0,
     }
 }
 
@@ -106,17 +133,19 @@ pub fn spawn_stealth_vm_cmd(
     // frontend contract stays stable.
     let _profile = stealth_profile.unwrap_or_else(|| "default".to_string());
 
-    // Apply stealth hardening before boot.
+    // Harden before boot. Only real cmdlet parameters here: `Set-VMProcessor`
+    // has no `HypervisorProtectionExposedToGuests`, and `Set-VM` has no
+    // `EnhancedSessionModeType`.
     let harden_script = format!(
         r#"
-        Set-VMProcessor -VMName '{vm}' -HypervisorProtectionExposedToGuests $false
-        Set-VM -VMName '{vm}' -EnhancedSessionModeType None
+        Set-VMProcessor -VMName '{vm}' -HideHypervisorPresent $true
         Set-VMMemory -VMName '{vm}' -DynamicMemoryEnabled $false
+        Set-VMHost -EnableEnhancedSessionMode $false
         "#,
         vm = &vm_name
     );
 
-    Command::new("powershell")
+    let harden = Command::new("powershell")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
@@ -126,6 +155,15 @@ pub fn spawn_stealth_vm_cmd(
         ])
         .output()
         .map_err(|e| format!("Failed to harden VM: {}", e))?;
+
+    // Hardening is best-effort: a VM that boots unhardened still beats no VM.
+    if !harden.status.success() {
+        eprintln!(
+            "[vm] hardening failed for '{}': {}",
+            vm_name,
+            String::from_utf8_lossy(&harden.stderr).trim()
+        );
+    }
 
     // Launch the console. vmconnect spawns detached; we keep the PID for telemetry.
     let child = Command::new("vmconnect.exe")
@@ -141,7 +179,7 @@ pub fn spawn_stealth_vm_cmd(
 
     let pid = Some(child.id());
 
-    // Give Hyper-V a moment to register state transition.
+    // Give Hyper-V a moment to register the state transition.
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let state_cmd = format!("(Get-VM -Name '{}').State.ToString()", &vm_name);
@@ -215,6 +253,37 @@ pub struct VmOrchestrator {
     pub vm_name: String,
     pub state: Arc<Mutex<VmState>>,
     pub loopback_ip: String,
+    /// Guest account for PowerShell Direct.
+    pub guest_username: String,
+    pub guest_password: String,
+}
+
+pub struct Vm {
+    pub vm_name: String,
+    pub loopback_ip: String,
+}
+
+impl Vm {
+    pub async fn create_differencing_disk(&self) -> Result<(), String> {
+        let base_path = PathBuf::from(
+            r"C:\Users\rippl\Downloads\The Nartan Build\Live Now\protocol\path\to\base\directory",
+        );
+        let output_dir = PathBuf::from(
+            r"C:\Users\rippl\Downloads\The Nartan Build\Live Now\protocol\path\to\output\directory",
+        );
+
+        clone::create_differencing_disk(&self.vm_name, &base_path, &output_dir)
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    pub async fn configure_loopback_adapter(&self) -> Result<(), String> {
+        let network_config = NetworkConfig::default();
+        network::configure_loopback_adapter(&network_config).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
 }
 
 impl VmOrchestrator {
@@ -222,7 +291,7 @@ impl VmOrchestrator {
     pub fn new(profile: TargetProfile) -> Self {
         // Pseudo-random name to avoid Hyper-V collisions and defeat
         // static-string host scans.
-        let entropy = uuid::Uuid::new_v4().to_string();
+        let entropy = Uuid::new_v4().to_string();
         let vm_name = format!("win_sys_{}", &entropy[..8]);
 
         Self {
@@ -230,7 +299,20 @@ impl VmOrchestrator {
             vm_name,
             state: Arc::new(Mutex::new(VmState::Offline)),
             loopback_ip: "127.0.0.2".to_string(),
+            guest_username: DEFAULT_GUEST_USER.to_string(),
+            guest_password: DEFAULT_GUEST_PASSWORD.to_string(),
         }
+    }
+
+    /// Override the guest credentials used for PowerShell Direct.
+    pub fn with_guest_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.guest_username = username.into();
+        self.guest_password = password.into();
+        self
     }
 
     /// Main ignition sequence — full deployment pipeline.
@@ -241,13 +323,10 @@ impl VmOrchestrator {
         }
 
         // 1. Generate config based on target requirements.
-        let _cfg = config::build_config(&self.profile.name);
+        let _cfg = config::build_config(&self.profile.display_name);
 
-        // 2. Clone base VHDX to a fast differencing disk.
-        clone::create_differencing_disk(&self.vm_name).map_err(|e| e.to_string())?;
-
-        // 3. Set up isolated virtual switch mapped to loopback.
-        network::configure_loopback_adapter(&self.vm_name, &self.loopback_ip)
+        // 2. Set up isolated virtual switch mapped to loopback.
+        network::configure_loopback_adapter(&NetworkConfig::default())
             .map_err(|e| e.to_string())?;
 
         {
@@ -255,10 +334,12 @@ impl VmOrchestrator {
             *state = VmState::Booting;
         }
 
-        // 4. Register and boot the VM via Hyper-V WMI.
-        hyperv::start_vm(&self.vm_name).map_err(|e| e.to_string())?;
+        // 3. Register and boot the VM via Hyper-V WMI.
+        hyperv::HyperVOrchestrator::new(&self.vm_name)
+            .start()
+            .map_err(|e| e.to_string())?;
 
-        // 5. Wait for RDP :3389 on the loopback bind.
+        // 4. Wait for RDP :3389 on the loopback bind.
         lifecycle::wait_for_boot(&self.loopback_ip)
             .await
             .map_err(|e| e.to_string())?;
@@ -283,10 +364,12 @@ impl VmOrchestrator {
         Ok(())
     }
 
-    /// Completely obliterates the VM, differencing disk, and vSwitch. No host artifacts remain.
+    /// Completely obliterates the VM, differencing disk, and vSwitch. No host
+    /// artifacts remain.
     pub async fn teardown(&self) -> Result<(), String> {
         lifecycle::destroy_vm(&self.vm_name, None).map_err(|e| e.to_string())?;
-        network::teardown_vswitch(&self.vm_name).map_err(|e| e.to_string())?;
+
+        network::destroy_network(&network::get_network_config()).map_err(|e| e.to_string())?;
 
         let mut state = self.state.lock().await;
         *state = VmState::Nuked;

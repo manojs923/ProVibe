@@ -1,546 +1,802 @@
-use crate::stealth::{StealthError};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use rand::Rng;
-use std::process::Command;
-use crate::stealth::VmHandle;
-use crate::stealth::TargetProfile;
-use crate::vm::lifecycle::spawn_stealth_vm;
 
-/// Artifact cleanup — removes VM-specific registry keys, uninstalls Hyper-V Integration Services,
-/// stops/disables Hyper-V guest services, removes virtual device drivers, clears Hyper-V event logs,
-/// unregisters Hyper-V scheduled tasks, removes Hyper-V firewall rules, and renames the virtual
-/// display adapter in the Device Manager registry to match physical GPU entries.
-///
-/// Every destructive operation is backed up to C:\ProgramData\StealthBackup\ inside the guest so
-/// `run_full_restore` can roll everything back.
+use thiserror::Error;
+use tracing::{debug, error, info, instrument, warn};
 
-const BACKUP_ROOT: &str = r"C:\ProgramData\StealthBackup";
+use crate::hyper_v::vm_manager::{VmManager, VmManagerOps};
+use crate::stealth::StealthError;
+use crate::util::powershell::PowerShellScript;
+use crate::vm::config::StealthConfig;
+use crate::vm::lifecycle::VmHandle;
 
-const VM_REGISTRY_KEYS: &[&str] = &[
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmguest",
-    r"HKLM\SOFTWARE\Microsoft\Virtual Machine",
-    // Bonus sweep — common leftovers
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmicheartbeat",
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmicvss",
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmicshutdown",
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmicrdv",
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmicguestinterface",
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmictimesync",
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmickvpexchange",
-    r"HKLM\SYSTEM\CurrentControlSet\Services\vmicvmsession",
-    r"HKLM\SYSTEM\CurrentControlSet\Services\Hypervideo",
-    r"HKLM\SOFTWARE\Microsoft\Virtual Machine\Guest",
-];
+const BACKUP_SUFFIX: &str = ".stealth_bak";
+const ARTIFACT_SCAN_TIMEOUT_SECS: u64 = 300;
+/// Fallback restore root when the config doesn't specify one.
+const DEFAULT_RESTORE_ROOT: &str = r"C:\Restored\";
 
-const VM_SERVICES: &[&str] = &[
-    "vmicguestinterface",
-    "vmicheartbeat",
-    "vmickvpexchange",
-    "vmicrdv",
-    "vmictimesync",
-    "vmicvmsession",
-    "vmicshutdown",
-    "vmicvss",
-];
+#[derive(Debug, Error)]
+pub enum GuestArtifactError {
+    #[error("Failed to execute PowerShell in guest: {0}")]
+    PowerShellExecution(String),
 
-const GPU_PROFILES: &[(&str, &str)] = &[
-    ("NVIDIA GeForce RTX 3070", r"PCI\VEN_10DE&DEV_2484"),
-    ("NVIDIA GeForce RTX 3060", r"PCI\VEN_10DE&DEV_2503"),
-    ("AMD Radeon RX 6700 XT", r"PCI\VEN_1002&DEV_73DF"),
-    ("Intel(R) UHD Graphics 630", r"PCI\VEN_8086&DEV_9BC5"),
-    ("Intel(R) Iris(R) Xe Graphics", r"PCI\VEN_8086&DEV_46A6"),
-];
+    #[error("VM '{0}' is not in a running state")]
+    VmNotRunning(String),
 
-const VIRTUAL_ADAPTER_MATCHES: &[&str] = &[
-    "Microsoft Hyper-V Video",
-    "Microsoft Basic Display Adapter",
-    "Virtual Display Adapter",
-];
+    #[error("Artifact scan timed out after {timeout_secs} seconds")]
+    ScanTimeout { timeout_secs: u64 },
 
-const PS_DIRECT_TIMEOUT: Duration = Duration::from_secs(90);
+    #[error("Failed to backup artifact at '{0}': {1}")]
+    BackupFailure(String, String),
 
+    #[error("Failed to restore artifact from '{0}': {1}")]
+    RestoreFailure(String, String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<GuestArtifactError> for StealthError {
+    fn from(err: GuestArtifactError) -> Self {
+        StealthError::GuestArtifact(err)
+    }
+}
+
+impl From<StealthError> for GuestArtifactError {
+    fn from(err: StealthError) -> Self {
+        GuestArtifactError::PowerShellExecution(err.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GuestArtifact {
+    pub name: String,
+    pub guest_path: PathBuf,
+    pub host_backup_path: PathBuf,
+    pub size_bytes: u64,
+    pub is_directory: bool,
+}
+
+/// Outcome of a full cleanup or restore sweep. Non-fatal per-item failures are
+/// collected so one bad artifact can't abort the run.
 #[derive(Debug, Clone, Default)]
 pub struct CleanupReport {
-    pub registry_keys_removed: Vec<String>,
-    pub registry_keys_missing: Vec<String>,
-    pub registry_keys_failed: Vec<String>,
-    pub vmbus_values_removed: Vec<String>,
-    pub services_stopped: Vec<String>,
-    pub services_already_stopped: Vec<String>,
-    pub services_failed: Vec<String>,
-    pub drivers_removed: Vec<String>,
-    pub drivers_backed_up: Vec<String>,
-    pub event_logs_cleared: Vec<String>,
-    pub scheduled_tasks_unregistered: Vec<String>,
-    pub firewall_rules_removed: Vec<String>,
-    pub integration_services_uninstalled: bool,
-    pub display_adapter_renamed: Option<String>,
-    pub backup_created: bool,
-    pub errors: Vec<String>,
+    pub discovered: usize,
+    pub cleaned: usize,
+    pub restored: usize,
+    pub failed: Vec<(String, String)>,
 }
 
 impl CleanupReport {
-    fn new() -> Self {
-        Self::default()
-    }
-
     pub fn is_clean(&self) -> bool {
-        self.errors.is_empty()
-            && self.registry_keys_failed.is_empty()
-            && self.services_failed.is_empty()
+        self.failed.is_empty()
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct RestoreReport {
-    pub services_restarted: Vec<String>,
-    pub services_failed: Vec<String>,
-    pub drivers_restored: Vec<String>,
-    pub event_logs_restored: Vec<String>,
-    pub scheduled_tasks_restored: Vec<String>,
-    pub firewall_rules_restored: Vec<String>,
-    pub registry_keys_restored: Vec<String>,
-    pub errors: Vec<String>,
+pub struct GuestArtifactCleaner {
+    config: StealthConfig,
+    vm_manager: Box<dyn VmManagerOps>,
 }
 
-impl RestoreReport {
-    pub fn new() -> Self {
-        // Initialize fields as needed
-        RestoreReport { 
-            services_restarted: Vec::new(),
-            services_failed: Vec::new(),
-            drivers_restored: Vec::new(),
-            event_logs_restored: Vec::new(),
-            scheduled_tasks_restored: Vec::new(),
-            firewall_rules_restored: Vec::new(),
-            registry_keys_restored: Vec::new(),
-            errors: Vec::new(),
+impl GuestArtifactCleaner {
+    #[instrument(name = "guest_artifact_cleaner_new", skip(config, vm_manager))]
+    pub fn new<M>(config: StealthConfig, vm_manager: M) -> Self
+    where
+        M: VmManagerOps + 'static,
+    {
+        Self {
+            config,
+            vm_manager: Box::new(vm_manager),
         }
     }
-}
 
-pub async fn cleanup_vm_artifacts(vm_handle: VmHandle) -> Result<CleanupReport, StealthError> {
-    let vm_name = vm_handle.name();
-    let mut report = CleanupReport::new();
+    /// Build a cleaner from a VM handle alone, using default paths. This is
+    /// what the tunnel/stealth layer uses, since it only carries a handle.
+    pub fn for_vm(vm: &VmHandle) -> Self {
+        let config = StealthConfig {
+            guest_vm_name: vm.name.clone(),
+            ..Default::default()
+        };
+        Self::new(config, VmManager::new())
+    }
 
-    backup_guest_state(&vm_name, &mut report);
-    scrub_registry(&vm_name, &mut report);
-    strip_vmbus_values(&vm_name, &mut report);
-    stop_vm_services(&vm_name, &mut report);
-    uninstall_integration_services(&vm_name, &mut report);
-    remove_virtual_drivers(&vm_name, &mut report);
-    clear_hyper_v_event_logs(&vm_name, &mut report);
-    unregister_hyper_v_tasks(&vm_name, &mut report);
-    remove_hyper_v_firewall_rules(&vm_name, &mut report);
-    rename_display_adapter(&vm_name, &mut report);
+    /// Scans the guest VM for known artifacts left by prior tooling or scripts.
+    /// Returns a list of discovered artifacts that can be cleaned or backed up.
+    #[instrument(name = "scan_for_artifacts", skip(self))]
+    pub async fn scan_for_artifacts(&self) -> Result<Vec<GuestArtifact>, GuestArtifactError> {
+        let vm_name = &self.config.guest_vm_name;
 
-    Ok(report)
-}
-
-pub async fn restore_artifacts(vm_handle: VmHandle) -> Result<RestoreReport, StealthError> {
-    let vm_name = vm_handle.name();
-    let mut report = RestoreReport::new();
-
-    restore_scheduled_tasks(&vm_name, &mut report);
-    restore_firewall_rules(&vm_name, &mut report);
-    restore_event_logs(&vm_name, &mut report);
-    restore_drivers(&vm_name, &mut report);
-    restart_vm_services(&vm_name, &mut report);
-    restore_registry_keys(&vm_name, &mut report);
-
-    Ok(report)
-}
-
-pub fn run_full_cleanup(vm_name: &str) -> Result<CleanupReport, String> {
-    let handle = VmHandle::open(vm_name).map_err(|e| e.to_string())?;
-    crate::stealth::block_on(cleanup_vm_artifacts(handle)).map_err(|e| e.to_string())
-}
-
-pub fn run_full_restore(vm_name: &str) -> Result<RestoreReport, String> {
-    let handle = VmHandle::open(vm_name).map_err(|e| e.to_string())?;
-    crate::stealth::block_on(restore_artifacts(handle)).map_err(|e| e.to_string())
-}
-
-fn backup_guest_state(vm_name: &str, report: &mut CleanupReport) {
-    let script = format!(
-        r#"
-        $ErrorActionPreference = 'Continue'
-        $root = '{BACKUP_ROOT}'
-        New-Item -ItemType Directory -Force -Path $root | Out-Null
-        New-Item -ItemType Directory -Force -Path "$root\services" | Out-Null
-        New-Item -ItemType Directory -Force -Path "$root\tasks" | Out-Null
-        New-Item -ItemType Directory -Force -Path "$root\firewall" | Out-Null
-        New-Item -ItemType Directory -Force -Path "$root\drivers" | Out-Null
-        New-Item -ItemType Directory -Force -Path "$root\eventlogs" | Out-Null
-        New-Item -ItemType Directory -Force -Path "$root\registry" | Out-Null
-
-        $services = @({services_array})
-        foreach ($svc in $services) {{
-            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-            if ($s) {{
-                $startType = (Get-CimInstance Win32_Service -Filter "Name='$svc'").StartMode
-                "$($s.Status)|$startType" | Out-File -FilePath "$root\services\$svc.txt" -Encoding utf8
-            }}
-        }}
-
-        # Backup driver inf files that match Hyper-V / virtual providers
-        Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
-            Where-Object {{ $_.Manufacturer -match 'Microsoft' -and $_.DeviceName -match 'Hyper-V|Virtual|VMBus' }} |
-            ForEach-Object {{
-                if ($_.InfName) {{
-                    $dest = Join-Path "$root\drivers" $_.InfName
-                    Copy-Item "$env:SystemRoot\INF\$($_.InfName)" $dest -Force -ErrorAction SilentlyContinue
-                    $_.InfName | Out-File -FilePath "$root\drivers\list.txt" -Append -Encoding utf8
-                }}
-            }}
-
-        # Backup scheduled tasks
-        Get-ScheduledTask -TaskPath '\Microsoft\Windows\Hyper-V\*' -ErrorAction SilentlyContinue |
-            Export-ScheduledTask | Out-File -FilePath "$root\tasks\all.xml" -Encoding utf8 -Append
-
-        # Backup firewall rules
-        Get-NetFirewallRule -DisplayName '*Hyper-V*' -ErrorAction SilentlyContinue |
-            ForEach-Object {{
-                $xml = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($_ | ConvertTo-Json -Depth 5 -Compress))
-                "$($_.Name)|$($_.DisplayName)|$($_.Enabled)|$($_.Direction)|$($_.Action)|$($_.Profile)|$xml" |
-                    Out-File -FilePath "$root\firewall\rules.txt" -Append -Encoding utf8
-            }}
-
-        # Backup event log configuration (which logs existed + max sizes)
-        wevtutil el | Where-Object {{ $_ -like '*Hyper-V*' }} |
-            Out-File -FilePath "$root\eventlogs\list.txt" -Encoding utf8
-
-        # Backup full registry keys before deletion
-        $keys = @({keys_array})
-        foreach ($key in $keys) {{
-            $safe = ($key -replace '[\\:]', '_')
-            reg export "$($key -replace 'HKLM\\', 'HKLM\')" "$root\registry\$safe.reg" /y 2>$null
-        }}
-
-        Write-Output 'BACKUP_COMPLETE'
-        "#,
-        services_array = VM_SERVICES.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", "),
-        keys_array = VM_REGISTRY_KEYS.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", "),
-    );
-
-    match run_in_guest(vm_name, &script) {
-        Ok((stdout, _)) if stdout.contains("BACKUP_COMPLETE") => {
-            report.backup_created = true;
+        if !self.vm_manager.is_vm_running(vm_name).await? {
+            return Err(GuestArtifactError::VmNotRunning(vm_name.clone()));
         }
-        Ok((_, stderr)) => {
-            report.errors.push(format!("backup incomplete — restore may be partial: {stderr}"));
-            // Backup failing is soft — cleanup proceeds, restore may not fully work.
-            report.backup_created = false;
-        }
-        Err(e) => {
-            report.errors.push(format!("backup failed: {e}"));
+
+        // Runs inside the guest via Hyper-V Guest Services. Requires the Guest
+        // Services integration component to be enabled and running.
+        let scan_script = PowerShellScript::new(
+            r#"
+$ErrorActionPreference = "Stop"
+
+# Known artifact locations left by tooling
+$artifactPaths = @(
+    "C:\\ProgramData\\StealthTool\\Logs",
+    "C:\\ProgramData\\StealthTool\\Temp",
+    "C:\\Windows\\Temp\\stealth_*.tmp",
+    "C:\\Users\\Public\\Documents\\stealth_*.json",
+    "$env:TEMP\\stealth_*"
+)
+
+$discovered = @()
+
+foreach ($path in $artifactPaths) {
+    if (Test-Path $path -PathType Any) {
+        $items = Get-Item $path -Force
+        foreach ($item in $items) {
+            $discovered += [PSCustomObject]@{
+                Name = $item.Name
+                FullName = $item.FullName
+                SizeBytes = if ($item.PSIsContainer) { 0 } else { $item.Length }
+                IsDirectory = $item.PSIsContainer
+                LastWriteTime = $item.LastWriteTime.ToString("o")
+            }
         }
     }
 }
 
-fn scrub_registry(vm_name: &str, report: &mut CleanupReport) {
-    for key in VM_REGISTRY_KEYS {
-        let script = format!(
-            "if (Test-Path 'Microsoft.PowerShell.Core\\Registry::{key}') {{ \
-                Remove-Item -Path 'Microsoft.PowerShell.Core\\Registry::{key}' -Recurse -Force; \
-                Write-Output 'REMOVED' \
-             }} else {{ Write-Output 'MISSING' }}"
+# Force array shape even for a single hit, so the host parser has one case.
+@($discovered) | ConvertTo-Json -Compress -Depth 4
+"#,
         );
-        match run_in_guest(vm_name, &script) {
-            Ok((stdout, _)) => {
-                if stdout.contains("REMOVED") {
-                    report.registry_keys_removed.push((*key).to_string());
-                } else {
-                    report.registry_keys_missing.push((*key).to_string());
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(ARTIFACT_SCAN_TIMEOUT_SECS),
+            self.vm_manager.execute_in_guest(vm_name, scan_script),
+        )
+        .await
+        .map_err(|_| GuestArtifactError::ScanTimeout {
+            timeout_secs: ARTIFACT_SCAN_TIMEOUT_SECS,
+        })??;
+
+        let artifacts = self.parse_scan_output(&output)?;
+        debug!(
+            "Discovered {} artifacts in guest VM '{}'",
+            artifacts.len(),
+            vm_name
+        );
+        Ok(artifacts)
+    }
+
+    /// Creates a backup of the specified artifact on the host filesystem before deletion.
+    #[instrument(name = "backup_artifact", skip(self))]
+    pub async fn backup_artifact(&self, artifact: &GuestArtifact) -> Result<(), GuestArtifactError> {
+        let backup_dir = &self.config.backup_directory;
+
+        fs::create_dir_all(backup_dir).map_err(|e| {
+            GuestArtifactError::BackupFailure(backup_dir.display().to_string(), e.to_string())
+        })?;
+
+        let guest_src = artifact.guest_path.to_string_lossy().to_string();
+        let host_dst = artifact.host_backup_path.to_string_lossy().to_string();
+
+        self.vm_manager
+            .copy_file_from_guest(&self.config.guest_vm_name, &guest_src, &host_dst)
+            .await
+            .map_err(|e| GuestArtifactError::BackupFailure(guest_src.clone(), e.to_string()))?;
+
+        info!(
+            "Backed up '{}' from guest to '{}' on host",
+            guest_src, host_dst
+        );
+        Ok(())
+    }
+
+    /// Backs up and then removes the artifact from the guest VM.
+    #[instrument(name = "clean_artifact", skip(self))]
+    pub async fn clean_artifact(&self, artifact: &GuestArtifact) -> Result<(), GuestArtifactError> {
+        self.backup_artifact(artifact).await?;
+
+        // Single-quote escaping for the guest-side path literal.
+        let guest_path_str = artifact.guest_path.to_string_lossy().replace('\'', "''");
+
+        let cleanup_script = PowerShellScript::new(format!(
+            r#"
+$ErrorActionPreference = "Stop"
+
+$targetPath = '{path}'
+
+if (Test-Path $targetPath) {{
+    if ((Get-Item $targetPath).PSIsContainer) {{
+        Remove-Item -Path $targetPath -Recurse -Force
+    }} else {{
+        Remove-Item -Path $targetPath -Force
+    }}
+    Write-Output "REMOVED:$targetPath"
+}} else {{
+    Write-Output "NOTFOUND:$targetPath"
+}}
+"#,
+            path = guest_path_str
+        ));
+
+        let output = self
+            .vm_manager
+            .execute_in_guest(&self.config.guest_vm_name, cleanup_script)
+            .await
+            .map_err(|e| GuestArtifactError::PowerShellExecution(e.to_string()))?;
+
+        if output.contains("NOTFOUND") {
+            warn!(
+                "Artifact '{}' was not found in guest during cleanup (already removed?)",
+                artifact.guest_path.display()
+            );
+        } else if output.contains("REMOVED") {
+            info!(
+                "Successfully removed artifact '{}' from guest",
+                artifact.guest_path.display()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Restores a previously backed-up artifact from the host back into the guest VM.
+    #[instrument(name = "restore_artifact", skip(self))]
+    pub async fn restore_artifact(&self, artifact: &GuestArtifact) -> Result<(), GuestArtifactError> {
+        if !artifact.host_backup_path.exists() {
+            return Err(GuestArtifactError::RestoreFailure(
+                artifact.host_backup_path.display().to_string(),
+                "Backup file does not exist on host".to_string(),
+            ));
+        }
+
+        let host_src = artifact.host_backup_path.to_string_lossy().to_string();
+        let guest_dst = artifact.guest_path.to_string_lossy().to_string();
+
+        self.vm_manager
+            .copy_file_to_guest(&self.config.guest_vm_name, &host_src, &guest_dst)
+            .await
+            .map_err(|e| {
+                GuestArtifactError::RestoreFailure(
+                    host_src.clone(),
+                    format!("Failed copy host->guest: {}", e),
+                )
+            })?;
+
+        info!("Restored '{}' to guest path '{}'", host_src, guest_dst);
+        Ok(())
+    }
+
+    /// Full cleanup cycle: scan, backup, and remove all discovered artifacts.
+    #[instrument(name = "full_cleanup", skip(self))]
+    pub async fn full_cleanup(&self) -> Result<CleanupReport, GuestArtifactError> {
+        let artifacts = self.scan_for_artifacts().await?;
+        let mut report = CleanupReport {
+            discovered: artifacts.len(),
+            ..Default::default()
+        };
+
+        for artifact in &artifacts {
+            match self.clean_artifact(artifact).await {
+                Ok(()) => report.cleaned += 1,
+                Err(e) => {
+                    error!(
+                        "Failed to clean artifact '{}': {}",
+                        artifact.guest_path.display(),
+                        e
+                    );
+                    report
+                        .failed
+                        .push((artifact.guest_path.display().to_string(), e.to_string()));
                 }
             }
-            Err(e) => {
-                report.registry_keys_failed.push(format!("{key}: {e}"));
+        }
+
+        Ok(report)
+    }
+
+    /// Full restore cycle: restores all artifacts that have backups on the host.
+    #[instrument(name = "full_restore", skip(self))]
+    pub async fn full_restore(&self) -> Result<CleanupReport, GuestArtifactError> {
+        let backup_dir = &self.config.backup_directory;
+        let mut report = CleanupReport::default();
+
+        if !backup_dir.exists() {
+            debug!(
+                "No backup directory found at '{}', nothing to restore",
+                backup_dir.display()
+            );
+            return Ok(report);
+        }
+
+        for entry in fs::read_dir(backup_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.to_string_lossy().contains(BACKUP_SUFFIX) {
+                continue;
+            }
+
+            let artifact = GuestArtifact {
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                guest_path: self.derive_guest_path(&path)?,
+                host_backup_path: path.clone(),
+                size_bytes: entry.metadata()?.len(),
+                is_directory: path.is_dir(),
+            };
+
+            match self.restore_artifact(&artifact).await {
+                Ok(()) => report.restored += 1,
+                Err(e) => {
+                    error!("Failed to restore artifact from '{}': {}", path.display(), e);
+                    report.failed.push((path.display().to_string(), e.to_string()));
+                }
             }
         }
+
+        info!("Restored {} artifacts to guest VM", report.restored);
+        Ok(report)
+    }
+
+    fn parse_scan_output(&self, raw_output: &str) -> Result<Vec<GuestArtifact>, GuestArtifactError> {
+        let trimmed = raw_output.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return Ok(Vec::new());
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ScannedItem {
+            #[serde(rename = "Name")]
+            name: String,
+            #[serde(rename = "FullName")]
+            full_name: String,
+            #[serde(rename = "SizeBytes", default)]
+            size_bytes: u64,
+            #[serde(rename = "IsDirectory", default)]
+            is_directory: bool,
+        }
+
+        let parse_err =
+            |e: serde_json::Error| GuestArtifactError::PowerShellExecution(format!(
+                "Failed to parse scan output JSON: {}",
+                e
+            ));
+
+        // ConvertTo-Json emits a bare object for a single item even when the
+        // pipeline input was an array, so accept both shapes.
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(parse_err)?;
+
+        let items: Vec<ScannedItem> = match value {
+            serde_json::Value::Array(_) => serde_json::from_value(value).map_err(parse_err)?,
+            serde_json::Value::Object(_) => {
+                vec![serde_json::from_value(value).map_err(parse_err)?]
+            }
+            serde_json::Value::Null => Vec::new(),
+            _ => Vec::new(),
+        };
+
+        let backup_dir = &self.config.backup_directory;
+
+        Ok(items
+            .into_iter()
+            .map(|item| {
+                let host_backup_path = backup_dir.join(format!("{}{}", item.name, BACKUP_SUFFIX));
+                GuestArtifact {
+                    name: item.name,
+                    guest_path: PathBuf::from(&item.full_name),
+                    host_backup_path,
+                    size_bytes: item.size_bytes,
+                    is_directory: item.is_directory,
+                }
+            })
+            .collect())
+    }
+
+    fn derive_guest_path(&self, backup_host_path: &Path) -> Result<PathBuf, GuestArtifactError> {
+        // Backup filenames follow the pattern: <original_name>.stealth_bak
+        let file_name = backup_host_path
+            .file_name()
+            .ok_or_else(|| {
+                GuestArtifactError::RestoreFailure(
+                    backup_host_path.display().to_string(),
+                    "Could not extract filename from backup path".to_string(),
+                )
+            })?
+            .to_string_lossy();
+
+        let original_name = file_name
+            .strip_suffix(BACKUP_SUFFIX)
+            .unwrap_or(file_name.as_ref());
+
+        // Full original paths aren't preserved in the backup name; a manifest
+        // would be needed to restore to the exact source directory.
+        let guest_restore_root = self
+            .config
+            .guest_restore_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_RESTORE_ROOT));
+
+        Ok(guest_restore_root.join(original_name))
     }
 }
 
-fn strip_vmbus_values(vm_name: &str, report: &mut CleanupReport) {
-    let values = ["ImagePath", "Start", "Type"];
-    for value in values {
-        let script = format!(
-            "if (Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\VMBus' \
-            -Name '{value}' -ErrorAction SilentlyContinue) {{ \
-             Remove-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\VMBus' \
-             -Name '{value}' -Force; Write-Output 'VMBUS_STRIPPED:{value}' \
-             }} else {{ Write-Output 'VMBUS_ABSENT:{value}' }}"
+// ---------------------------------------------------------------------------
+// Free-function entry points used by the stealth layer
+// ---------------------------------------------------------------------------
+
+/// Scan, back up, and remove every known guest artifact.
+pub async fn run_full_cleanup(vm: &VmHandle) -> Result<CleanupReport, GuestArtifactError> {
+    GuestArtifactCleaner::for_vm(vm).full_cleanup().await
+}
+
+/// Restore every backed-up artifact into the guest.
+pub async fn run_full_restore(vm: &VmHandle) -> Result<CleanupReport, GuestArtifactError> {
+    GuestArtifactCleaner::for_vm(vm).full_restore().await
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hyper_v::vm_manager::MockVmManager;
+    use mockall::predicate::*;
+
+    fn test_config() -> StealthConfig {
+        StealthConfig {
+            guest_vm_name: "TestVM".to_string(),
+            backup_directory: PathBuf::from("/tmp/stealth_backups"),
+            guest_restore_root: Some(PathBuf::from(r"C:\Restored\")),
+            ..Default::default()
+        }
+    }
+
+    fn artifact(name: &str) -> GuestArtifact {
+        GuestArtifact {
+            name: name.to_string(),
+            guest_path: PathBuf::from(format!(r"C:\ProgramData\StealthTool\Logs\{}", name)),
+            host_backup_path: PathBuf::from(format!("/tmp/stealth_backups/{}{}", name, BACKUP_SUFFIX)),
+            size_bytes: 1024,
+            is_directory: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_parses_output_correctly() {
+        let mut mock_vm = MockVmManager::new();
+        let json_output = r#"[{"Name":"test.log","FullName":"C:\\ProgramData\\StealthTool\\Logs\\test.log","SizeBytes":1024,"IsDirectory":false}]"#;
+
+        mock_vm
+            .expect_is_vm_running()
+            .with(eq("TestVM"))
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(true) }));
+
+        mock_vm
+            .expect_execute_in_guest()
+            .times(1)
+            .returning(move |_, _| Box::pin(async move { Ok(json_output.to_string()) }));
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        let result = cleaner.scan_for_artifacts().await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "test.log");
+        assert_eq!(
+            result[0].guest_path,
+            PathBuf::from(r"C:\ProgramData\StealthTool\Logs\test.log")
         );
-        match run_in_guest(vm_name, &script) {
-            Ok((stdout, _)) if stdout.contains("VMBUS_STRIPPED") => {
-                report.vmbus_values_removed.push(format!("VMBus\\{value}"));
-            }
-            Ok((stdout, _)) if stdout.contains("VMBUS_ABSENT") => {
-                report.vmbus_values_removed.push(format!("VMBus\\{value} (already absent)"));
-            }
-            Ok((_, stderr)) => {
-                report.errors.push(format!("VMBus '{value}' strip produced unexpected output: {stderr}"));
-            }
-            Err(e) => {
-                report.errors.push(format!("VMBus '{value}' strip failed: {e}"));
-            }
+        assert_eq!(result[0].size_bytes, 1024);
+        assert!(!result[0].is_directory);
+    }
+
+    #[tokio::test]
+    async fn scan_errors_when_vm_not_running() {
+        let mut mock_vm = MockVmManager::new();
+
+        mock_vm
+            .expect_is_vm_running()
+            .with(eq("TestVM"))
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(false) }));
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        let result = cleaner.scan_for_artifacts().await;
+
+        match result.unwrap_err() {
+            GuestArtifactError::VmNotRunning(name) => assert_eq!(name, "TestVM"),
+            other => panic!("expected VmNotRunning, got {:?}", other),
         }
     }
-}
 
-fn stop_vm_services(vm_name: &str, report: &mut CleanupReport) {
-    for svc in VM_SERVICES {
-        let script = format!(
-            "$svc = Get-Service -Name '{svc}' -ErrorAction SilentlyContinue; \
-             if ($svc -and $svc.Status -ne 'Stopped') {{ \
-              Stop-Service -Name '{svc}' -Force -ErrorAction Continue; \
-              Set-Service -Name '{svc}' -StartupType Disabled -ErrorAction Continue; \
-              Write-Output 'STOPPED' \
-             }} elseif ($svc) {{ \
-              Set-Service -Name '{svc}' -StartupType Disabled -ErrorAction Continue; \
-              Write-Output 'ALREADY_STOPPED' \
-             }} else {{ \
-              Write-Output 'NOT_PRESENT' \
-             }}"
+    #[tokio::test(start_paused = true)]
+    async fn scan_times_out() {
+        let mut mock_vm = MockVmManager::new();
+
+        mock_vm
+            .expect_is_vm_running()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(true) }));
+
+        mock_vm.expect_execute_in_guest().times(1).returning(|_, _| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(ARTIFACT_SCAN_TIMEOUT_SECS + 10)).await;
+                Ok(String::new())
+            })
+        });
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        let result = cleaner.scan_for_artifacts().await;
+
+        match result.unwrap_err() {
+            GuestArtifactError::ScanTimeout { timeout_secs } => {
+                assert_eq!(timeout_secs, ARTIFACT_SCAN_TIMEOUT_SECS)
+            }
+            other => panic!("expected ScanTimeout, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_artifact_succeeds() {
+        let mut mock_vm = MockVmManager::new();
+
+        mock_vm
+            .expect_copy_file_from_guest()
+            .with(
+                eq("TestVM"),
+                eq(r"C:\ProgramData\StealthTool\Logs\test.log"),
+                eq("/tmp/stealth_backups/test.log.stealth_bak"),
+            )
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        cleaner.backup_artifact(&artifact("test.log")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_errors_when_backup_missing() {
+        let mock_vm = MockVmManager::new();
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        let result = cleaner.restore_artifact(&artifact("nonexistent.log")).await;
+
+        match result.unwrap_err() {
+            GuestArtifactError::RestoreFailure(_, msg) => {
+                assert!(msg.contains("does not exist"));
+            }
+            other => panic!("expected RestoreFailure, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_artifact_removes_file() {
+        let mut mock_vm = MockVmManager::new();
+
+        mock_vm
+            .expect_copy_file_from_guest()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        mock_vm
+            .expect_execute_in_guest()
+            .with(eq("TestVM"), always())
+            .times(1)
+            .returning(|_, _| {
+                Box::pin(async { Ok(r"REMOVED:C:\ProgramData\StealthTool\Logs\test.log".to_string()) })
+            });
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        cleaner.clean_artifact(&artifact("test.log")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clean_artifact_tolerates_already_removed() {
+        let mut mock_vm = MockVmManager::new();
+
+        mock_vm
+            .expect_copy_file_from_guest()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        mock_vm
+            .expect_execute_in_guest()
+            .with(eq("TestVM"), always())
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok("NOTFOUND:gone".to_string()) }));
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        cleaner.clean_artifact(&artifact("missing.log")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_cleanup_processes_all_artifacts() {
+        let mut mock_vm = MockVmManager::new();
+
+        mock_vm
+            .expect_is_vm_running()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(true) }));
+
+        let json_output = r#"[
+            {"Name":"a.log","FullName":"C:\\ProgramData\\StealthTool\\Logs\\a.log","SizeBytes":100,"IsDirectory":false},
+            {"Name":"b.log","FullName":"C:\\ProgramData\\StealthTool\\Logs\\b.log","SizeBytes":200,"IsDirectory":false}
+        ]"#;
+
+        mock_vm
+            .expect_execute_in_guest()
+            .times(3)
+            .returning(move |_, script| {
+                let is_scan = script.as_string().contains("artifactPaths");
+                Box::pin(async move {
+                    if is_scan {
+                        Ok(json_output.to_string())
+                    } else {
+                        Ok("REMOVED:ok".to_string())
+                    }
+                })
+            });
+
+        mock_vm
+            .expect_copy_file_from_guest()
+            .times(2)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        let report = cleaner.full_cleanup().await.unwrap();
+
+        assert_eq!(report.discovered, 2);
+        assert_eq!(report.cleaned, 2);
+        assert!(report.is_clean());
+    }
+
+    #[tokio::test]
+    async fn full_cleanup_continues_after_individual_failure() {
+        let mut mock_vm = MockVmManager::new();
+
+        mock_vm
+            .expect_is_vm_running()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(true) }));
+
+        let json_output = r#"[
+            {"Name":"good.log","FullName":"C:\\ProgramData\\StealthTool\\Logs\\good.log","SizeBytes":50,"IsDirectory":false},
+            {"Name":"bad.log","FullName":"C:\\ProgramData\\StealthTool\\Logs\\bad.log","SizeBytes":50,"IsDirectory":false}
+        ]"#;
+
+        mock_vm
+            .expect_execute_in_guest()
+            .times(3)
+            .returning(move |_, script| {
+                let s = script.as_string().to_string();
+                let is_scan = s.contains("artifactPaths");
+                let is_bad = s.contains("bad.log");
+                Box::pin(async move {
+                    if is_scan {
+                        Ok(json_output.to_string())
+                    } else if is_bad {
+                        Err(StealthError::GuestServices("unavailable".into()))
+                    } else {
+                        Ok("REMOVED:ok".to_string())
+                    }
+                })
+            });
+
+        mock_vm
+            .expect_copy_file_from_guest()
+            .times(2)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        let cleaner = GuestArtifactCleaner::new(test_config(), mock_vm);
+        let report = cleaner.full_cleanup().await.unwrap();
+
+        // Both discovered, one cleaned, one recorded as failed.
+        assert_eq!(report.discovered, 2);
+        assert_eq!(report.cleaned, 1);
+        assert_eq!(report.failed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_restore_returns_empty_when_no_backup_dir() {
+        let mock_vm = MockVmManager::new();
+        let mut config = test_config();
+        config.backup_directory = PathBuf::from("/tmp/definitely_does_not_exist_dir");
+
+        let cleaner = GuestArtifactCleaner::new(config, mock_vm);
+        let report = cleaner.full_restore().await.unwrap();
+
+        assert_eq!(report.restored, 0);
+    }
+
+    #[tokio::test]
+    async fn parse_scan_output_handles_empty() {
+        let cleaner = GuestArtifactCleaner::new(test_config(), MockVmManager::new());
+        assert!(cleaner.parse_scan_output("").unwrap().is_empty());
+        assert!(cleaner.parse_scan_output("null").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_scan_output_handles_single_object() {
+        let cleaner = GuestArtifactCleaner::new(test_config(), MockVmManager::new());
+
+        // ConvertTo-Json emits a bare object for one item.
+        let single_json =
+            r#"{"Name":"only.log","FullName":"C:\\Temp\\only.log","SizeBytes":42,"IsDirectory":false}"#;
+
+        let parsed = cleaner.parse_scan_output(single_json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "only.log");
+    }
+
+    #[tokio::test]
+    async fn parse_scan_output_handles_missing_optional_fields() {
+        let cleaner = GuestArtifactCleaner::new(test_config(), MockVmManager::new());
+
+        let json = r#"[{"Name":"x.log","FullName":"C:\\Temp\\x.log"}]"#;
+        let parsed = cleaner.parse_scan_output(json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].size_bytes, 0);
+        assert!(!parsed[0].is_directory);
+    }
+
+    #[tokio::test]
+    async fn derive_guest_path_strips_suffix() {
+        let cleaner = GuestArtifactCleaner::new(test_config(), MockVmManager::new());
+
+        let guest_path = cleaner
+            .derive_guest_path(Path::new("/tmp/stealth_backups/myfile.log.stealth_bak"))
+            .unwrap();
+
+        assert_eq!(guest_path, PathBuf::from(r"C:\Restored\myfile.log"));
+    }
+
+    #[tokio::test]
+    async fn backup_creates_directory() {
+        let mut mock_vm = MockVmManager::new();
+
+        mock_vm
+            .expect_copy_file_from_guest()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+
+        let dir = std::env::temp_dir().join("stealth_test_backup_creation");
+        let mut config = test_config();
+        config.backup_directory = dir.clone();
+
+        let mut a = artifact("dir_test.log");
+        a.host_backup_path = dir.join("dir_test.log.stealth_bak");
+
+        let cleaner = GuestArtifactCleaner::new(config, mock_vm);
+        cleaner.backup_artifact(&a).await.unwrap();
+
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn guest_artifact_error_display() {
+        assert_eq!(
+            GuestArtifactError::VmNotRunning("MyVM".to_string()).to_string(),
+            "VM 'MyVM' is not in a running state"
         );
-        match run_in_guest(vm_name, &script) {
-            Ok((stdout, _)) if stdout.contains("STOPPED") => {
-                report.services_stopped.push((*svc).to_string());
-            }
-            Ok((stdout, _)) if stdout.contains("ALREADY_STOPPED") => {
-                report.services_already_stopped.push((*svc).to_string());
-            }
-            Ok((stdout, _)) if stdout.contains("NOT_PRESENT") => {
-                report.services_already_stopped.push(format!("{svc} (not present)"));
-            }
-            Ok((_, stderr)) => {
-                report.services_failed.push(format!("{svc}: unexpected output: {stderr}"));
-            }
-            Err(e) => {
-                report.services_failed.push(format!("{svc}: {e}"));
-            }
-        }
-    }
-}
-
-fn remove_virtual_drivers(vm_name: &str, report: &mut CleanupReport) {
-    let script = r#"
-    // Remove device drivers:
-    pnputil /remove-device oem*.inf;
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.drivers_removed.push("oem*.inf".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("driver removal failed: {e}"));
-        }
-    }
-}
-
-fn clear_hyper_v_event_logs(vm_name: &str, report: &mut CleanupReport) {
-    let script = r#"
-    // Remove event logs:
-    wevtutil cl Microsoft-Windows-Hyper-V*;
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.event_logs_cleared.push("Microsoft-Windows-Hyper-V*".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("event log clearing failed: {e}"));
-        }
-    }
-}
-
-fn unregister_hyper_v_tasks(vm_name: &str, report: &mut CleanupReport) {
-    let script = r#"
-    // Remove scheduled tasks:
-    Unregister-ScheduledTask \Microsoft\Windows\Hyper-V*;
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.scheduled_tasks_unregistered.push("\\Microsoft\\Windows\\Hyper-V*".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("scheduled task unregistration failed: {e}"));
-        }
-    }
-}
-
-fn remove_hyper_v_firewall_rules(vm_name: &str, report: &mut CleanupReport) {
-    let script = r#"
-    // Remove firewall rules:
-    Remove-NetFirewallRule -DisplayName "Hyper-V";
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.firewall_rules_removed.push("Hyper-V".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("firewall rule removal failed: {e}"));
-        }
-    }
-}
-
-fn rename_display_adapter(vm_name: &str, report: &mut CleanupReport) {
-    let script = r#"
-    // Rename the virtual display adapter to match physical GPU entries.
-    # Get list of physical GPU entries from backup
-    $gpus = Get-Content -Path "C:\ProgramData\StealthBackup\drivers\list.txt" | Where-Object { $_ -match 'PCI\\VEN_1002' }
-
-    if ($gpus.Count -gt 0) {
-        # Choose a random physical GPU to rename the virtual adapter
-        $selected_gpu = Get-Random -InputObject $gpus
-
-        # Rename the virtual display adapter using pnputil
-        pnputil /add-driver "C:\ProgramData\StealthBackup\drivers\$selected_gpu" /install
-    } else {
-        Write-Output 'No physical GPU entries found for renaming'
-    }
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.display_adapter_renamed = Some("Virtual Display Adapter".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("display adapter renaming failed: {e}"));
-        }
-    }
-}
-
-fn run_powershell_in_guest(script: &str, vm_name: &str) -> Result<(), StealthError> {
-    use std::os::windows::process::CommandExt;
-
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .output()
-        .map_err(|e| StealthError::from(format!("Failed to run PowerShell script: {e}")))?;
-
-    if !output.status.success() {
-        return Err(StealthError::from(format!(
-            "PowerShell script failed with stdout: {} and stderr: {}",
-            output.stdout,
-            output.stderr
-        )));
-    }
-
-    Ok(())
-}
-
-fn run_in_guest(vm_name: &str, script: &str) -> Result<(String, String), StealthError> {
-    let output = run_powershell_in_guest(script, vm_name)?;
-    Ok((String::from_utf8_lossy(&output.stdout).to_string(), String::from_utf8_lossy(&output.stderr).to_string()))
-}
-
-fn uninstall_integration_services(vm_name: &str, report: &mut CleanupReport) {
-    let script = r#"
-    // Uninstall Integration Services:
-    msiexec /x {GUID} /quiet /norestart
-    dism /online /remove-package /packagepath:C:\Windows\servicing\Packages\Microsoft-Windows-Hyper-V-IntegrationServices-Package~31bf3856ad364e35~amd64~en-us~~19041.1972.2.0.mum
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.integration_services_uninstalled = true;
-        }
-        Err(e) => {
-            report.errors.push(format!("Integration Services uninstallation failed: {e}"));
-        }
-    }
-}
-
-fn restore_scheduled_tasks(vm_name: &str, report: &mut RestoreReport) {
-    let script = r#"
-    # Restore scheduled tasks
-    Get-Content -Path "C:\ProgramData\StealthBackup\tasks\all.xml" | ForEach-Object { Import-ScheduledTask -InputObject $_ }
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.scheduled_tasks_restored.push("All".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("scheduled task restoration failed: {e}"));
-        }
-    }
-}
-
-fn restore_firewall_rules(vm_name: &str, report: &mut RestoreReport) {
-    let script = r#"
-    # Restore firewall rules
-    Get-Content -Path "C:\ProgramData\StealthBackup\firewall\rules.txt" | ForEach-Object { 
-        $parts = $_ -split '\|'
-        New-NetFirewallRule -DisplayName $parts[1] -Enabled $parts[2] -Direction $parts[3] -Action $parts[4] -Profile $parts[5]
-    }
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.firewall_rules_restored.push("All".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("firewall rule restoration failed: {e}"));
-        }
-    }
-}
-
-fn restore_event_logs(vm_name: &str, report: &mut RestoreReport) {
-    let script = r#"
-    # Restore event log configuration
-    Get-Content -Path "C:\ProgramData\StealthBackup\eventlogs\list.txt" | ForEach-Object { wevtutil el $_ }
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.event_logs_restored.push("All".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("event log restoration failed: {e}"));
-        }
-    }
-}
-
-fn restore_drivers(vm_name: &str, report: &mut RestoreReport) {
-    let script = r#"
-    # Restore drivers
-    Get-Content -Path "C:\ProgramData\StealthBackup\drivers\list.txt" | ForEach-Object { pnputil /add-driver C:\ProgramData\StealthBackup\drivers\$_.inf /install }
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.drivers_restored.push("All".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("driver restoration failed: {e}"));
-        }
-    }
-}
-
-fn restore_registry_keys(vm_name: &str, report: &mut RestoreReport) {
-    let script = r#"
-    # Restore full registry keys
-    Get-ChildItem -Path "C:\ProgramData\StealthBackup\registry" | ForEach-Object { reg import "$_.reg" }
-    "#;
-    match run_in_guest(vm_name, script) {
-        Ok(_) => {
-            report.registry_keys_restored.push("All".to_string());
-        }
-        Err(e) => {
-            report.errors.push(format!("registry key restoration failed: {e}"));
-        }
-    }
-}
-
-fn restart_vm_services(vm_name: &str, report: &mut RestoreReport) {
-    for svc in VM_SERVICES {
-        let script = format!(
-            "Start-Service -Name '{svc}'",
-            svc = svc
+        assert_eq!(
+            GuestArtifactError::ScanTimeout { timeout_secs: 300 }.to_string(),
+            "Artifact scan timed out after 300 seconds"
         );
-        match run_in_guest(vm_name, &script) {
-            Ok(_) => {
-                report.services_restarted.push((*svc).to_string());
-            }
-            Err(e) => {
-                report.services_failed.push(format!("{svc}: {e}"));
-            }
-        }
+        assert_eq!(
+            GuestArtifactError::BackupFailure("/p".into(), "disk full".into()).to_string(),
+            "Failed to backup artifact at '/p': disk full"
+        );
+    }
+
+    #[test]
+    fn guest_artifact_error_converts_to_stealth_error() {
+        let err: StealthError = GuestArtifactError::VmNotRunning("VM".into()).into();
+        assert!(matches!(err, StealthError::GuestArtifact(_)));
     }
 }

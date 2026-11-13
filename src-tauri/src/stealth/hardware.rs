@@ -1,5 +1,7 @@
 use std::process::Command;
 use rand::Rng;
+use std::fmt;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct HardwareProfile {
@@ -46,8 +48,40 @@ pub struct VmHandle {
     pub vhdx_path: String,
 }
 
+impl VmHandle {
+    /// Creates a handle from a VM name and the path to its VHDX disk image.
+    pub fn new(vm_name: impl Into<String>, vhdx_path: impl Into<String>) -> Self {
+        Self {
+            vm_name: vm_name.into(),
+            vhdx_path: vhdx_path.into(),
+        }
+    }
+
+    /// The VM's name, as registered with the hypervisor.
+    pub fn name(&self) -> &str {
+        &self.vm_name
+    }
+
+    /// Path to the VM's VHDX disk image.
+    pub fn vhdx_path(&self) -> &Path {
+        Path::new(&self.vhdx_path)
+    }
+}
+
+impl VmHandle {
+    pub fn open(vm_name: impl Into<String>) -> Result<Self, String> {
+        Ok(Self::new(vm_name, String::new()))
+    }
+}
+
+impl fmt::Display for VmHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.vm_name, self.vhdx_path)
+    }
+}
+
 #[derive(Debug)]
-pub struct StealthError(String);
+pub struct StealthError(pub String);
 
 impl std::fmt::Display for StealthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

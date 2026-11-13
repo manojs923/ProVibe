@@ -20,8 +20,11 @@
 use crate::stealth::StealthError;
 use crate::vm::lifecycle::VmHandle;
 
+use std::io::{Read, Write};
 use std::process::Stdio;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
+
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -49,8 +52,21 @@ const INTEL_VENDOR_STRING: &str = "GenuineIntel";
 /// Default timeout for a PowerShell host invocation.
 const HOST_PS_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Poll granularity for the blocking runner's wait loop.
+const SYNC_POLL: Duration = Duration::from_millis(50);
+
 /// Deadline for the post-unmask verification loop.
 const UNMASK_VERIFY_TIMEOUT_SECS: u64 = 120;
+
+/// Shared argument vector for every host PowerShell invocation.
+const PS_ARGS: [&str; 6] = [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    "-",
+];
 
 // ---------------------------------------------------------------------------
 // Public async API
@@ -68,17 +84,19 @@ pub async fn mask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> {
 
     let output = run_powershell_on_host(&script).await?;
 
-    if !output.contains("MASK_COMPLETE") {
-        return Err(StealthError::ScriptFailure(format!(
-            "mask_hypervisor: script did not reach MASK_COMPLETE sentinel. \
-             Output:\n{}",
+    // Failure sentinels are emitted before the script exits, so check them
+    // first — otherwise a hard failure reads as a missing sentinel.
+    if output.contains("MASK_FAILED:HideHypervisorPresent") {
+        return Err(StealthError::CpuidFailure(format!(
+            "mask_hypervisor: HideHypervisorPresent failed. Output:\n{}",
             output
         )));
     }
 
-    if output.contains("MASK_FAILED:HideHypervisorPresent") {
-        return Err(StealthError::ScriptFailure(format!(
-            "mask_hypervisor: HideHypervisorPresent failed. Output:\n{}",
+    if !output.contains("MASK_COMPLETE") {
+        return Err(StealthError::CpuidFailure(format!(
+            "mask_hypervisor: script did not reach MASK_COMPLETE sentinel. \
+             Output:\n{}",
             output
         )));
     }
@@ -99,7 +117,7 @@ pub async fn unmask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> 
     let output = run_powershell_on_host(&script).await?;
 
     if output.contains("Unmask verification failed") {
-        return Err(StealthError::VerificationFailed(format!(
+        return Err(StealthError::CpuidFailure(format!(
             "unmask_hypervisor: guest did not re-report HypervisorPresent \
              within {}s. Output:\n{}",
             UNMASK_VERIFY_TIMEOUT_SECS, output
@@ -111,8 +129,8 @@ pub async fn unmask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> 
 
 /// Capability check: can the current host apply CPUID masking?
 ///
-/// Requires Hyper-V PowerShell module and the `Set-VMProcessor` cmdlet to
-/// expose the `HideHypervisorPresent` parameter (Windows 10 1803+ /
+/// Requires the Hyper-V PowerShell module and a `Set-VMProcessor` that
+/// exposes the `HideHypervisorPresent` parameter (Windows 10 1803+ /
 /// Windows Server 2019+).
 pub fn host_supports_masking() -> bool {
     let probe = r#"
@@ -130,14 +148,8 @@ try {
 "#;
 
     match std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            probe,
-        ])
+        .args(PS_ARGS)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -152,7 +164,7 @@ try {
 // ---------------------------------------------------------------------------
 
 /// Primary masking script — sets HideHypervisorPresent and clears
-/// virtualization extension exposure. Can apply while VM is running
+/// virtualization extension exposure. Can apply while the VM is running
 /// (live update) or offline.
 pub fn build_mask_script(vm_name: &str) -> String {
     format!(
@@ -232,7 +244,7 @@ Write-Output "MASK_COMPLETE"
 }
 
 /// Unmask script — restores hypervisor visibility. Used during rollback
-/// or when destroying VM.
+/// or when destroying the VM.
 pub fn build_unmask_script(vm_name: &str) -> String {
     let mut s = String::new();
 
@@ -293,7 +305,7 @@ pub fn build_unmask_script(vm_name: &str) -> String {
     s.push_str("    }\n");
     s.push_str("}\n\n");
 
-    // 5. Signal guest-side agent to undo registry edits.
+    // 5. Signal the guest-side agent to undo registry edits.
     s.push_str("# Signal guest-side agent to undo registry edits\n");
     s.push_str(&format!(
         "try {{\n    $maskKey = \"HKLM:\\SOFTWARE\\MaskAgent\\{}\"\n",
@@ -328,10 +340,7 @@ pub fn build_unmask_script(vm_name: &str) -> String {
     ));
     s.push_str("$ok = $false\n");
     s.push_str("while ((Get-Date) -lt $deadline) {\n");
-    s.push_str(&format!(
-        "    $state = (Get-VM -Name \"{}\").State\n",
-        vm_name
-    ));
+    s.push_str(&format!("    $state = (Get-VM -Name \"{}\").State\n", vm_name));
     s.push_str("    if ($state -eq 'Running') {\n");
     s.push_str("        try {\n");
     s.push_str(&format!(
@@ -359,21 +368,24 @@ pub fn build_unmask_script(vm_name: &str) -> String {
 // Host PowerShell invocation
 // ---------------------------------------------------------------------------
 
+/// Merge stdout and stderr into one blob so callers can look for sentinels
+/// regardless of which stream PowerShell chose.
+fn combine_streams(stdout: String, stderr: String) -> String {
+    if stderr.is_empty() {
+        stdout
+    } else {
+        format!("{}\n[STDERR]\n{}", stdout, stderr)
+    }
+}
+
 /// Run a PowerShell script on the host and capture combined stdout/stderr.
 ///
 /// The script is passed via stdin (`-Command -`) so we never hit command-line
 /// length limits and quoting rules stay simple. A hard timeout guards against
 /// hung WinRM/VSMS calls.
-async fn run_powershell_on_host(script: &str) -> Result<String, StealthError> {
+pub(crate) async fn run_powershell_on_host(script: &str) -> Result<String, StealthError> {
     let mut child = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "-",
-        ])
+        .args(PS_ARGS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -400,25 +412,90 @@ async fn run_powershell_on_host(script: &str) -> Result<String, StealthError> {
             )))
         }
         Err(_) => {
-            return Err(StealthError::HostInvocation(format!(
-                "powershell.exe timed out after {:?}",
-                HOST_PS_TIMEOUT
-            )))
+            return Err(StealthError::PowerShellFailure {
+                exit_code: -1,
+                stderr: format!("powershell.exe timed out after {:?}", HOST_PS_TIMEOUT),
+            })
         }
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // Combine stdout and stderr so callers can inspect error output
-    // from PowerShell alongside the normal sentinel lines.
-    let combined = if stderr.is_empty() {
-        stdout
-    } else {
-        format!("{}\n[STDERR]\n{}", stdout, stderr)
-    };
+    Ok(combine_streams(stdout, stderr))
+}
 
-    Ok(combined)
+/// Blocking variant of [`run_powershell_on_host`], for call sites that are
+/// not on a Tokio runtime or cannot await (rollback paths).
+///
+/// Stdout/stderr are drained on helper threads so a large script result can
+/// never deadlock against the wait loop.
+pub fn run_powershell_on_host_sync(script: &str) -> Result<String, StealthError> {
+    let mut child = std::process::Command::new("powershell.exe")
+        .args(PS_ARGS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            StealthError::HostInvocation(format!("failed to spawn powershell.exe: {}", e))
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes()).map_err(|e| {
+            StealthError::HostInvocation(format!("failed to write script to stdin: {}", e))
+        })?;
+    }
+
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+
+    let out_reader = out_pipe.take().map(|mut p| {
+        thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = p.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let err_reader = err_pipe.take().map(|mut p| {
+        thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = p.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = Instant::now() + HOST_PS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(StealthError::PowerShellFailure {
+                    exit_code: -1,
+                    stderr: format!("powershell.exe timed out after {:?}", HOST_PS_TIMEOUT),
+                });
+            }
+            Ok(None) => thread::sleep(SYNC_POLL),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(StealthError::HostInvocation(format!(
+                    "powershell.exe wait failed: {}",
+                    e
+                )));
+            }
+        }
+    }
+
+    let stdout = out_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = err_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    Ok(combine_streams(stdout, stderr))
 }
 
 // ---------------------------------------------------------------------------
@@ -430,34 +507,48 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_mask_unmask_cycle() {
-        // This test assumes a Hyper-V host with a test VM named "TestVM"
+    async fn mask_unmask_cycle() {
+        // Assumes a Hyper-V host with a test VM named "TestVM".
         let vm_handle = VmHandle::new("TestVM");
 
-        // Mask the hypervisor
         let mask_result = mask_hypervisor(vm_handle.clone()).await;
         assert!(mask_result.is_ok(), "Masking failed: {:?}", mask_result);
 
-        // Unmask the hypervisor
-        let unmask_result = unmask_hypervisor(vm_handle.clone()).await;
+        let unmask_result = unmask_hypervisor(vm_handle).await;
         assert!(unmask_result.is_ok(), "Unmasking failed: {:?}", unmask_result);
     }
 
     #[test]
-    fn test_host_supports_masking() {
-        let supported = host_supports_masking();
-        assert!(supported, "Host does not support masking");
+    fn host_reports_masking_support() {
+        assert!(host_supports_masking(), "Host does not support masking");
     }
 
     #[test]
-    fn test_build_mask_script() {
+    fn mask_script_sets_hide_hypervisor() {
         let script = build_mask_script("TestVM");
         assert!(script.contains("Set-VMProcessor -VMName $vmName -HideHypervisorPresent $true"));
+        assert!(script.contains("MASK_COMPLETE"));
     }
 
     #[test]
-    fn test_build_unmask_script() {
+    fn unmask_script_clears_hide_hypervisor() {
         let script = build_unmask_script("TestVM");
         assert!(script.contains("Set-VMProcessor -VMName \"TestVM\" -HideHypervisorPresent $false"));
+        assert!(script.contains("UNMASK_COMPLETE"));
+    }
+
+    #[test]
+    fn scripts_embed_the_vm_name() {
+        assert!(build_mask_script("Alpha").contains("'Alpha'"));
+        assert!(build_unmask_script("Beta").contains("\"Beta\""));
+    }
+
+    #[test]
+    fn mask_script_has_balanced_format_braces() {
+        // A stray single brace would make format! panic; this asserts the
+        // rendered script still contains real PowerShell blocks.
+        let script = build_mask_script("TestVM");
+        assert!(script.contains("try {"));
+        assert!(script.contains("catch {"));
     }
 }

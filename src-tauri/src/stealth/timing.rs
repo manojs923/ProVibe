@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use crate::stealth::StealthError;
-
+use crate::stealth::hardware::{TargetProfile, VmHandle};
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------

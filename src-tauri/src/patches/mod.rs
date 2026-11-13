@@ -11,7 +11,9 @@ pub mod generic;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::process::Command;
-use crate::stealth::VmHandle;
+use crate::vm::lifecycle::VmHandle;
+
+use crate::patches::generic::get_patches;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PatchResult {
@@ -207,7 +209,7 @@ pub fn load_patches(target_id: &str) -> Vec<Patch> {
         "proctorio" => proctorio::get_patches(),
         "proctoru" => proctoru::get_patches(),
         "honorlock" => honorlock::get_patches(),
-        "examity" => examity::get_patches(),
+        "examity" => get_patches(),
         _ => {
             // Fallback to generic stealth patches if target is unknown or unspecified
             println!("Target ID '{}' not recognized. Loading generic patch set.", target_id);

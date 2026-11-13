@@ -1,0 +1,578 @@
+// src-tauri/src/rdp/mod.rs
+//
+// Loopback RDP Tunneling — module root.
+//
+// The whole point of this subsystem is the optical air-gap: we never touch VM
+// memory, we never inject into the guest. We spawn mstsc.exe pointed at the
+// loopback adapter (127.0.0.2), then capture the *rendered pixels on the host
+// monitor*. The VM is a black box; everything we know about it comes through
+// what RDP draws on our screen and what audio it redirects back to us.
+//
+// Pipeline:
+//   client.rs  -> spawns mstsc.exe with a generated .rdp config
+//   stream.rs  -> captures the mstsc window's rendered output (optical gap)
+//   audio.rs   -> taps RDP audio redirection for speech-to-text
+//   input.rs   -> optional synthetic input forwarding (per-profile gated)
+
+pub mod client;
+pub mod stream;
+pub mod audio;
+pub mod input;
+
+use std::net::TcpStream;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::Serialize;
+use thiserror::Error;
+
+use crate::rdp::audio::{AudioSegment, AudioTap};
+use crate::rdp::client::{RDPClientHandle, RdpClient};
+use crate::rdp::input::{InputConfig, InputForwarder, InputPolicy};
+use crate::rdp::stream::{Frame, RdpStream as StreamCapture, StreamConfig};
+
+// -----------------------------------------------------------------------------
+// Expected `RdpClient` surface (documented contract for client.rs)
+// -----------------------------------------------------------------------------
+//
+//   impl RdpClient {
+//       pub fn new(cfg: &TunnelConfig) -> Self;
+//       pub fn spawn(&mut self) -> Result<(), RdpClientError>;
+//       pub fn wait_for_desktop(&mut self) -> Result<Duration, RdpClientError>;
+//       pub fn is_alive(&self) -> bool;
+//       pub fn ever_connected(&self) -> bool;
+//       pub fn kill(&mut self) -> Result<(), RdpClientError>;
+//       pub fn handle(&self) -> Option<RDPClientHandle>; // Some(_) iff spawn+wait succeeded
+//   }
+//
+// Expected `RdpStream` (aliased as `StreamCapture`) surface:
+//
+//   impl RdpStream {
+//       pub fn new(cfg: StreamConfig) -> Self;
+//       pub fn attach_to_client_window(&mut self, handle: &RDPClientHandle)
+//           -> Result<(), StreamError>;
+//       pub fn latest_frame(&self) -> Option<Frame>;
+//       pub fn stop(&mut self);
+//   }
+//
+// If your current client.rs/stream.rs exports differ, the only call sites are
+// `connect()`, `teardown()`, and `state()` below — one line each. Adjust names
+// there rather than scattering shims through the module.
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TunnelStatus {
+    pub active: bool,
+    pub local_port: u16,
+    pub remote_host: String,
+    pub remote_port: u16,
+    pub latency_ms: Option<u64>,
+    pub adapter_name: String,
+}
+
+#[tauri::command]
+pub fn get_tunnel_status(local_port: Option<u16>) -> Result<TunnelStatus, String> {
+    let port = local_port.unwrap_or(3389);
+
+    let sock_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
+        .parse()
+        .map_err(|e: std::net::AddrParseError| e.to_string())?;
+
+    // Check if something is listening on the RDP port.
+    let listener_active =
+        TcpStream::connect_timeout(&sock_addr, Duration::from_millis(500)).is_ok();
+
+    // Check loopback adapter existence.
+    let adapter_output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetAdapter | Where-Object { $_.Name -like '*Loopback*' -or $_.Name -like '*RDP*' -or $_.Name -like '*Tunnel*' } | Select-Object Name, Status | ConvertTo-Json",
+        ])
+        .output()
+        .map_err(|e| format!("Adapter check failed: {}", e))?;
+
+    let adapter_info = String::from_utf8_lossy(&adapter_output.stdout);
+    let adapter_name = if adapter_info.contains("Up") {
+        adapter_info
+            .lines()
+            .find(|l| l.contains("Name"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .unwrap_or_else(|| "Unknown".to_string())
+    } else {
+        "None".to_string()
+    };
+
+    // Measure latency if active.
+    let latency = if listener_active {
+        let start = std::time::Instant::now();
+        if TcpStream::connect_timeout(&sock_addr, Duration::from_secs(1)).is_ok() {
+            Some(start.elapsed().as_millis() as u64)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(TunnelStatus {
+        active: listener_active,
+        local_port: port,
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: port,
+        latency_ms: latency,
+        adapter_name,
+    })
+}
+
+/// Tunneled-session errors surfaced up through the orchestrator.
+#[derive(Debug, Error)]
+pub enum RdpError {
+    // --- Lifecycle / spawn ---
+    #[error("mstsc.exe failed to spawn: {0}")]
+    ClientSpawn(String),
+
+    #[error("RDP handshake timed out after {0} ms — guest may not be listening on 127.0.0.2")]
+    HandshakeTimeout(u64),
+
+    #[error("client handle unavailable — spawn did not complete")]
+    HandleUnavailable,
+
+    #[error("session is not connected")]
+    NotConnected,
+
+    #[error("subsystem already initialized: {0}")]
+    AlreadyInitialized(&'static str),
+
+    #[error("invalid remote PID (0 is not a valid process identifier)")]
+    InvalidPid,
+
+    // --- Wrapped subsystem errors ---
+    #[error("client error: {0}")]
+    Client(#[from] ClientError),
+
+    #[error("stream error: {0}")]
+    Stream(#[from] StreamError),
+
+    #[error("input error: {0}")]
+    Input(#[from] InputError),
+
+    // --- Variants from the first definition, not used in this file ---
+    #[error("stream capture lost its target window (mstsc closed or minimized to tray)")]
+    StreamLost,
+
+    #[error("audio redirection endpoint unavailable: {0}")]
+    AudioUnavailable(String),
+
+    #[error("input forwarding rejected by policy — target profile forbids synthetic input")]
+    InputPolicyDenied,
+
+    #[error("input subsystem not initialized — call connect() first")]
+    InputNotReady,
+
+    #[error("tunnel already torn down")]
+    AlreadyDisconnected,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TunnelStartResult {
+    pub success: bool,
+    pub adapter_name: String,
+    pub ip_address: String,
+    pub message: String,
+}
+
+#[tauri::command]
+pub fn start_loopback_tunnel_cmd(
+    adapter_name: Option<String>,
+    ip_address: Option<String>,
+) -> Result<TunnelStartResult, String> {
+    let adapter = adapter_name.unwrap_or_else(|| "ProtocolLoopback".to_string());
+    let ip = ip_address.unwrap_or_else(|| "192.168.137.1".to_string());
+
+    let install_script = format!(
+        r#"
+        $existing = Get-NetAdapter -Name '{adapter}' -ErrorAction SilentlyContinue
+        if (-not $existing) {{
+            $devconPath = "C:\Program Files (x86)\Windows Kits\10\Tools\x64\devcon.exe"
+            if (Test-Path $devconPath) {{
+                & $devconPath install $env:WINDIR\INF\netloop.inf *MSLOOP
+            }} else {{
+                Install-WindowsFeature -Name RSAT-Loopback -ErrorAction SilentlyContinue
+            }}
+            Start-Sleep -Seconds 2
+            $adapters = Get-NetAdapter | Where-Object {{ $_.InterfaceDescription -like '*Loopback*' }} | Sort-Object ifIndex | Select-Object -Last 1
+            if ($adapters) {{ Rename-NetAdapter -Name $adapters.Name -NewName '{adapter}' }}
+        }}
+        Enable-NetAdapter -Name '{adapter}' -Confirm:$false
+        "#,
+        adapter = adapter
+    );
+
+    Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &install_script])
+        .output()
+        .map_err(|e| format!("Adapter installation failed: {}", e))?;
+
+    let ip_script = format!(
+        r#"
+        $iface = Get-NetAdapter -Name '{adapter}'
+        $iface | New-NetIPAddress -IPAddress {ip} -PrefixLength 24 -ErrorAction SilentlyContinue
+        $iface | Set-NetIPInterface -InterfaceMetric 5
+        "#,
+        adapter = adapter,
+        ip = ip
+    );
+
+    let ip_output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ip_script])
+        .output()
+        .map_err(|e| format!("IP assignment failed: {}", e))?;
+
+    let success = ip_output.status.success();
+
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'",
+        ])
+        .output()
+        .map_err(|e| format!("RDP enable failed: {}", e))?;
+
+    Ok(TunnelStartResult {
+        success,
+        adapter_name: adapter,
+        ip_address: ip,
+        message: if success {
+            "Loopback tunnel established".to_string()
+        } else {
+            "Adapter created but IP assignment may have failed".to_string()
+        },
+    })
+}
+
+#[tauri::command]
+pub fn stop_loopback_tunnel(adapter_name: Option<String>) -> Result<String, String> {
+    let adapter = adapter_name.unwrap_or_else(|| "ProtocolLoopback".to_string());
+
+    let script = format!(
+        r#"
+        $adapter = Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue
+        if ($adapter) {{
+            Disable-NetAdapter -Name '{}' -Confirm:$false
+            Write-Output "Disabled"
+        }} else {{
+            Write-Output "NotFound"
+        }}
+        "#,
+        adapter, adapter
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| format!("Stop tunnel failed: {}", e))?;
+
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    match result.as_str() {
+        "Disabled" => Ok(format!("Tunnel adapter '{}' disabled", adapter)),
+        "NotFound" => Ok("No active tunnel found".to_string()),
+        _ => Err(format!("Unexpected result: {}", result)),
+    }
+}
+
+/// Lifecycle of a single tunnel instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelState {
+    /// mstsc.exe not yet spawned.
+    Idle,
+    /// Client launched, waiting for the logon desktop to paint.
+    Connecting,
+    /// Full desktop rendered, capture loop running.
+    Live,
+    /// teardown() called; draining capture buffers.
+    Disconnecting,
+    /// Dead. Requires a new RDPTunnel to retry.
+    Closed,
+}
+
+/// Global tunnel configuration — mutated per target profile before connect.
+#[derive(Debug, Clone)]
+pub struct TunnelConfig {
+    /// Loopback address the VM's private vSwitch is NAT'd to.
+    pub loopback_addr: String, // default "127.0.0.2"
+    /// Stored guest credentials for silent connect (no credential prompt).
+    pub username: String,
+    pub password: String,
+    pub domain: Option<String>,
+    /// Host-side render resolution of the mstsc window.
+    pub desktop_width: u32,
+    pub desktop_height: u32,
+    /// Whether audio redirection is enabled for this session.
+    pub audio_redirection: bool,
+    /// Input policy — some lockdown browsers fingerprint synthetic input.
+    pub input_policy: InputPolicy,
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            loopback_addr: "127.0.0.2".to_string(),
+            username: String::new(),
+            password: String::new(),
+            domain: None,
+            desktop_width: 1920,
+            desktop_height: 1080,
+            audio_redirection: true,
+            input_policy: InputPolicy::Forbidden, // safe default: off
+        }
+    }
+}
+
+/// The public face of the rdp subsystem. Holds one live mstsc session.
+///
+/// The VM orchestrator constructs this after `verify_rdp_ready()` returns
+/// true on the guest side, then hands the `Frame` stream to the AI engine's
+/// WebSocket ingress.
+pub struct RDPTunnel {
+    config: TunnelConfig,
+    client: RdpClient,
+    stream: StreamCapture,
+    audio: AudioTap,
+    /// None until `connect()` succeeds — we cannot build an InputForwarder
+    /// without a real PID + window title, and we refuse to fabricate one
+    /// with a zero sentinel (that was the old footgun).
+    input: Option<InputForwarder>,
+    running: Arc<AtomicBool>,
+}
+
+impl RDPTunnel {
+    pub fn new(config: TunnelConfig) -> Self {
+        let running = Arc::new(AtomicBool::new(false));
+        let client = RdpClient::new(&config);
+        let audio = AudioTap::new(config.audio_redirection);
+
+        Self {
+            client,
+            stream: None,
+            audio,
+            input: None,
+            running,
+            config,
+        }
+    }
+
+    /// Current lifecycle state, derived from subsystem health.
+    pub fn state(&self) -> TunnelState {
+        if !self.running.load(Ordering::SeqCst) {
+            return if self.client.ever_connected() {
+                TunnelState::Closed
+            } else {
+                TunnelState::Idle
+            };
+        }
+        if self.client.is_alive() {
+            TunnelState::Live
+        } else {
+            TunnelState::Disconnecting
+        }
+    }
+
+    /// Spawn mstsc.exe with the generated .rdp file, wait for the logon
+    /// desktop to paint, then arm the optical capture loop and audio tap.
+    /// Input forwarding is initialized separately via `init_input()` once
+    /// the guest reports a stable PID.
+    pub fn connect(&mut self) -> Result<(), RdpError> {
+        if self.running.load(Ordering::SeqCst) {
+            // Idempotent: a live tunnel just no-ops.
+            return Ok(());
+        }
+
+        self.client
+            .spawn()
+            .map_err(|e| RdpError::ClientSpawn(e.to_string()))?;
+
+        self.client
+            .wait_for_desktop()
+            .map_err(|e| RdpError::HandshakeTimeout(e.as_millis() as u64))?;
+
+        // Materialize the real handle *after* spawn + desktop-paint so that
+        // PID and window title are guaranteed valid. No sentinel values.
+        let handle = self
+            .client
+            .handle()
+            .ok_or(RdpError::HandleUnavailable)?;
+
+        tracing::info!(
+            pid = handle.pid(),
+            window = %handle.window_title(),
+            "RDP client handle acquired; attaching subsystems"
+        );
+
+        // Attach capture *before* flipping the running flag so no frame is
+        // ever missed between desktop-paint and capture-start.
+        let capture = StreamCapture::new(self.config.capture.clone())
+            .attach_to_client_window(&handle)
+            .map_err(RdpError::Stream)?;
+        self.stream = Some(capture);
+
+        // Audio redirection rides the same session handle; failures here are
+        // non-fatal (a silent tunnel is still a functional tunnel).
+        if let Err(e) = self.audio.start(&handle) {
+            tracing::warn!(error = ?e, "audio tap failed to start; continuing without audio");
+        }
+
+        // Input forwarder is deliberately NOT initialized here — the remote
+        // PID isn't stable until the guest-side agent checks in. Callers use
+        // `init_input(remote_pid)` once that handshake completes.
+
+        self.running.store(true, Ordering::SeqCst);
+        tracing::info!("RDP tunnel is live");
+
+        Ok(())
+    }
+
+    /// Attach the host-side optical capture pipeline to this session.
+    ///
+    /// Must be called **after** `connect()` has produced a live `RDPClientHandle`.
+    /// The stream capture borrows the handle to subscribe to framebuffer
+    /// deltas; it never touches guest memory. Idempotent: if a capture is
+    /// already attached, this is a no-op.
+    pub async fn attach_stream(&mut self) -> Result<(), RdpError> {
+        if self.stream.is_some() {
+            tracing::debug!("stream capture already attached; skipping re-attach");
+            return Ok(());
+        }
+
+        let handle = self
+            .client
+            .handle()
+            .ok_or(RdpError::NotConnected)?;
+
+        let capture = StreamCapture::attach(&handle, self.config.capture.clone())
+            .await
+            .map_err(RdpError::Stream)?;
+
+        self.stream = Some(capture);
+        Ok(())
+    }
+
+    /// Lazily initialize the input forwarder once the remote session reports
+    /// a stable PID for the hosting process. Returns `AlreadyInitialized` if
+    /// called twice — callers should treat that as a programming error, not
+    /// a runtime condition.
+    pub fn init_input(&mut self, remote_pid: u32) -> Result<(), RdpError> {
+        if self.input.is_some() {
+            return Err(RdpError::AlreadyInitialized("input_forwarder"));
+        }
+
+        if remote_pid == 0 {
+            return Err(RdpError::InvalidPid);
+        }
+
+        let forwarder = InputForwarder::new(remote_pid, self.config.input.clone())
+            .map_err(RdpError::Input)?;
+
+        self.input = Some(forwarder);
+        Ok(())
+    }
+
+    /// Forward a single input event to the remote session.
+    ///
+    /// Silently drops events when the forwarder has not yet been initialized —
+    /// this is intentional. Early-session input (before the guest reports its
+    /// PID) must not be queued, because replaying stale input after the window
+    /// handle changes is a known source of ghost-click bugs.
+    pub fn send_input(&mut self, event: InputEvent) -> Result<(), RdpError> {
+        match self.input.as_mut() {
+            Some(fwd) => fwd.send(event).map_err(RdpError::Input),
+            None => {
+                tracing::debug!(
+                    ?event,
+                    "dropping input event: forwarder not yet initialized"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Pull the next decoded frame from the capture pipeline, if any.
+    pub async fn next_frame(&mut self) -> Result<Option<Frame>, RdpError> {
+        match self.stream.as_mut() {
+            Some(s) => s.next_frame().await.map_err(RdpError::Stream),
+            None => Ok(None),
+        }
+    }
+
+    /// Graceful teardown. Order matters: input first (so no events race the
+    /// closing socket), then stream (release GPU/shared-memory resources),
+    /// then client (TLS close_notify + TCP FIN).
+    pub async fn shutdown(mut self) -> Result<(), RdpError> {
+        // Flip the flag up front so `state()` observers see Disconnecting
+        // for the duration of teardown, not just after it completes.
+        self.running.store(false, Ordering::SeqCst);
+
+        if let Some(mut input) = self.input.take() {
+            if let Err(e) = input.shutdown() {
+                tracing::warn!(error = ?e, "input forwarder shutdown failed");
+            }
+        }
+
+        if let Some(stream) = self.stream.take() {
+            if let Err(e) = stream.detach().await {
+                tracing::warn!(error = ?e, "stream detach failed");
+            }
+        }
+
+        if let Err(e) = self.audio.stop() {
+            tracing::warn!(error = ?e, "audio tap stop failed");
+        }
+
+        self.client.disconnect().await.map_err(RdpError::Client)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expected contracts from sibling modules.
+//
+// These are documented here rather than enforced by a trait because the
+// concrete types are only ever constructed inside this module. If any of
+// these signatures drift, the compiler will catch it at the call sites
+// above.
+// ---------------------------------------------------------------------------
+//
+// client.rs must expose:
+//   pub struct RdpClient { /* ... */ }
+//   pub struct RDPClientHandle { /* cheaply cloneable, Send + Sync */ }
+//   impl RdpClient {
+//       pub fn new(cfg: ClientConfig) -> Result<Self, ClientError>;
+//       pub async fn connect(&mut self, target: &Target) -> Result<(), ClientError>;
+//       pub async fn disconnect(&mut self) -> Result<(), ClientError>;
+//       pub fn handle(&self) -> Option<RDPClientHandle>;
+//   }
+//
+// stream.rs must expose:
+//   pub struct StreamCapture { /* ... */ }
+//   impl StreamCapture {
+//       pub async fn attach(
+//           handle: &RDPClientHandle,
+//           cfg: CaptureConfig,
+//       ) -> Result<Self, StreamError>;
+//       pub async fn next_frame(&mut self) -> Result<Option<Frame>, StreamError>;
+//       pub async fn detach(self) -> Result<(), StreamError>;
+//   }
+//
+// input.rs must expose:
+//   pub struct InputForwarder { /* ... */ }
+//   impl InputForwarder {
+//       pub fn new(remote_pid: u32, cfg: InputConfig) -> Result<Self, InputError>;
+//       pub fn send(&mut self, event: InputEvent) -> Result<(), InputError>;
+//       pub fn shutdown(&mut self) -> Result<(), InputError>;
+//   }

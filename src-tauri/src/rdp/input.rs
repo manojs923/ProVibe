@@ -4,30 +4,32 @@
 // with per-target anti-detection configuration.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
+
 use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyboardState, MapVirtualKeyW, SendInput, KEYBD_EVENT_FLAGS,
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEEVENTF_HWHEEL, VIRTUAL_KEY,MOUSE_EVENT_FLAGS, MAPVK_VK_TO_VSC,
+    GetAsyncKeyState, GetKeyboardState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
+    INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetClientRect, GetForegroundWindow, GetWindowRect,
-    SetForegroundWindow,
+    FindWindowW, GetClientRect, GetCursorPos, GetForegroundWindow, SetCursorPos, SetForegroundWindow,
 };
 
-use windows::Win32::UI::WindowsAndMessaging::ScreenToClient;
-use rand::Rng;
-
-use crate::target_id::TargetProfile;
 use crate::rdp::client::RDPClientHandle;
+use crate::target_id::TargetProfile;
 
 /// Input mode determines how aggressively we try to make synthetic input
 /// indistinguishable from physical input at the OS level.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     /// Standard SendInput with scancode. Most compatible, detectable by
     /// low-level hooks checking LLKHF_INJECTED flag.
@@ -132,9 +134,53 @@ impl InputConfig {
     }
 }
 
+/// A single input action to forward into the session.
+///
+/// Coordinates are guest-space pixels; they get translated to host screen
+/// pixels by the forwarder. Keys are raw virtual-key codes so the type stays
+/// serializable across the Tauri boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InputEvent {
+    /// Type text into the currently focused guest control.
+    Text { text: String },
+    /// Click guest coordinates, then type.
+    TextAt { x: u32, y: u32, text: String },
+    /// Single key press (down + up).
+    KeyPress { vk: u16 },
+    /// Key chord, e.g. Ctrl+C.
+    KeyCombo {
+        modifiers: Vec<u16>,
+        key: u16,
+    },
+    /// Move the cursor along a humanized path.
+    MouseMove { x: u32, y: u32 },
+    /// Left click.
+    Click { x: u32, y: u32 },
+    /// Middle click.
+    MiddleClick { x: u32, y: u32 },
+    /// Right click.
+    RightClick { x: u32, y: u32 },
+    /// Vertical wheel. Positive scrolls up.
+    Scroll { amount: i32 },
+    /// Horizontal wheel. Positive scrolls right.
+    HScroll { amount: i32 },
+    /// Release every held modifier and mouse button.
+    ReleaseAllModifiers,
+    /// Bring the client window to the foreground.
+    Focus,
+}
+
+/// Input policy resolved from a target profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputPolicy {
+    Forbidden,
+    Allowed { humanized: bool },
+}
+
 /// Manages input forwarding into the RDP client window.
 pub struct InputForwarder {
-    pub running: std::sync::atomic::AtomicBool,
+    pub running: AtomicBool,
     /// Handle to the mstsc client window.
     client_hwnd: Option<HWND>,
     /// Client window client rect (guest viewport on host screen).
@@ -143,28 +189,23 @@ pub struct InputForwarder {
     guest_resolution: (u32, u32),
     /// Active input configuration.
     config: InputConfig,
-    /// Random state for timing jitter.
-    // rng: rand::thread_rng(),  <- commented this
+    /// Random state for timing jitter. StdRng is Send, so the owning
+    /// Tunnel stays Send across await points.
+    rng: StdRng,
     /// Track burst state for natural typing rhythm.
     burst_remaining: u32,
     /// Last input timestamp.
     last_input: Option<Instant>,
     /// Currently held modifier keys.
     held_modifiers: Vec<VIRTUAL_KEY>,
-    /// Pending verification keys.
+    /// Keys awaiting state verification, mapped to the expected down state.
     pending_verify: HashMap<VIRTUAL_KEY, bool>,
-    rng: rand::rngs::ThreadRng,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum InputPolicy {
-    Forbidden,
-    Allowed { humanized: bool },
 }
 
 impl InputForwarder {
     pub fn new(client: &RDPClientHandle, config: InputConfig) -> Result<Self, InputError> {
-        let hwnd = client.get_window_handle()
+        let hwnd = client
+            .get_window_handle()
             .map_err(|_| InputError::ClientNotRunning)?;
 
         let client_rect = unsafe {
@@ -174,10 +215,9 @@ impl InputForwarder {
         };
 
         let guest_res = client.get_guest_resolution();
-        let rng = rand::thread_rng();
 
         Ok(Self {
-            rng,
+            rng: StdRng::from_entropy(),
             client_hwnd: Some(hwnd),
             client_rect,
             guest_resolution: guest_res,
@@ -186,7 +226,29 @@ impl InputForwarder {
             last_input: None,
             held_modifiers: Vec::new(),
             pending_verify: HashMap::new(),
+            running: AtomicBool::new(false),
         })
+    }
+
+    /// Dispatch a single event. Convenience entry point for the tunnel.
+    pub fn send(&mut self, event: InputEvent) -> Result<(), InputError> {
+        match event {
+            InputEvent::Text { text } => self.type_text(&text),
+            InputEvent::TextAt { x, y, text } => self.type_text_at(x, y, &text),
+            InputEvent::KeyPress { vk } => self.press_key(VIRTUAL_KEY(vk)),
+            InputEvent::KeyCombo { modifiers, key } => {
+                let mods: Vec<VIRTUAL_KEY> = modifiers.into_iter().map(VIRTUAL_KEY).collect();
+                self.press_key_combo(&mods, VIRTUAL_KEY(key))
+            }
+            InputEvent::MouseMove { x, y } => self.move_mouse(x, y),
+            InputEvent::Click { x, y } => self.click(x, y),
+            InputEvent::MiddleClick { x, y } => self.middle_click(x, y),
+            InputEvent::RightClick { x, y } => self.right_click(x, y),
+            InputEvent::Scroll { amount } => self.vscroll(amount),
+            InputEvent::HScroll { amount } => self.hscroll(amount),
+            InputEvent::ReleaseAllModifiers => self.release_all_modifiers(),
+            InputEvent::Focus => self.focus_client(),
+        }
     }
 
     /// Bring the RDP client window to the foreground and ensure it
@@ -196,8 +258,8 @@ impl InputForwarder {
 
         unsafe {
             if !SetForegroundWindow(hwnd).as_bool() {
-    return Err(InputError::FocusFailed);
-}
+                return Err(InputError::FocusFailed);
+            }
         }
 
         Ok(())
@@ -212,16 +274,19 @@ impl InputForwarder {
         let client_width = (self.client_rect.right - self.client_rect.left).max(1);
         let client_height = (self.client_rect.bottom - self.client_rect.top).max(1);
 
-        let scale_x = client_width as f64 / self.guest_resolution.0 as f64;
-        let scale_y = client_height as f64 / self.guest_resolution.1 as f64;
+        let scale_x = client_width as f64 / self.guest_resolution.0.max(1) as f64;
+        let scale_y = client_height as f64 / self.guest_resolution.1.max(1) as f64;
 
         let local_x = (guest_x as f64 * scale_x).round() as i32;
         let local_y = (guest_y as f64 * scale_y).round() as i32;
 
-        // Convert client coordinates to screen coordinates.
-        let mut point = POINT { x: local_x, y: local_y };
+        // Client-relative → screen-relative.
+        let mut point = POINT {
+            x: local_x,
+            y: local_y,
+        };
         unsafe {
-            if !ScreenToClient(hwnd, &mut point).as_bool() {
+            if !ClientToScreen(hwnd, &mut point).as_bool() {
                 return Err(InputError::CoordinateTranslationFailed);
             }
         }
@@ -240,7 +305,7 @@ impl InputForwarder {
         let chars: Vec<char> = text.chars().collect();
         let mut burst_count = 0;
 
-        for (idx, ch) in chars.iter().enumerate() {
+        for ch in chars.iter() {
             self.apply_typing_delay(&mut burst_count)?;
             self.press_key_for_char(*ch)?;
 
@@ -256,7 +321,12 @@ impl InputForwarder {
     }
 
     /// Type text at a specific location in the guest (click first, then type).
-    pub fn type_text_at(&mut self, guest_x: u32, guest_y: u32, text: &str) -> Result<(), InputError> {
+    pub fn type_text_at(
+        &mut self,
+        guest_x: u32,
+        guest_y: u32,
+        text: &str,
+    ) -> Result<(), InputError> {
         self.click(guest_x, guest_y)?;
         self.human_pause(Duration::from_millis(150))?;
         self.type_text(text)?;
@@ -282,7 +352,11 @@ impl InputForwarder {
     }
 
     /// Send a key combination (e.g., Ctrl+C).
-    pub fn press_key_combo(&mut self, modifiers: &[VIRTUAL_KEY], key: VIRTUAL_KEY) -> Result<(), InputError> {
+    pub fn press_key_combo(
+        &mut self,
+        modifiers: &[VIRTUAL_KEY],
+        key: VIRTUAL_KEY,
+    ) -> Result<(), InputError> {
         if self.config.mode == InputMode::Disabled {
             return Err(InputError::InputDisabled);
         }
@@ -311,7 +385,7 @@ impl InputForwarder {
         Ok(())
     }
 
-/// Move mouse to guest coordinates with humanized path.
+    /// Move mouse to guest coordinates with humanized path.
     pub fn move_mouse(&mut self, guest_x: u32, guest_y: u32) -> Result<(), InputError> {
         if self.config.mode == InputMode::Disabled {
             return Err(InputError::InputDisabled);
@@ -323,17 +397,17 @@ impl InputForwarder {
         let current = self.get_cursor_position()?;
 
         if self.config.mode == InputMode::Standard {
-            // Direct move. Use the full path and cast coordinates to i32.
+            // Direct move.
             unsafe {
-                windows::Win32::UI::WindowsAndMessaging::SetCursorPos(host_x as i32, host_y as i32)
-                    .map_err(|_| InputError::CursorMoveFailed)?;
+                SetCursorPos(host_x, host_y).map_err(|_| InputError::CursorMoveFailed)?;
             }
+            self.last_input = Some(Instant::now());
             return Ok(());
         }
 
         // Humanized: interpolate a curved path.
-        let steps = self.config.mouse_interpolation_steps;
-        let deviation = self.config.mouse_curve_deviation;
+        let steps = self.config.mouse_interpolation_steps.max(1);
+        let deviation = self.config.mouse_curve_deviation as f64;
 
         let start_x = current.0 as f64;
         let start_y = current.1 as f64;
@@ -341,10 +415,8 @@ impl InputForwarder {
         let end_y = host_y as f64;
 
         // Quadratic Bezier with random control point deviation.
-        let ctrl_x = (start_x + end_x) / 2.0
-            + self.rng.gen_range(-(deviation as f64)..=deviation as f64);
-        let ctrl_y = (start_y + end_y) / 2.0
-            + self.rng.gen_range(-(deviation as f64)..=deviation as f64);
+        let ctrl_x = (start_x + end_x) / 2.0 + self.rng.gen_range(-deviation..=deviation);
+        let ctrl_y = (start_y + end_y) / 2.0 + self.rng.gen_range(-deviation..=deviation);
 
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
@@ -357,15 +429,15 @@ impl InputForwarder {
                 + 2.0 * one_minus_t * t * ctrl_y
                 + t * t * end_y;
 
-            // Interpolated move. Use the full path here as well.
             unsafe {
-                windows::Win32::UI::Input::KeyboardAndMouse::SetCursorPos(x.round() as i32, y.round() as i32)
+                SetCursorPos(x.round() as i32, y.round() as i32)
                     .map_err(|_| InputError::CursorMoveFailed)?;
             }
 
             self.human_pause(Duration::from_millis(self.config.mouse_step_delay_ms as u64))?;
         }
 
+        self.last_input = Some(Instant::now());
         Ok(())
     }
 
@@ -375,16 +447,7 @@ impl InputForwarder {
         self.human_pause(Duration::from_millis(30))?;
         self.send_mouse_button(MOUSEEVENTF_LEFTDOWN)?;
         self.human_pause(Duration::from_millis(45))?;
-               self.send_mouse_button(MOUSEEVENTF_LEFTUP)?;
-        Ok(())
-    }
-
-    /// Release all currently held modifiers (recovery / cleanup).
-    pub fn release_all_modifiers(&mut self) -> Result<(), InputError> {
-        while let Some(vk) = self.held_modifiers.pop() {
-            self.send_key_event(vk, true)?;
-            self.human_pause(Duration::from_millis(15))?;
-        }
+        self.send_mouse_button(MOUSEEVENTF_LEFTUP)?;
         Ok(())
     }
 
@@ -398,30 +461,156 @@ impl InputForwarder {
         Ok(())
     }
 
-    /// Horizontal scroll (positive = right, negative = left).
-    pub fn hscroll(&mut self, direction: i32, amount: i32) -> Result<(), InputError> {
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: windows::Win32::UI::Input::KeyboardAndMouse::MOUSEINPUT {
-                    dx: 0,
-                    dy: 0,
-                    mouseData: (amount.abs() as u32) * 120,
-                    dwFlags: MOUSEEVENTF_HWHEEL,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
+    /// Right-click at guest coordinates.
+    pub fn right_click(&mut self, guest_x: u32, guest_y: u32) -> Result<(), InputError> {
+        self.move_mouse(guest_x, guest_y)?;
+        self.human_pause(Duration::from_millis(30))?;
+        self.send_mouse_button(MOUSEEVENTF_RIGHTDOWN)?;
+        self.human_pause(Duration::from_millis(45))?;
+        self.send_mouse_button(MOUSEEVENTF_RIGHTUP)?;
+        Ok(())
+    }
 
-        let inputs = [input];
-        let result = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        if result == 0 {
-            return Err(InputError::SendInputFailed);
-        }
-
+    /// Vertical wheel. Positive = up. Each unit is one detent (120).
+    pub fn vscroll(&mut self, amount: i32) -> Result<(), InputError> {
+        self.send_wheel(amount.saturating_mul(120), MOUSEEVENTF_WHEEL)?;
         self.human_pause(Duration::from_millis(80))?;
         Ok(())
+    }
+
+    /// Horizontal scroll. Positive = right, negative = left.
+    pub fn hscroll(&mut self, amount: i32) -> Result<(), InputError> {
+        self.send_wheel(amount.saturating_mul(120), MOUSEEVENTF_HWHEEL)?;
+        self.human_pause(Duration::from_millis(80))?;
+        Ok(())
+    }
+
+    /// Release all currently held modifiers (recovery / cleanup).
+    pub fn release_all_modifiers(&mut self) -> Result<(), InputError> {
+        while let Some(vk) = self.held_modifiers.pop() {
+            self.send_key_event(vk, true)?;
+            self.human_pause(Duration::from_millis(15))?;
+        }
+        Ok(())
+    }
+
+    /// Update the guest resolution if the RDP session was resized.
+    pub fn update_guest_resolution(&mut self, resolution: (u32, u32)) {
+        self.guest_resolution = resolution;
+    }
+
+    /// Re-acquire the client window rect (e.g., after window resize or move).
+    pub fn refresh_client_rect(&mut self) -> Result<(), InputError> {
+        let hwnd = self.client_hwnd.ok_or(InputError::ClientNotRunning)?;
+
+        self.client_rect = unsafe {
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect).map_err(|_| InputError::WindowQueryFailed)?;
+            rect
+        };
+
+        Ok(())
+    }
+
+    /// Check whether the RDP client window is still the foreground window.
+    pub fn is_client_focused(&self) -> bool {
+        let hwnd = match self.client_hwnd {
+            Some(h) => h,
+            None => return false,
+        };
+
+        unsafe { GetForegroundWindow() == hwnd }
+    }
+
+    /// Attempt to re-locate the mstsc client window by class name if the
+    /// stored handle has become stale.
+    pub fn reacquire_client(&mut self, class_name: &str) -> Result<(), InputError> {
+        let wide: Vec<u16> = class_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let hwnd = unsafe {
+            FindWindowW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                windows::core::PCWSTR::null(),
+            )
+        };
+
+        let hwnd = hwnd.map_err(|e| InputError::WindowNotFound(e.to_string()))?;
+        if hwnd.0.is_null() {
+            return Err(InputError::WindowNotFound("null handle".into()));
+        }
+        self.client_hwnd = Some(hwnd);
+        self.refresh_client_rect()?;
+        Ok(())
+    }
+
+    /// Gracefully stop forwarding, releasing any held keys/buttons and
+    /// resetting internal state. Safe to call multiple times.
+    pub fn shutdown(&mut self) -> Result<(), InputError> {
+        // Best-effort: a dead window shouldn't block teardown.
+        let _ = self.release_all_modifiers();
+        self.stop();
+        Ok(())
+    }
+
+    /// Unconditional release sweep + state reset.
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+
+        let modifiers: [u16; 8] = [
+            0x10, // VK_SHIFT
+            0x11, // VK_CONTROL
+            0x12, // VK_MENU (Alt)
+            0x5B, // VK_LWIN
+            0x5C, // VK_RWIN
+            0xA0, // VK_LSHIFT
+            0xA2, // VK_LCONTROL
+            0xA4, // VK_LMENU
+        ];
+
+        let mut inputs: Vec<INPUT> = Vec::with_capacity(modifiers.len() + 3);
+
+        for vk in modifiers.iter() {
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(*vk),
+                        wScan: 0,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        // Release any held mouse buttons.
+        for flag in [
+            MOUSEEVENTF_LEFTUP,
+            MOUSEEVENTF_RIGHTUP,
+            MOUSEEVENTF_MIDDLEUP,
+        ] {
+            inputs.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: 0,
+                        dwFlags: flag,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        unsafe {
+            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        }
+
+        self.burst_remaining = 0;
+        self.held_modifiers.clear();
+        self.pending_verify.clear();
     }
 
     // ------------------------------------------------------------------
@@ -435,10 +624,12 @@ impl InputForwarder {
         // pause before starting the next burst.
         if self.burst_remaining == 0 {
             let (min_burst, max_burst) = self.config.burst_length_range;
-            self.burst_remaining = self.rng.gen_range(min_burst..=max_burst);
+            let hi = max_burst.max(min_burst);
+            self.burst_remaining = self.rng.gen_range(min_burst..=hi);
 
             let (min_pause, max_pause) = self.config.burst_pause_range;
-            let pause = self.rng.gen_range(min_pause..=max_pause);
+            let hi_pause = max_pause.max(min_pause);
+            let pause = self.rng.gen_range(min_pause..=hi_pause);
             self.human_pause(Duration::from_millis(pause as u64))?;
         }
 
@@ -459,7 +650,8 @@ impl InputForwarder {
         // Occasional hesitation ("thinking" pause).
         if self.rng.gen::<f32>() < self.config.hesitation_probability {
             let (min_h, max_h) = self.config.hesitation_ms;
-            let hesitation = self.rng.gen_range(min_h..=max_h);
+            let hi_h = max_h.max(min_h);
+            let hesitation = self.rng.gen_range(min_h..=hi_h);
             self.human_pause(Duration::from_millis(hesitation as u64))?;
         }
 
@@ -468,7 +660,7 @@ impl InputForwarder {
 
     /// Sleep with small random variance so fixed delays don't produce
     /// perfectly periodic timing signatures.
-    fn human_pause(&self, duration: Duration) -> Result<(), InputError> {
+    fn human_pause(&mut self, duration: Duration) -> Result<(), InputError> {
         if self.config.mode == InputMode::Standard {
             std::thread::sleep(duration);
             return Ok(());
@@ -515,7 +707,7 @@ impl InputForwarder {
     /// layout entirely, which is necessary for arbitrary text.
     fn send_unicode_char(&mut self, ch: char) -> Result<(), InputError> {
         let mut code_units = [0u16; 2];
-        let encoded: Vec<u16> = ch.encode_utf16(&mut code_units).iter().copied().collect();
+        let encoded: Vec<u16> = ch.encode_utf16(&mut code_units).to_vec();
 
         for &unit in &encoded {
             // Key down.
@@ -546,8 +738,7 @@ impl InputForwarder {
                 },
             };
 
-            let inputs = [down];
-            let result = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            let result = unsafe { SendInput(&[down], std::mem::size_of::<INPUT>() as i32) };
             if result == 0 {
                 return Err(InputError::SendInputFailed);
             }
@@ -556,8 +747,7 @@ impl InputForwarder {
             let hold = self.rng.gen_range(25..=55);
             std::thread::sleep(Duration::from_millis(hold));
 
-            let inputs = [up];
-            let result = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            let result = unsafe { SendInput(&[up], std::mem::size_of::<INPUT>() as i32) };
             if result == 0 {
                 return Err(InputError::SendInputFailed);
             }
@@ -569,13 +759,15 @@ impl InputForwarder {
     /// Send a raw key event using scan codes (more realistic than
     /// VK-based injection; matches what a physical keyboard produces).
     fn send_key_event(&mut self, vk: VIRTUAL_KEY, key_up: bool) -> Result<(), InputError> {
-        let scan_code = unsafe {
-            MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC)
-        };
+        let scan_code = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) };
 
         if scan_code == 0 {
             // Fall back to VK-based injection if no scancode exists.
-            let flags = if key_up { KEYEVENTF_KEYUP } else { windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0) };
+            let flags = if key_up {
+                KEYEVENTF_KEYUP
+            } else {
+                KEYBD_EVENT_FLAGS(0)
+            };
             let input = INPUT {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
@@ -589,21 +781,23 @@ impl InputForwarder {
                 },
             };
 
-            let inputs = [input];
-            let result = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            let result = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
             if result == 0 {
                 return Err(InputError::SendInputFailed);
             }
+            self.pending_verify.insert(vk, !key_up);
             return Ok(());
         }
 
         // Extended keys (arrows, insert/delete block, numpad divider)
         // require the EXTENDEDKEY flag to behave correctly.
-        let is_extended = matches!(vk.0,
-            0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 | 0x27 | 0x28 | // PgUp/PgDn/End/Home/arrows
-            0x2D | 0x2E |                                             // Insert/Delete
-            0x5B | 0x5C |                                             // Win keys
-            0x6F                                                      // Numpad divide
+        let is_extended = matches!(
+            vk.0,
+            0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 | 0x27 | 0x28 // PgUp/PgDn/End/Home/arrows
+                | 0x2D | 0x2E
+                | 0x5B
+                | 0x5C
+                | 0x6F // Numpad divide
         );
 
         let mut flags = KEYEVENTF_SCANCODE;
@@ -627,12 +821,12 @@ impl InputForwarder {
             },
         };
 
-        let inputs = [input];
-        let result = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        let result = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
         if result == 0 {
             return Err(InputError::SendInputFailed);
         }
 
+        self.pending_verify.insert(vk, !key_up);
         Ok(())
     }
 
@@ -641,7 +835,7 @@ impl InputForwarder {
         let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
-                mi: windows::Win32::UI::Input::KeyboardAndMouse::MOUSEINPUT {
+                mi: MOUSEINPUT {
                     dx: 0,
                     dy: 0,
                     mouseData: 0,
@@ -652,8 +846,32 @@ impl InputForwarder {
             },
         };
 
-        let inputs = [input];
-        let result = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        let result = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        if result == 0 {
+            return Err(InputError::SendInputFailed);
+        }
+
+        Ok(())
+    }
+
+    /// Send a wheel event. `delta` is signed but travels as raw u32 bits,
+    /// which is how the OS interprets wheel mouseData.
+    fn send_wheel(&mut self, delta: i32, flags: MOUSE_EVENT_FLAGS) -> Result<(), InputError> {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: delta as u32,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+
+        let result = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
         if result == 0 {
             return Err(InputError::SendInputFailed);
         }
@@ -665,8 +883,7 @@ impl InputForwarder {
     fn get_cursor_position(&self) -> Result<(i32, i32), InputError> {
         let mut point = POINT::default();
         unsafe {
-            let result = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point);
-            result.map_err(|_| InputError::CursorQueryFailed)?;
+            GetCursorPos(&mut point).map_err(|_| InputError::CursorQueryFailed)?;
         }
         Ok((point.x, point.y))
     }
@@ -677,23 +894,24 @@ impl InputForwarder {
         // Brief settle delay before reading state.
         std::thread::sleep(Duration::from_millis(5));
 
-        let state_ok = unsafe {
-            let mut keyboard_state = [0u8; 256];
-            let ok = GetKeyboardState(&mut keyboard_state);
-            if ok.is_err() {
-                return Err(InputError::VerificationFailed);
-            }
-            keyboard_state
-        };
+        let mut keyboard_state = [0u8; 256];
+        unsafe {
+            GetKeyboardState(&mut keyboard_state).map_err(|_| InputError::VerificationFailed)?;
+        }
 
-        // If any tracked key is stuck down unexpectedly, roll it back.
-        for (vk, expected_down) in self.pending_verify.clone().iter() {
-            let vk_index = vk.0 as usize;
-            if vk_index < 256 {
-                let is_down = (state_ok[vk_index] & 0x80) != 0;
-                if is_down && !expected_down {
-                    // Key stuck — send an explicit key-up to recover.
-                    self.send_key_event(*vk, true)?;
+        // Any tracked key stuck down against expectation gets rolled back.
+        let pending: Vec<(VIRTUAL_KEY, bool)> = self
+            .pending_verify
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+
+        for (vk, expected_down) in pending {
+            let idx = vk.0 as usize;
+            if idx < keyboard_state.len() {
+                let is_down = (keyboard_state[idx] & 0x80) != 0;
+                if is_down != expected_down {
+                    self.send_key_event(vk, is_down)?;
                 }
             }
         }
@@ -722,187 +940,13 @@ impl InputForwarder {
 
         Ok(())
     }
+}
 
-    /// Update the guest resolution if the RDP session was resized.
-    pub fn update_guest_resolution(&mut self, resolution: (u32, u32)) {
-        self.guest_resolution = resolution;
-    }
-
-    /// Re-acquire the client window rect (e.g., after window resize or move).
-    pub fn refresh_client_rect(&mut self) -> Result<(), InputError> {
-        let hwnd = self.client_hwnd.ok_or(InputError::ClientNotRunning)?;
-
-        self.client_rect = unsafe {
-            let mut rect = RECT::default();
-            GetClientRect(hwnd, &mut rect).map_err(|_| InputError::WindowQueryFailed)?;
-            rect
-        };
-
-        Ok(())
-    }
-
-    /// Check whether the RDP client window is still the foreground window.
-    pub fn is_client_focused(&self) -> bool {
-        let hwnd = match self.client_hwnd {
-            Some(h) => h,
-            None => return false,
-        };
-
-        unsafe { GetForegroundWindow() == hwnd }
-    }
-
-    /// Attempt to re-locate the mstsc client window by class name if the
-    /// stored handle has become stale.
-    pub fn reacquire_client(&mut self, class_name: &str) -> Result<(), InputError> {
-        let wide: Vec<u16> = class_name.encode_utf16().chain(std::iter::once(0)).collect();
-        let hwnd = unsafe {
-            FindWindowW(
-                windows::core::PCWSTR(wide.as_ptr()),
-                windows::core::PCWSTR::null(),
-            )
-        };
-
-        let hwnd = hwnd.map_err(|e| InputError::WindowNotFound(e.to_string()))?;
-        if hwnd.0.is_null() {
-        return Err(InputError::WindowNotFound("null handle".into()));
-        }
-    self.client_hwnd = Some(hwnd);
-        self.refresh_client_rect()?;
-        Ok(())
-    }
-
-        /// Gracefully stops the input forwarder, releasing any held keys/buttons
-    /// and resetting internal state. Safe to call multiple times.
-    pub fn stop(&mut self) {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
-            KEYBDINPUT, MOUSEINPUT, KEYEVENTF_KEYUP,
-            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP,
-            VIRTUAL_KEY,
-        };
-
-        // Release common modifier keys that may have been left pressed.
-        let modifiers: [u16; 8] = [
-            0x10, // VK_SHIFT
-            0x11, // VK_CONTROL
-            0x12, // VK_MENU (Alt)
-            0x5B, // VK_LWIN
-            0x5C, // VK_RWIN
-            0xA0, // VK_LSHIFT
-            0xA2, // VK_LCONTROL
-            0xA4, // VK_LMENU
-        ];
-
-        let mut inputs: Vec<INPUT> = Vec::with_capacity(modifiers.len() + 3);
-
-        for vk in modifiers.iter() {
-            inputs.push(INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(*vk),
-                        wScan: 0,
-                        dwFlags: KEYEVENTF_KEYUP,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            });
-        }
-
-        // Release any held mouse buttons.
-        for flag in [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP] {
-            inputs.push(INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dx: 0,
-                        dy: 0,
-                        mouseData: 0,
-                        dwFlags: flag,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            });
-        }
-
-        unsafe {
-            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        }
-
-        // Reset internal pacing state so the next session starts clean.
-        self.burst_remaining = 0;
-    }
-
-    /// Sends a single virtual-key press+release to the focused RDP window.
-    /// Returns `Ok(())` on success, `InputError` if the window handle is invalid
-    /// or the Windows API call fails.
-    pub fn send_key(
-        &mut self,
-        _client: &crate::rdp::client::RDPClientHandle,
-        vk: u16,
-    ) -> Result<(), InputError> {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
-            KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-        };
-
-        if self.client_hwnd.0.is_null() {
-            return Err(InputError::WindowNotFound("null hwnd on send_key".into()));
-        }
-
-        // Optional humanizer: tiny pre-keystroke pause.
-        let pre_delay = self.rng.gen_range(8..=22);
-        std::thread::sleep(std::time::Duration::from_millis(pre_delay));
-
-        let key_down = INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(vk),
-                    wScan: 0,
-                    dwFlags: Default::default(),
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-
-        let key_up = INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(vk),
-                    wScan: 0,
-                    dwFlags: KEYEVENTF_KEYUP,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-
-        // Press
-        let sent_down = unsafe {
-            SendInput(&[key_down], std::mem::size_of::<INPUT>() as i32)
-        };
-        if sent_down == 0 {
-            return Err(InputError::CoordinateTranslationFailed);
-        }
-
-        // Realistic hold duration (25–55 ms, matches your existing pacing).
-        let hold = self.rng.gen_range(25..=55);
-        std::thread::sleep(std::time::Duration::from_millis(hold));
-
-        // Release
-        let sent_up = unsafe {
-            SendInput(&[key_up], std::mem::size_of::<INPUT>() as i32)
-        };
-        if sent_up == 0 {
-            return Err(InputError::CoordinateTranslationFailed);
-        }
-
-        Ok(())
+impl Drop for InputForwarder {
+    fn drop(&mut self) {
+        // Never leave a modifier latched if the forwarder is dropped
+        // without an explicit shutdown().
+        self.stop();
     }
 }
 
