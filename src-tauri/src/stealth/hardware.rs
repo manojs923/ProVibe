@@ -278,14 +278,18 @@ fn patch_vm_bios(
     vm_name: &str,
     profile: &HardwareProfile,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Set-VMBios only takes effect on a powered-off VM.
     let bios_cmd = format!(
-        "Set-VMBios -VMName '{}' -Manufacturer '{}' -Product '{}' -SerialNumber '{}'; \
-         Set-VM -VMName '{}' -Notes ''",
-        vm_name,
-        profile.bios_manufacturer,
-        profile.bios_product,
-        profile.bios_serial_number,
-        vm_name
+        "$ErrorActionPreference = 'Stop'; \
+         $vm = Get-VM -Name '{vm}' -ErrorAction Stop; \
+         $wasRunning = $vm.State -eq 'Running'; \
+         if ($wasRunning) {{ Stop-VM -Name '{vm}' -TurnOff -Force }}; \
+         Set-VMBios -VMName '{vm}' -Manufacturer '{man}' -Product '{prod}' -SerialNumber '{ser}'; \
+         if ($wasRunning) {{ Start-VM -Name '{vm}' }}",
+        vm = vm_name,
+        man = profile.bios_manufacturer,
+        prod = profile.bios_product,
+        ser = profile.bios_serial_number
     );
     run_powershell_host(&bios_cmd)?;
     Ok(())
@@ -405,17 +409,17 @@ pub async fn patch_smbios_strings(
             -Name 'SystemUUID' -Value $uuid -PropertyType String -Force;
 
         # Remove Hyper-V VM artifacts from SMBIOS
-        Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Virtual Machine' `
-            -ErrorAction SilentlyContinue;
-        Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\vmguest' `
-            -ErrorAction SilentlyContinue;
+        Remove-Item -Path 'HKLM:\SOFTWARE\Microsoft\Virtual Machine' `
+            -Recurse -Force -ErrorAction SilentlyContinue;
+        Remove-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\vmguest' `
+            -Recurse -Force -ErrorAction SilentlyContinue;
 
-        # Patch baseboard info
-        $board = Get-WmiObject -Class Win32_BaseBoard;
-        $board | ForEach-Object {
+        # Patch baseboard info. A WMI property write only persists with Put().
+        Get-WmiObject -Class Win32_BaseBoard | ForEach-Object {
             $_.SerialNumber = $ser;
             $_.Manufacturer = $man;
             $_.Product = $prod;
+            $_.Put() | Out-Null;
         };
     "#;
 
@@ -436,7 +440,7 @@ pub async fn patch_smbios_strings(
     // Additionally patch WMI BIOS instance directly.
     let wmi_script = format!(
         r#"
-        Set-WmiInstance -Class Win32_BIOS -Arguments @{{
+        Set-WmiInstance -Namespace 'root\cimv2' -Class Win32_BIOS -Arguments @{{
             SerialNumber = '{}'
             SMBIOSBIOSVersion = '{}'
             ReleaseDate = '{}'
@@ -467,6 +471,7 @@ fn patch_disk_serial_in_guest(
         $disks = Get-WmiObject -Class Win32_DiskDrive;
         foreach ($disk in $disks) {
             $disk.SerialNumber = $serial;
+            $disk.Put() | Out-Null;
         };
 
         # Patch the mounted device serial in the registry
@@ -493,6 +498,7 @@ pub async fn patch_disk_serials(
             r#"
             $disk = Get-WmiObject Win32_DiskDrive | Where-Object {{ $_.DeviceID -eq '{}' }}
             $disk.SerialNumber = '{}'
+            $disk.Put() | Out-Null;
             "#,
             disk.device_path, disk.serial_number
         );
@@ -558,7 +564,8 @@ pub async fn restore_disk_serials(vm_name: &str) -> Result<(), StealthError> {
         # Reset any WMI-visible disk serials to blank so Windows re-enumerates
         $disks = Get-WmiObject -Class Win32_DiskDrive;
         foreach ($disk in $disks) {
-            $disk.SerialNumber = '';
+            $disk.SerialNumber = $serial;
+            $disk.Put() | Out-Null;
         };
     "#;
     run_powershell_in_guest(vm_name, script).map_err(|e| StealthError(e.to_string()))?;

@@ -27,8 +27,8 @@ use super::{build_guest_invocation, run_host_ps, run_host_ps_transfer, GuestCred
 ///
 /// Every method takes the VM name explicitly rather than being bound to one
 /// VM, so a single manager can serve several guests.
-#[cfg_attr(test, mockall::automock)]
 #[async_trait]
+#[cfg_attr(test, mockall::automock)]
 pub trait VmManagerOps: Send + Sync {
     /// Whether the named VM exists and is currently running.
     ///

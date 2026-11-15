@@ -1,5 +1,10 @@
-use std::process::Command;
 use std::io::{Error, ErrorKind};
+use std::path::PathBuf;
+use std::process::Command;
+
+/// Internal switch shared with `vm::mod` and `vm::network`. One definition so
+/// the three modules can't drift apart.
+pub const LOOPBACK_SWITCH: &str = "Protocol-Loopback";
 
 // hyper-v orchestration module
 // spins up the localized matrix and strips the hypervisor signature.
@@ -9,35 +14,95 @@ pub struct HyperVOrchestrator {
     switch_name: String,
 }
 
+fn ps_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn run_ps(script: &str) -> Result<String, Error> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("ps execution failed: {}", err),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 impl HyperVOrchestrator {
-    pub fn new(target_id: &str) -> Self {
+    /// `name` is used verbatim — callers already hold the final name, so
+    /// deriving one here made teardown target a VM that never existed.
+    pub fn new(name: &str) -> Self {
         Self {
-            vm_name: format!("{}_stealth_sandbox", target_id.to_lowercase()),
-            switch_name: "loopback_airgap_switch".to_string(),
+            vm_name: name.to_string(),
+            switch_name: LOOPBACK_SWITCH.to_string(),
         }
     }
 
-    // silent execution of powershell cmdlets
+    pub fn vm_name(&self) -> &str {
+        &self.vm_name
+    }
+
     fn execute_ps(&self, script: &str) -> Result<String, Error> {
-        let output = Command::new("powershell")
-            .args(&["-NoProfile", "-NonInteractive", "-Command", script])
-            .output()?;
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::new(ErrorKind::Other, format!("ps execution failed: {}", err)));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        run_ps(script)
     }
 
-    pub fn create_vm(&self, vhdx_path: &str, ram_mb: u32, cores: u8) -> Result<(), Error> {
-        // initialize the guest environment using a pre-sysprepped vhdx
+    fn state(&self) -> Option<String> {
         let script = format!(
-            "New-VM -Name '{name}' -MemoryStartupBytes {ram}MB -BootDevice VHD -VHDPath '{vhdx}' -Generation 2 -NoVHD;\n\
-             Set-VMProcessor -VMName '{name}' -Count {cores};",
-            name = self.vm_name,
-            ram = ram_mb,
-            vhdx = vhdx_path,
+            "(Get-VM -Name '{}' -ErrorAction SilentlyContinue).State.ToString()",
+            ps_escape(&self.vm_name)
+        );
+        match run_ps(&script) {
+            Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => None,
+        }
+    }
+
+    /// Create the guest from a pre-sysprepped parent image. No-op when the VM
+    /// already exists, so re-engaging is safe.
+    ///
+    /// `parent_vhdx` is the base image; a differencing child is created under
+    /// ProgramData so the base stays pristine.
+    pub fn create_vm(&self, parent_vhdx: &str, ram_mb: u32, cores: u8) -> Result<(), Error> {
+        if self.state().is_some() {
+            return Ok(());
+        }
+
+        let parent = PathBuf::from(parent_vhdx);
+        if !parent.exists() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("parent VHDX missing: {}", parent.display()),
+            ));
+        }
+
+        let bytes = (ram_mb as u64) * 1024 * 1024;
+        let script = format!(
+            r#"$ErrorActionPreference = 'Stop'
+$name = '{name}'
+$base = '{parent}'
+$dir  = Join-Path $env:ProgramData 'Protocol\VMs'
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$vhd = Join-Path $dir ($name + '.vhdx')
+New-VHD -Path $vhd -ParentPath $base -Differencing | Out-Null
+New-VM -Name $name -VHDPath $vhd -MemoryStartupBytes {ram} -Generation 2 | Out-Null
+Set-VMProcessor -VMName $name -Count {cores}
+Set-VM -Name $name -CheckpointType Disabled
+"#,
+            name = ps_escape(&self.vm_name),
+            parent = ps_escape(&parent.to_string_lossy()),
+            ram = bytes,
             cores = cores
         );
         self.execute_ps(&script)?;
@@ -45,43 +110,66 @@ impl HyperVOrchestrator {
     }
 
     pub fn apply_stealth_patches(&self) -> Result<(), Error> {
-        // the optical illusion. this zeroes out cpuid leaf 0x40000000.
-        // the guest os (and seb/msb) will query the cpu and think it's running on bare metal.
+        // The optical illusion. `CompatibilityForMigrationEnabled` masks host
+        // CPU features from the guest, and nested virt is switched off so
+        // `cpuid` leaf 0x40000000 stops advertising a hypervisor.
         let script = format!(
-            "Set-VMProcessor -VMName '{name}' -ExposeVirtualizationExtensions $false;\n\
-             Set-VMProcessor -VMName '{name}' -CompatibilityForMigrationEnabled $true;\n\
-             # wmi hooks to overwrite smbios strings (dell/lenovo spoofing) would inject here\n\
-             $vm = Get-WmiObject -Namespace root\\virtualization\\v2 -Class Msvm_ComputerSystem | Where-Object {{ $_.ElementName -eq '{name}' }};",
-            name = self.vm_name
+            r#"$ErrorActionPreference = 'Stop'
+Set-VMProcessor -VMName '{name}' -ExposeVirtualizationExtensions $false
+Set-VMProcessor -VMName '{name}' -CompatibilityForMigrationEnabled $true
+# SMBIOS string overwrites (Dell/Lenovo spoofing) hook in here via Msvm_ComputerSystem.
+"#,
+            name = ps_escape(&self.vm_name)
         );
         self.execute_ps(&script)?;
         Ok(())
     }
 
     pub fn attach_loopback_network(&self) -> Result<(), Error> {
-        // isolate the patient. internal switch only, bound to our host loopback.
-        // no route to the public internet unless we explicitly proxy it.
+        // Isolate the patient: internal switch only, no route to the internet.
         let script = format!(
-            "$switch = Get-VMSwitch -Name '{switch}' -ErrorAction SilentlyContinue;\n\
-             if (-not $switch) {{ New-VMSwitch -Name '{switch}' -SwitchType Internal -Notes 'airgap' }};\n\
-             Connect-VMNetworkAdapter -VMName '{name}' -SwitchName '{switch}';\n\
-             # assign 127.0.0.2 to the host vnic for the rdp tunnel\n\
-             $netAdapter = Get-NetAdapter | Where-Object {{ $_.InterfaceDescription -match 'Hyper-V Virtual Ethernet Adapter' -and $_.Name -match '{switch}' }};\n\
-             if ($netAdapter) {{ New-NetIPAddress -InterfaceAlias $netAdapter.Name -IPAddress 127.0.0.2 -PrefixLength 24 -ErrorAction SilentlyContinue }};",
-            switch = self.switch_name,
-            name = self.vm_name
+            r#"$ErrorActionPreference = 'Stop'
+$switch = Get-VMSwitch -Name '{switch}' -ErrorAction SilentlyContinue
+if (-not $switch) {{ New-VMSwitch -Name '{switch}' -SwitchType Internal -Notes 'airgap' | Out-Null }}
+$nic = Get-VMNetworkAdapter -VMName '{name}'
+if (-not $nic) {{ Add-VMNetworkAdapter -VMName '{name}' -SwitchName '{switch}' | Out-Null }}
+else {{ Connect-VMNetworkAdapter -VMName '{name}' -SwitchName '{switch}' }}
+
+$netAdapter = Get-NetAdapter | Where-Object {{ $_.InterfaceDescription -match 'Hyper-V Virtual Ethernet Adapter' -and $_.Name -match '{switch}' }}
+if ($netAdapter) {{ New-NetIPAddress -InterfaceAlias $netAdapter.Name -IPAddress 127.0.0.2 -PrefixLength 24 -ErrorAction SilentlyContinue | Out-Null }}
+"#,
+            switch = ps_escape(&self.switch_name),
+            name = ps_escape(&self.vm_name)
         );
         self.execute_ps(&script)?;
         Ok(())
     }
 
     pub fn start(&self) -> Result<(), Error> {
-        self.execute_ps(&format!("Start-VM -Name '{}'", self.vm_name))?;
+        if let Some(state) = self.state() {
+            if state.eq_ignore_ascii_case("Running") {
+                return Ok(());
+            }
+        }
+        self.execute_ps(&format!("Start-VM -Name '{}'", ps_escape(&self.vm_name)))?;
         Ok(())
     }
-    
+
     pub fn destroy(&self) -> Result<(), Error> {
-        self.execute_ps(&format!("Stop-VM -Name '{}' -TurnOff -Force -ErrorAction SilentlyContinue;\nRemove-VM -Name '{}' -Force -ErrorAction SilentlyContinue;", self.vm_name, self.vm_name))?;
+        let name = ps_escape(&self.vm_name);
+        // Pull the disk path before the VM record disappears, then unlink the
+        // differencing child. `Remove-VM` alone leaks it in ProgramData.
+        let script = format!(
+            r#"$ErrorActionPreference = 'SilentlyContinue'
+$vm = Get-VM -Name '{name}'
+$disks = if ($vm) {{ $vm.HardDrives | ForEach-Object {{ $_.Path }} }} else {{ @() }}
+Stop-VM -Name '{name}' -TurnOff -Force
+Remove-VM -Name '{name}' -Force
+foreach ($d in $disks) {{ if ($d -and (Test-Path $d)) {{ Remove-Item $d -Force }} }}
+"#,
+            name = name
+        );
+        self.execute_ps(&script)?;
         Ok(())
     }
 }

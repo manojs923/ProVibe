@@ -3,7 +3,8 @@
 // VM lifecycle: boot wait, RDP readiness, spawn pipeline, checkpoint, destroy.
 //
 // All Hyper-V work goes through PowerShell with `-NonInteractive`, so a
-// misbehaving cmdlet can never sit waiting on a prompt.
+// misbehaving cmdlet can never sit waiting on a prompt. Every script runs on
+// the blocking pool — `Command::output()` would otherwise stall the reactor.
 
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -37,7 +38,6 @@ pub struct VmHandle {
 }
 
 impl VmHandle {
-    /// Handle for a VM addressed by name alone.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -45,13 +45,11 @@ impl VmHandle {
         }
     }
 
-    /// Attach the console client's pid.
     pub fn with_pid(mut self, pid: u32) -> Self {
         self.pid = Some(pid);
         self
     }
 
-    /// The VM's name, as registered with Hyper-V.
     pub fn vm_name(&self) -> &str {
         &self.name
     }
@@ -61,17 +59,31 @@ impl VmHandle {
 // PowerShell
 // ---------------------------------------------------------------------------
 
-/// Silent PowerShell executor for lifecycle commands.
+/// Silent PowerShell executor. Blocking — call via `execute_ps_async` from
+/// async contexts.
 fn execute_ps(script: &str) -> Result<String, Error> {
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
         .output()?;
 
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(Error::other(format!("ps execution failed: {}", err)));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn execute_ps_async(script: String) -> Result<String, Error> {
+    tokio::task::spawn_blocking(move || execute_ps(&script))
+        .await
+        .map_err(|e| Error::other(format!("ps task panicked: {}", e)))?
 }
 
 // ---------------------------------------------------------------------------
@@ -79,11 +91,13 @@ fn execute_ps(script: &str) -> Result<String, Error> {
 // ---------------------------------------------------------------------------
 
 /// Blocks until the Hyper-V state confirms the VM is actually running.
+///
+/// Takes the VM *name*, not the loopback address.
 pub async fn wait_for_boot(vm_name: &str) -> Result<(), Error> {
     let script = format!("(Get-VM -Name {}).State", ps_literal(vm_name));
 
     for _ in 0..BOOT_RETRIES {
-        if let Ok(state) = execute_ps(&script) {
+        if let Ok(state) = execute_ps_async(script.clone()).await {
             if state.trim().eq_ignore_ascii_case("Running") {
                 return Ok(());
             }
@@ -127,8 +141,8 @@ pub struct SpawnedVm {
     pub rdp_address: String,
 }
 
-/// Full spawn pipeline: network isolation -> differencing disk -> vm creation
-/// -> boot -> rdp poll.
+/// Full spawn pipeline: cleanup -> network isolation -> differencing disk ->
+/// vm creation -> boot -> rdp poll.
 pub async fn spawn_stealth_vm(
     vm_name: &str,
     base_image: &Path,
@@ -137,26 +151,35 @@ pub async fn spawn_stealth_vm(
     let net_config = network::get_network_config();
     let disk_dir = vm_dir.join("disks");
 
-    // 1. Network: isolated private switch + loopback.
-    network::setup_network(&net_config)
-        .map_err(|e| Error::other(format!("network setup failed: {}", e)))?;
-
-    // 2. Disk: differencing vhdx referencing the golden image.
-    let disk = clone::create_differencing_disk(vm_name, base_image, &disk_dir)
-        .map_err(|e| Error::other(format!("disk clone failed: {}", e)))?;
-
-    // 3. Destroy a stale VM of the same name if a previous session crashed
-    //    mid-teardown.
-    let _ = execute_ps(&format!(
+    // 1. Cleanup FIRST. The differencing disk lives at a deterministic path,
+    //    so a crashed prior session would make New-VHD collide below. Both the
+    //    VM record and the stale delta have to go before we recreate either.
+    let stale_disk = disk_dir.join(format!("{}.vhdx", vm_name));
+    let _ = execute_ps_async(format!(
         "Stop-VM -Name {name} -TurnOff -Force -ErrorAction SilentlyContinue;\n\
          Remove-VM -Name {name} -Force -ErrorAction SilentlyContinue",
         name = ps_literal(vm_name)
-    ));
+    ))
+    .await;
+    if stale_disk.exists() {
+        let _ = clone::destroy_differencing_disk(&stale_disk);
+    }
 
-    // 4. Create the VM: gen2, no dynamic memory (deterministic footprint),
-    //    minimum specs since it only runs a proctoring app and RDP.
+    // 2. Network: isolated private switch + loopback.
+    let net = net_config.clone();
+    tokio::task::spawn_blocking(move || network::setup_network(&net))
+        .await
+        .map_err(|e| Error::other(format!("network task panicked: {}", e)))?
+        .map_err(|e| Error::other(format!("network setup failed: {}", e)))?;
+
+    // 3. Disk: differencing vhdx referencing the golden image.
+    let disk = clone::create_differencing_disk(vm_name, base_image, &disk_dir)
+        .map_err(|e| Error::other(format!("disk clone failed: {}", e)))?;
+
+    // 4. Create the VM: gen2, fixed memory (deterministic footprint), minimum
+    //    specs since it only runs a proctoring app and RDP.
     let disk_str = disk.disk_path.to_string_lossy().to_string();
-    execute_ps(&format!(
+    execute_ps_async(format!(
         "New-VM -Name {name} -Generation 2 -MemoryStartupBytes 2GB \
          -VHDPath {disk} -SwitchName {switch} -ErrorAction Stop;\n\
          Set-VM -Name {name} -ProcessorCount 2 -DynamicMemory:$false \
@@ -166,29 +189,40 @@ pub async fn spawn_stealth_vm(
         name = ps_literal(vm_name),
         disk = ps_literal(&disk_str),
         switch = ps_literal(&net_config.switch_name)
-    ))?;
+    ))
+    .await?;
 
     // 5. Materialise the memory object so the first guest read is cheap.
-    let _ = execute_ps(&format!(
+    let _ = execute_ps_async(format!(
         "Get-VM -Name {} | Get-VMMemory | Out-Null",
         ps_literal(vm_name)
-    ));
+    ))
+    .await;
 
     // 6. Boot.
-    execute_ps(&format!(
+    execute_ps_async(format!(
         "Start-VM -Name {} -ErrorAction Stop",
         ps_literal(vm_name)
-    ))?;
+    ))
+    .await?;
 
     // 7. Wait for running state, then RDP readiness on loopback.
     wait_for_boot(vm_name).await?;
     verify_rdp_ready(&net_config.loopback_ip).await?;
 
     // 8. Final leak check before handing the session to the user.
-    let leak =
-        network::detect_route_leak(&net_config).map_err(|e| Error::other(e))?;
+    let net = net_config.clone();
+    let leak = tokio::task::spawn_blocking(move || network::detect_route_leak(&net))
+        .await
+        .map_err(|e| Error::other(format!("leak check panicked: {}", e)))?
+        .map_err(Error::other)?;
+
     if leak {
-        network::remediate_leak(&net_config).map_err(|e| Error::other(e))?;
+        let net = net_config.clone();
+        tokio::task::spawn_blocking(move || network::remediate_leak(&net))
+            .await
+            .map_err(|e| Error::other(format!("leak remediation panicked: {}", e)))?
+            .map_err(Error::other)?;
     }
 
     Ok(SpawnedVm {
@@ -202,7 +236,6 @@ pub async fn spawn_stealth_vm(
 // Checkpoints
 // ---------------------------------------------------------------------------
 
-/// Creates a Hyper-V checkpoint for instant redeployment.
 pub fn create_checkpoint(vm_name: &str, checkpoint_name: &str) -> Result<(), Error> {
     execute_ps(&format!(
         "Checkpoint-VM -Name {name} -SnapshotName {snap} -ErrorAction Stop",
@@ -212,10 +245,9 @@ pub fn create_checkpoint(vm_name: &str, checkpoint_name: &str) -> Result<(), Err
     Ok(())
 }
 
-/// Obliterates current state and instantly reverts to the clean snapshot.
 pub fn restore_checkpoint(vm_name: &str, checkpoint_name: &str) -> Result<(), Error> {
     execute_ps(&format!(
-        "Restore-VMSnapshot -Name {snap} -VMName {name} -Confirm:$false -ErrorAction Stop;\n\
+        "Restore-VMCheckpoint -Name {snap} -VMName {name} -Confirm:$false -ErrorAction Stop;\n\
          Start-VM -Name {name};",
         name = ps_literal(vm_name),
         snap = ps_literal(checkpoint_name)
@@ -227,23 +259,44 @@ pub fn restore_checkpoint(vm_name: &str, checkpoint_name: &str) -> Result<(), Er
 // Destroy
 // ---------------------------------------------------------------------------
 
-/// Scorched earth. Forcefully kills the process, deletes the VM, destroys the
-/// differencing disk (all session writes), and tears down network state. The
-/// base image survives untouched.
+/// Scorched earth. Kills the VM, deletes the differencing disk (all session
+/// writes), and tears down network state. The base image survives untouched.
+///
+/// When `disk_path` is `None` the attached disks are resolved from the VM
+/// record before removal — otherwise the delta VHDX leaks in ProgramData and
+/// carries the session evidence with it.
 pub fn destroy_vm(vm_name: &str, disk_path: Option<&Path>) -> Result<(), Error> {
+    let name = ps_literal(vm_name);
+
+    let resolved: Vec<String> = match disk_path {
+        Some(p) => vec![p.to_string_lossy().to_string()],
+        None => execute_ps(&format!(
+            "$vm = Get-VM -Name {name} -ErrorAction SilentlyContinue; \
+             if ($vm) {{ $vm.HardDrives | ForEach-Object {{ $_.Path }} }}",
+            name = name
+        ))
+        .map(|out| {
+            out.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default(),
+    };
+
     execute_ps(&format!(
         "Stop-VM -Name {name} -TurnOff -Force -ErrorAction SilentlyContinue;\n\
          Remove-VM -Name {name} -Force -ErrorAction SilentlyContinue;",
-        name = ps_literal(vm_name)
+        name = name
     ))?;
 
-    // Nuke the delta disk — this is where all session activity (proctoring
+    // Nuke the delta disks — this is where all session activity (proctoring
     // app logs, browser history, exam artifacts) lives. Gone means gone.
-    if let Some(path) = disk_path {
-        let _ = clone::destroy_differencing_disk(path);
+    for path in resolved {
+        let _ = clone::destroy_differencing_disk(Path::new(&path));
     }
 
-    // Tear down network residue.
+    // Tear down network residue. Callers should NOT also call this.
     let _ = network::destroy_network(&network::get_network_config());
 
     Ok(())

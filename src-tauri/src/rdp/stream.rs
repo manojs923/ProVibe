@@ -88,8 +88,6 @@ pub enum StreamError {
     Io(#[from] std::io::Error),
     #[error("thread spawn failed: {0}")]
     ThreadSpawn(String),
-    #[error("window not found")]
-    WindowNotFound,
     #[error("capture failed: {0}")]
     CaptureFailed(String),
     #[error("stream not started")]
@@ -163,25 +161,32 @@ pub type CaptureConfig = StreamConfig;
 // Pixel helpers
 // ---------------------------------------------------------------------------
 
+/// Clips `window_rect` against the output rect, in output-local coordinates.
+/// Both edges are clipped: a window hanging off the left or top of the monitor
+/// otherwise yields a crop shifted by the overhang and captures the wrong
+/// pixels entirely.
 pub fn compute_crop_rect(
     window_rect: (i32, i32, i32, i32),
     output_origin: (i32, i32),
     output_size: (u32, u32),
 ) -> (u32, u32, u32, u32) {
-    let wx = window_rect.0 - output_origin.0;
-    let wy = window_rect.1 - output_origin.1;
-    let ww = (window_rect.2 - window_rect.0).max(0);
-    let wh = (window_rect.3 - window_rect.1).max(0);
+    let wx = (window_rect.0 - output_origin.0) as i64;
+    let wy = (window_rect.1 - output_origin.1) as i64;
+    let ww = (window_rect.2 - window_rect.0).max(0) as i64;
+    let wh = (window_rect.3 - window_rect.1).max(0) as i64;
 
-    let cx = wx.clamp(0, output_size.0 as i32) as u32;
-    let cy = wy.clamp(0, output_size.1 as i32) as u32;
+    let ow = output_size.0 as i64;
+    let oh = output_size.1 as i64;
 
-    let max_w = output_size.0.saturating_sub(cx);
-    let max_h = output_size.1.saturating_sub(cy);
-    let cw = (ww as u32).min(max_w);
-    let ch = (wh as u32).min(max_h);
+    let x0 = wx.max(0);
+    let y0 = wy.max(0);
+    let x1 = (wx + ww).min(ow);
+    let y1 = (wy + wh).min(oh);
 
-    (cx, cy, cw, ch)
+    let cw = (x1 - x0).max(0);
+    let ch = (y1 - y0).max(0);
+
+    (x0 as u32, y0 as u32, cw as u32, ch as u32)
 }
 
 pub fn crop_bgra(
@@ -528,11 +533,7 @@ impl DdaState {
             for row in 0..height as usize {
                 let src_row = src.add(row * row_pitch);
                 let dst_off = row * row_bytes;
-                std::ptr::copy_nonoverlapping(
-                    src_row,
-                    data.as_mut_ptr().add(dst_off),
-                    row_bytes,
-                );
+                std::ptr::copy_nonoverlapping(src_row, data.as_mut_ptr().add(dst_off), row_bytes);
             }
 
             self.context.Unmap(staging, 0);
@@ -805,7 +806,7 @@ impl RdpStream {
     }
 
     /// Tunnel-facing entry point: attach by client handle and wait for the
-    /// first frame before returning.
+    /// first frame before returning. Blocking — up to `ATTACH_TIMEOUT`.
     #[cfg(windows)]
     pub async fn attach(
         handle: &RDPClientHandle,
@@ -858,7 +859,8 @@ impl RdpStream {
                 });
             }
 
-            thread::sleep(FRAME_POLL);
+            // Yield to the reactor rather than pinning a worker thread.
+            tokio::time::sleep(FRAME_POLL).await;
         }
     }
 
@@ -870,7 +872,10 @@ impl RdpStream {
 
     /// Attach to a running RdpClient, locate its window, and start capturing.
     #[cfg(windows)]
-    pub fn attach_to_client_window(&mut self, client: &crate::rdp::client::RdpClient) -> Result<(), StreamError> {
+    pub fn attach_to_client_window(
+        &mut self,
+        client: &crate::rdp::client::RdpClient,
+    ) -> Result<(), StreamError> {
         let pid = client.process_id().ok_or(StreamError::NoRdpWindow)?;
         self.rdp_client_pid = Some(pid);
         let hwnd = find_rdp_window(pid)?;
@@ -921,7 +926,7 @@ impl RdpStream {
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), StreamError>>();
 
-        let worker = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("rdp-capture".to_string())
             .spawn(move || {
                 let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
@@ -941,8 +946,6 @@ impl RdpStream {
                         return;
                     }
                 };
-
-                let mut first_frame_sent = false;
 
                 while running.load(Ordering::SeqCst) {
                     let now = Instant::now();
@@ -980,8 +983,7 @@ impl RdpStream {
                     if config.crop_to_window {
                         if let Engine::Dda(dda) = &engine {
                             let (origin, size) = dda.output_geometry();
-                            let crop =
-                                compute_crop_rect(window_screen_rect(hwnd), origin, size);
+                            let crop = compute_crop_rect(window_screen_rect(hwnd), origin, size);
                             if crop.2 > 0 && crop.3 > 0 {
                                 let cropped = crop_bgra(&raw.data, raw.width, raw.stride(), crop);
                                 if !cropped.is_empty() {
@@ -1015,12 +1017,18 @@ impl RdpStream {
                     };
 
                     *latest_frame.lock().unwrap() = Some(frame);
-                    first_frame_sent = true;
                 }
+            });
 
-                let _ = first_frame_sent;
-            })
-            .map_err(|e| StreamError::ThreadSpawn(e.to_string()))?;
+        let worker = match spawned {
+            Ok(w) => w,
+            Err(e) => {
+                // Without this the stream reports itself running with no
+                // worker and next_frame() spins until timeout forever.
+                self.running.store(false, Ordering::SeqCst);
+                return Err(StreamError::ThreadSpawn(e.to_string()));
+            }
+        };
 
         self.worker = Some(worker);
 

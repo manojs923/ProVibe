@@ -147,9 +147,17 @@ try {
 }
 "#;
 
+    // `-Command` with the script inline: PS_ARGS ends in `-Command -`, which
+    // reads stdin, so a null stdin would hand PowerShell an empty script.
     match std::process::Command::new("powershell.exe")
-        .args(PS_ARGS)
-        .stdin(Stdio::null())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            probe,
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -287,6 +295,9 @@ pub fn build_unmask_script(vm_name: &str) -> String {
 
     // 4. Reattach the original disk image (if the canonical path is present)
     s.push_str("# Reattach original disk image if canonical path exists\n");
+    s.push_str("$diskRoot = $env:VM_DISKS\n");
+    s.push_str("if (-not $diskRoot) { $diskRoot = Join-Path $env:ProgramData 'Protocol\\VMs' }\n");
+    s.push_str(&format!("$origDisk = Join-Path $diskRoot \"{}.vhdx\"\n", vm_name));
     s.push_str(&format!(
         "$origDisk = Join-Path $env:VM_DISKS \"{}.vhdx\"\n",
         vm_name

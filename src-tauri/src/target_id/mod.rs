@@ -159,7 +159,7 @@ pub enum DetectionVectorKind {
 }
 
 /// Detection vectors used by the matcher to identify the target.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DetectionVector {
     pub process_names: Vec<String>,
     pub registry_keys: Vec<String>,

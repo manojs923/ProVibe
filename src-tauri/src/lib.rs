@@ -8,36 +8,239 @@ mod vm;
 
 pub use target_id::{fetch_all, fetch_profile};
 
-use tauri::{Emitter, Manager};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use std::collections::HashMap;
+use std::fs;
+use std::io::Cursor;
+use std::sync::mpsc::{channel, Receiver};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use rdev::{listen, EventType, Key};
+use screenshots::Screen;
+use serde::{Deserialize, Serialize};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager};
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::HWND;
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
 
 /// Fallback guest name when `PROTOCOL_VM_NAME` is unset.
 const DEFAULT_VM_NAME: &str = "Test-Nartan-Build";
 
 // ---------------------------------------------------------------------------
+// Trigger configuration (trigger_config.json next to the executable)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerConfig {
+    /// Double-tap to summon the copilot. Default: CapsLock (invisible, net-zero).
+    pub summon_double_tap: String,
+    /// Double-tap to buffer one frame. Default: "-" (leaves "--").
+    pub sniper_double_tap: String,
+    /// Double-tap to flush the frame buffer. Default: Return.
+    pub flush_double_tap: String,
+    /// Double-tap to start/stop audio capture. Default: "." (leaves "..").
+    pub audio_double_tap: String,
+    /// Double-tap to hide/show the window. Default: ScrollLock (inert in browsers).
+    pub toggle_double_tap: String,
+    /// Double-tap to raise opacity.
+    pub opacity_up_double_tap: String,
+    /// Double-tap to lower opacity.
+    pub opacity_down_double_tap: String,
+    /// Max ms between two presses of the same key to count as a double-tap.
+    pub double_tap_window_ms: u64,
+    /// Cooldown FLOOR for the sniper, in ms. Summon/toggle/opacity ignore this.
+    pub cooldown_min_ms: u64,
+    /// Cooldown CEILING for the sniper — the gate is jittered inside the range
+    /// so repeated captures don't land on a metronome.
+    pub cooldown_max_ms: u64,
+}
+
+impl Default for TriggerConfig {
+    fn default() -> Self {
+        Self {
+            summon_double_tap: "CapsLock".to_string(),
+            sniper_double_tap: "-".to_string(),
+            flush_double_tap: "Return".to_string(),
+            audio_double_tap: ".".to_string(),
+            toggle_double_tap: "ScrollLock".to_string(),
+            opacity_up_double_tap: "=".to_string(),
+            opacity_down_double_tap: "[".to_string(),
+            double_tap_window_ms: 400,
+            cooldown_min_ms: 1500,
+            cooldown_max_ms: 2000,
+        }
+    }
+}
+
+impl TriggerConfig {
+    /// Rejects tokens that carry a modifier, since the whole point is to keep
+    /// the guest-side fingerprint modifier-free.
+    fn sanitized(mut self) -> Self {
+        let defaults = TriggerConfig::default();
+
+        let fields: [&mut String; 7] = [
+            &mut self.summon_double_tap,
+            &mut self.sniper_double_tap,
+            &mut self.flush_double_tap,
+            &mut self.audio_double_tap,
+            &mut self.toggle_double_tap,
+            &mut self.opacity_up_double_tap,
+            &mut self.opacity_down_double_tap,
+        ];
+        let fallbacks: [&String; 7] = [
+            &defaults.summon_double_tap,
+            &defaults.sniper_double_tap,
+            &defaults.flush_double_tap,
+            &defaults.audio_double_tap,
+            &defaults.toggle_double_tap,
+            &defaults.opacity_up_double_tap,
+            &defaults.opacity_down_double_tap,
+        ];
+
+        for (slot, fallback) in fields.into_iter().zip(fallbacks) {
+            let lowered = slot.to_lowercase();
+            if lowered.contains("ctrl")
+                || lowered.contains("alt")
+                || lowered.contains("shift")
+                || lowered.contains("meta")
+                || lowered.contains("win")
+            {
+                eprintln!(
+                    "⚠️ trigger '{}' uses a modifier, falling back to '{}'",
+                    slot, fallback
+                );
+                *slot = fallback.clone();
+            }
+        }
+
+        if self.double_tap_window_ms < 120 {
+            self.double_tap_window_ms = 400;
+        }
+        if self.cooldown_max_ms < self.cooldown_min_ms {
+            self.cooldown_max_ms = self.cooldown_min_ms;
+        }
+        self
+    }
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .map(|d| d.join("trigger_config.json"))
+}
+
+fn load_config() -> TriggerConfig {
+    if let Some(path) = config_path() {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            match serde_json::from_str::<TriggerConfig>(&raw) {
+                Ok(cfg) => {
+                    #[cfg(debug_assertions)]
+                    println!("⚙️ trigger_config.json loaded: {:?}", cfg);
+                    return cfg.sanitized();
+                }
+                Err(e) => {
+                    eprintln!("⚠️ trigger_config.json malformed ({}), restoring template.", e);
+                    if let Ok(t) = serde_json::to_string_pretty(&TriggerConfig::default()) {
+                        let _ = fs::write(&path, t);
+                    }
+                }
+            }
+        } else if let Ok(t) = serde_json::to_string_pretty(&TriggerConfig::default()) {
+            let _ = fs::write(&path, t);
+        }
+    }
+    TriggerConfig::default()
+}
+
+#[tauri::command]
+fn get_trigger_config() -> TriggerConfig {
+    load_config()
+}
+
+#[tauri::command]
+fn reload_trigger_config(app: AppHandle) -> TriggerConfig {
+    let cfg = load_config();
+    let _ = app.emit("trigger-config", &cfg);
+    cfg
+}
+
+// ---------------------------------------------------------------------------
+// Capture
+// ---------------------------------------------------------------------------
+
+fn grab_primary_monitor() -> Result<String, String> {
+    let screens = Screen::all().map_err(|e| e.to_string())?;
+    let screen = screens.first().ok_or("monitor_not_found")?;
+    let image = screen.capture().map_err(|e| e.to_string())?;
+
+    let mut buffer = Vec::new();
+    let mut cursor = Cursor::new(&mut buffer);
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut cursor, image::ImageOutputFormat::Jpeg(75))
+        .map_err(|e| e.to_string())?;
+
+    Ok(STANDARD.encode(&buffer))
+}
+
+/// Full-monitor capture for the bare-metal fallback.
+///
+/// The window is protected with WDA_EXCLUDEFROMCAPTURE, and GDI BitBlt (what
+/// the `screenshots` crate uses) renders protected windows as a solid black
+/// rectangle. Protection is dropped for the duration of the shot so the exam
+/// underneath stays readable, then restored.
+#[tauri::command]
+async fn capture_screen_native(app: AppHandle) -> Result<String, String> {
+    let window = app.get_webview_window("main");
+    if let Some(w) = &window {
+        let _ = w.set_content_protected(false);
+    }
+    tokio::time::sleep(Duration::from_millis(90)).await;
+
+    let result = tokio::task::spawn_blocking(grab_primary_monitor)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(w) = &window {
+        let _ = w.set_content_protected(true);
+    }
+    result
+}
+
+/// Console-only capture for VM mode. `ip` doubles as a window hint.
+#[tauri::command]
+async fn capture_rdp_window(ip: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || rdp::stream::capture_window_by_hint(&ip))
+        .await
+        .map_err(|e| format!("capture task panicked: {}", e))?
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // C2 endpoints
 // ---------------------------------------------------------------------------
 
-/// Orchestrate a stealth VM for `target` and report the resulting state.
-///
-/// Spawning shells out to `vmconnect` and blocks, so it runs on the blocking
-/// pool rather than stalling the async runtime.
 #[tauri::command]
 async fn launch_stealth_vm(target: String) -> Result<String, String> {
     #[cfg(debug_assertions)]
     println!("orchestrating hyper-v container for target: {}", target);
 
-    let vm_name =
-        std::env::var("PROTOCOL_VM_NAME").unwrap_or_else(|_| DEFAULT_VM_NAME.to_string());
-
+    let vm_name = std::env::var("PROTOCOL_VM_NAME").unwrap_or_else(|_| DEFAULT_VM_NAME.to_string());
     let spawn_name = vm_name.clone();
     let profile = target.clone();
 
-    let spawned =
-        tokio::task::spawn_blocking(move || vm::spawn_stealth_vm_cmd(spawn_name, Some(profile)))
-            .await
-            .map_err(|e| format!("spawn task panicked: {}", e))?
-            .map_err(|e| format!("spawn failed: {}", e))?;
+    // `spawn_stealth_vm_cmd` is async; the blocking form is what belongs inside
+    // spawn_blocking.
+    let spawned = tokio::task::spawn_blocking(move || {
+        vm::spawn_stealth_vm_blocking(spawn_name, Some(profile))
+    })
+    .await
+    .map_err(|e| format!("spawn task panicked: {}", e))?
+    .map_err(|e| format!("spawn failed: {}", e))?;
 
     if !spawned.success {
         return Err(format!(
@@ -52,161 +255,198 @@ async fn launch_stealth_vm(target: String) -> Result<String, String> {
     ))
 }
 
-/// Capture the guest console as a base64 JPEG.
-///
-/// `ip` doubles as a window hint: the best-scoring visible console window wins,
-/// so an IP that matches no title still resolves the only open console.
-#[tauri::command]
-async fn capture_rdp_window(ip: String) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || rdp::stream::capture_window_by_hint(&ip))
-        .await
-        .map_err(|e| format!("capture task panicked: {}", e))?
-        .map_err(|e| e.to_string())
+// ---------------------------------------------------------------------------
+// Keystroke engine
+// ---------------------------------------------------------------------------
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Jittered cooldown ceiling for gated commands.
+fn next_gate(cfg: &TriggerConfig) -> u64 {
+    let span = cfg.cooldown_max_ms.saturating_sub(cfg.cooldown_min_ms).max(1);
+    let mut x = now_ms() | 1;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    now_ms() + cfg.cooldown_min_ms + (x % span)
+}
+
+fn key_token(k: &Key) -> Option<String> {
+    let name = format!("{:?}", k);
+    match k {
+        Key::Tab => Some("Tab".to_string()),
+        Key::CapsLock => Some("CapsLock".to_string()),
+        Key::ScrollLock => Some("ScrollLock".to_string()),
+        Key::Return | Key::KpReturn => Some("Return".to_string()),
+        Key::Minus | Key::KpMinus => Some("-".to_string()),
+        Key::Dot | Key::KpDelete => Some(".".to_string()),
+        Key::Equal | Key::KpPlus => Some("=".to_string()),
+        Key::LeftBracket => Some("[".to_string()),
+        Key::RightBracket => Some("]".to_string()),
+        Key::BackQuote => Some("`".to_string()),
+        Key::SemiColon => Some(";".to_string()),
+        Key::Comma => Some(",".to_string()),
+        Key::Slash => Some("/".to_string()),
+        Key::BackSlash => Some("\\".to_string()),
+        _ => {
+            if name.len() <= 8 {
+                Some(name)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+enum KeyMsg {
+    Press { key: Key, at: u64 },
+}
+
+fn keystroke_thread(app: AppHandle, rx: Receiver<KeyMsg>) {
+    let mut cfg = load_config();
+    let _ = app.emit("trigger-config", &cfg);
+
+    // Only gated commands appear here.
+    let mut gates: HashMap<&'static str, u64> = HashMap::new();
+    let mut last_key: Option<(Key, u64)> = None;
+
+    let matches = |token: &Option<String>, trigger: &str| -> bool {
+        token
+            .as_ref()
+            .map(|t| t.eq_ignore_ascii_case(trigger))
+            .unwrap_or(false)
+    };
+
+    while let Ok(msg) = rx.recv() {
+        let KeyMsg::Press { key, at } = msg;
+        let token = key_token(&key);
+
+        let pair = matches!(&last_key, Some((prev, prev_at))
+            if *prev == key && at.saturating_sub(*prev_at) <= cfg.double_tap_window_ms);
+
+        if !pair {
+            last_key = Some((key, at));
+            continue;
+        }
+
+        let command: Option<&'static str> = if matches(&token, &cfg.summon_double_tap) {
+            Some("SUMMON_COPILOT")
+        } else if matches(&token, &cfg.sniper_double_tap) {
+            Some("TRIGGER_SNIPER")
+        } else if matches(&token, &cfg.flush_double_tap) {
+            Some("FLUSH_BUFFER")
+        } else if matches(&token, &cfg.audio_double_tap) {
+            Some("TRIGGER_AUDIO")
+        } else if matches(&token, &cfg.toggle_double_tap) {
+            Some("TOGGLE_VISIBILITY")
+        } else if matches(&token, &cfg.opacity_up_double_tap) {
+            Some("OPACITY_UP")
+        } else if matches(&token, &cfg.opacity_down_double_tap) {
+            Some("OPACITY_DOWN")
+        } else {
+            None
+        };
+
+        let Some(command) = command else {
+            last_key = Some((key, at));
+            continue;
+        };
+
+        // Only the sniper is gated. Summon and toggle must feel instant.
+        let gated = matches!(command, "TRIGGER_SNIPER");
+        if gated {
+            let allowed = gates.get(command).copied().unwrap_or(0);
+            if at < allowed {
+                #[cfg(debug_assertions)]
+                println!("⏳ gate: {} blocked (retry after {})", command, allowed);
+                // Re-arm with this press so the next tap retries immediately
+                // instead of the attempt being swallowed.
+                last_key = Some((key, at));
+                continue;
+            }
+            gates.insert(command, next_gate(&cfg));
+        }
+
+        #[cfg(debug_assertions)]
+        println!("🔥 INTERCEPT: {}", command);
+
+        if command == "SUMMON_COPILOT" || command == "TOGGLE_VISIBILITY" {
+            if let Some(window) = app.get_webview_window("main") {
+                if command == "TOGGLE_VISIBILITY" && window.is_visible().unwrap_or(false) {
+                    let _ = window.hide();
+                } else {
+                    let _ = window.show();
+                }
+            }
+        }
+
+        if command == "TRIGGER_SNIPER" || command == "TRIGGER_AUDIO" {
+            // Re-read so edits to the JSON take effect without a restart.
+            cfg = load_config();
+        }
+
+        if let Err(e) = app.emit("app-command", command) {
+            #[cfg(debug_assertions)]
+            eprintln!("⚠️ IPC warning - frontend unhooked: {}", e);
+        }
+
+        last_key = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    // Windows-only imports stay inside `run` so the module compiles elsewhere.
-    #[cfg(target_os = "windows")]
-    use windows::Win32::Foundation::HWND;
-    #[cfg(target_os = "windows")]
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
-    };
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&quit])?;
 
-    tauri::Builder::default()
-        // 1. Native window tracker (remembers position and size across reboots).
-        .plugin(tauri_plugin_window_state::Builder::default().build())
-        // 2. Global macro listener.
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, shortcut, event| {
-                    if event.state != ShortcutState::Pressed {
-                        return;
-                    }
-
-                    let raw_os_key = shortcut.to_string().to_lowercase();
-
-                    // The summoning protocol.
-                    let unified_command = match raw_os_key.as_str() {
-                        k if k.contains("alt+-") => "SUMMON_COPILOT",
-                        k if k.contains("alt+t") => "SUMMON_COPILOT",
-                        k if k.contains("keya") => "TRIGGER_AUDIO",
-                        k if k.contains("keyh") => "TOGGLE_VISIBILITY",
-                        k if k.contains(".") || k.contains("period") => "TOGGLE_VISIBILITY",
-                        k if k.contains("arrowup") => "OPACITY_UP",
-                        k if k.contains("arrowdown") => "OPACITY_DOWN",
-                        k if k.contains("keyv") => "SPAWN_VM",
-                        k if k.contains("keyr") => "TOGGLE_RDP_TUNNEL",
-                        _ => "UNKNOWN_COMMAND",
-                    };
-
-                    #[cfg(debug_assertions)]
-                    println!("OS INTERCEPT: {}", unified_command);
-
-                    // Zero-latency OS window summoning.
-                    if unified_command == "SUMMON_COPILOT"
-                        || unified_command == "TOGGLE_VISIBILITY"
-                    {
-                        if let Some(window) = app.get_webview_window("main") {
-                            if unified_command == "TOGGLE_VISIBILITY"
-                                && window.is_visible().unwrap_or(false)
-                            {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                    }
-
-                    // VM spawn hotkey routes into the orchestration subsystem.
-                    if unified_command == "SPAWN_VM" {
-                        std::thread::spawn(move || {
-                            let vm_name = std::env::var("PROTOCOL_VM_NAME")
-                                .unwrap_or_else(|_| DEFAULT_VM_NAME.to_string());
-
-                            if let Err(e) = vm::spawn_stealth_vm_cmd(vm_name, None) {
-                                #[cfg(debug_assertions)]
-                                eprintln!("VM spawn failed: {}", e);
-                            }
-                        });
-                    }
-
-                    // RDP loopback tunnel toggle — stops when live, starts when not.
-                    if unified_command == "TOGGLE_RDP_TUNNEL" {
-                        std::thread::spawn(move || {
-                            let active = rdp::get_tunnel_status(None)
-                                .map(|status| status.active)
-                                .unwrap_or(false);
-
-                            let outcome = if active {
-                                rdp::stop_loopback_tunnel(None)
-                            } else {
-                                rdp::start_loopback_tunnel_cmd(None, None)
-                                    .map(|result| result.message)
-                            };
-
-                            if let Err(e) = outcome {
-                                #[cfg(debug_assertions)]
-                                eprintln!("RDP tunnel toggle failed: {}", e);
-                            }
-                        });
-                    }
-
-                    // Defensive event emission — the frontend may not be up yet.
-                    if let Err(e) = app.emit("app-command", unified_command) {
-                        #[cfg(debug_assertions)]
-                        eprintln!("WARNING: frontend unreachable for hotkey event: {}", e);
-                    }
-                })
-                .build(),
-        )
-        .setup(|app| {
-            // 3. Register global shortcuts.
-            let _ = app.global_shortcut().register("Alt+-");
-            let _ = app.global_shortcut().register("Alt+T");
-            let _ = app.global_shortcut().register("Alt+A");
-            let _ = app.global_shortcut().register("Alt+H");
-            let _ = app.global_shortcut().register("Alt+Up");
-            let _ = app.global_shortcut().register("Alt+Down");
-            let _ = app.global_shortcut().register(".");
-            let _ = app.global_shortcut().register("Alt+V");
-            let _ = app.global_shortcut().register("Alt+R");
-
-            // 4. OS-level screen-capture evasion.
-            #[cfg(target_os = "windows")]
+    let mut builder = TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            if event.id() == "quit" {
+                app.exit(0);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                ..
+            } = event
             {
-                if let Some(window) = app.get_webview_window("main") {
-                    if let Ok(hwnd_wrapper) = window.hwnd() {
-                        let hwnd = hwnd_wrapper.0 as isize;
-                        unsafe {
-                            let _ = SetWindowDisplayAffinity(
-                                HWND(hwnd as *mut core::ffi::c_void),
-                                WDA_EXCLUDEFROMCAPTURE,
-                            );
-                        }
-                        println!("Stealth protocol: window is now invisible to screen capture.");
-                    }
+                let app = tray.app_handle();
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
                 }
             }
+        });
 
-            // 5. Passive lockdown-browser detection at startup.
-            #[cfg(target_os = "windows")]
-            {
-                let app_handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    tauri::async_runtime::block_on(target_id::start_detection_loop(&app_handle));
-                });
-            }
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
 
-            Ok(())
-        })
+    builder.build(app)?;
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
+            capture_screen_native,
+            capture_rdp_window,
+            get_trigger_config,
+            reload_trigger_config,
+            launch_stealth_vm,
             target_id::scan_for_lockdown_browsers,
             vm::get_vm_status,
             vm::spawn_stealth_vm_cmd,
@@ -216,9 +456,54 @@ pub fn run() {
             rdp::stop_loopback_tunnel,
             patches::apply_target_patches,
             stealth::verify_stealth_posture,
-            launch_stealth_vm,
-            capture_rdp_window,
         ])
+        .setup(|app| {
+            let _ = build_tray(app);
+
+            // Raw global keystream — replaces every global shortcut.
+            let app_handle = app.handle().clone();
+            let (tx, rx) = channel::<KeyMsg>();
+
+            std::thread::spawn(move || keystroke_thread(app_handle, rx));
+
+            std::thread::spawn(move || {
+                let callback = move |event: rdev::Event| {
+                    if let EventType::KeyPress(key) = event.event_type {
+                        let _ = tx.send(KeyMsg::Press { key, at: now_ms() });
+                    }
+                };
+                if let Err(e) = listen(callback) {
+                    eprintln!("⚠️ keystroke listener failed to attach: {:?}", e);
+                }
+            });
+
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Ok(hwnd_wrapper) = window.hwnd() {
+                        unsafe {
+                            if SetWindowDisplayAffinity(
+                                HWND(hwnd_wrapper.0 as _),
+                                WDA_EXCLUDEFROMCAPTURE,
+                            )
+                            .is_err()
+                            {
+                                eprintln!("🛡️ stealth failure: os blocked drm evasion.");
+                            }
+                        }
+                        #[cfg(debug_assertions)]
+                        println!("🛡️ DRM screen evasion active.");
+                    }
+                }
+
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    tauri::async_runtime::block_on(target_id::start_detection_loop(&handle));
+                });
+            }
+
+            Ok(())
+        })
         .run(tauri::generate_context!())
-        .expect("CRITICAL FAILURE: The Operating System refused to allocate resources for the application.");
+        .expect("CRITICAL FAILURE: OS rejected application initialization.");
 }

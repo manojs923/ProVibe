@@ -10,6 +10,12 @@
 //   stream.rs  -> captures the mstsc window's rendered output
 //   audio.rs   -> taps RDP audio redirection for speech-to-text
 //   input.rs   -> optional synthetic input forwarding
+//
+// NOTE: the Tunnel/RdpClient/StreamCapture machinery below is not reachable
+// from any command yet. The commands are standalone PowerShell wrappers. See
+// the wiring note at the bottom.
+
+#![allow(dead_code)]
 
 pub mod audio;
 pub mod client;
@@ -18,7 +24,7 @@ pub mod stream;
 
 use std::net::TcpStream;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -27,6 +33,14 @@ use crate::rdp::audio::AudioTap;
 use crate::rdp::client::{ClientError, RdpClient};
 use crate::rdp::input::{InputConfig, InputError, InputEvent, InputForwarder};
 use crate::rdp::stream::{CaptureConfig, Frame, StreamCapture, StreamError};
+
+/// The one loopback address the whole crate agrees on. `hyperv.rs` binds the
+/// Hyper-V vEthernet here and the frontend passes it to `capture_rdp_window`.
+pub const LOOPBACK_IP: &str = "127.0.0.2";
+/// Adapter name owned by this module.
+pub const LOOPBACK_ADAPTER: &str = "ProtocolLoopback";
+/// Guest RDP port.
+pub const RDP_PORT: u16 = 3389;
 
 // -----------------------------------------------------------------------------
 // Contracts expected from sibling modules
@@ -46,12 +60,6 @@ use crate::rdp::stream::{CaptureConfig, Frame, StreamCapture, StreamError};
 //       pub fn kill(&mut self) -> Result<(), ClientError>;
 //       pub async fn disconnect(&mut self) -> Result<(), ClientError>;
 //   }
-//   impl RDPClientHandle {
-//       pub fn pid(&self) -> u32;
-//       pub fn window_title(&self) -> String;
-//       pub fn get_window_handle(&self) -> Result<HWND, windows::core::Error>;
-//       pub fn get_guest_resolution(&self) -> (u32, u32);
-//   }
 //
 // stream.rs:
 //   pub struct StreamCapture; pub struct CaptureConfig (Clone); pub enum StreamError;
@@ -61,21 +69,30 @@ use crate::rdp::stream::{CaptureConfig, Frame, StreamCapture, StreamError};
 //       pub async fn next_frame(&mut self) -> Result<Frame, StreamError>;
 //       pub async fn detach(self) -> Result<(), StreamError>;
 //   }
-//
-// audio.rs:
-//   impl AudioTap {
-//       pub fn new(enabled: bool) -> Self;
-//       pub fn start(&mut self, handle: &RDPClientHandle) -> Result<(), AudioError>;
-//       pub fn stop(&mut self) -> Result<(), AudioError>;
-//   }
-//
-// input.rs:
-//   impl InputForwarder {
-//       pub fn new(handle: &RDPClientHandle, cfg: InputConfig) -> Result<Self, InputError>;
-//       pub fn send(&mut self, event: InputEvent) -> Result<(), InputError>;
-//       pub fn shutdown(&mut self) -> Result<(), InputError>;
-//   }
 // -----------------------------------------------------------------------------
+
+fn ps_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn run_ps(script: &str) -> Result<String, String> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .map_err(|e| format!("powershell spawn failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
 // =============================================================================
 // Tauri commands
@@ -91,58 +108,65 @@ pub struct TunnelStatus {
     pub adapter_name: String,
 }
 
+#[derive(serde::Deserialize)]
+struct AdapterRow {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Status")]
+    status: String,
+}
+
+fn adapter_state() -> (String, bool) {
+    let script = format!(
+        "Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue | Select-Object Name, Status | ConvertTo-Json -Compress",
+        ps_escape(LOOPBACK_ADAPTER)
+    );
+
+    let Ok(raw) = run_ps(&script) else {
+        return ("None".to_string(), false);
+    };
+    if raw.is_empty() {
+        return ("None".to_string(), false);
+    }
+
+    // ConvertTo-Json emits an object for one row, an array for many.
+    let rows: Vec<AdapterRow> = match serde_json::from_str::<Vec<AdapterRow>>(&raw) {
+        Ok(v) => v,
+        Err(_) => match serde_json::from_str::<AdapterRow>(&raw) {
+            Ok(v) => vec![v],
+            Err(_) => return ("None".to_string(), false),
+        },
+    };
+
+    match rows.into_iter().next() {
+        Some(row) => {
+            let up = row.status.eq_ignore_ascii_case("Up");
+            (row.name, up)
+        }
+        None => ("None".to_string(), false),
+    }
+}
+
 #[tauri::command]
 pub fn get_tunnel_status(local_port: Option<u16>) -> Result<TunnelStatus, String> {
-    let port = local_port.unwrap_or(3389);
+    let port = local_port.unwrap_or(RDP_PORT);
+    let (adapter_name, adapter_up) = adapter_state();
 
-    let sock_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
+    let addr = format!("{}:{}", LOOPBACK_IP, port);
+    let sock_addr: std::net::SocketAddr = addr
         .parse()
         .map_err(|e: std::net::AddrParseError| e.to_string())?;
 
-    // Check if something is listening on the RDP port.
-    let listener_active =
-        TcpStream::connect_timeout(&sock_addr, Duration::from_millis(500)).is_ok();
-
-    // Check loopback adapter existence.
-    let adapter_output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-NetAdapter | Where-Object { $_.Name -like '*Loopback*' -or $_.Name -like '*RDP*' -or $_.Name -like '*Tunnel*' } | Select-Object Name, Status | ConvertTo-Json",
-        ])
-        .output()
-        .map_err(|e| format!("Adapter check failed: {}", e))?;
-
-    let adapter_info = String::from_utf8_lossy(&adapter_output.stdout);
-    let adapter_name = if adapter_info.contains("Up") {
-        adapter_info
-            .lines()
-            .find(|l| l.contains("Name"))
-            .and_then(|l| l.split(':').nth(1))
-            .map(|s| s.trim().trim_matches(|c| c == '"' || c == ',').to_string())
-            .unwrap_or_else(|| "Unknown".to_string())
-    } else {
-        "None".to_string()
-    };
-
-    // Measure latency if active.
-    let latency = if listener_active {
-        let start = std::time::Instant::now();
-        if TcpStream::connect_timeout(&sock_addr, Duration::from_secs(1)).is_ok() {
-            Some(start.elapsed().as_millis() as u64)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let start = Instant::now();
+    let listener_active = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(500)).is_ok();
+    let latency_ms = listener_active.then(|| start.elapsed().as_millis() as u64);
 
     Ok(TunnelStatus {
-        active: listener_active,
+        active: listener_active && adapter_up,
         local_port: port,
-        remote_host: "127.0.0.1".to_string(),
+        remote_host: LOOPBACK_IP.to_string(),
         remote_port: port,
-        latency_ms: latency,
+        latency_ms,
         adapter_name,
     })
 }
@@ -160,105 +184,107 @@ pub fn start_loopback_tunnel_cmd(
     adapter_name: Option<String>,
     ip_address: Option<String>,
 ) -> Result<TunnelStartResult, String> {
-    let adapter = adapter_name.unwrap_or_else(|| "ProtocolLoopback".to_string());
-    let ip = ip_address.unwrap_or_else(|| "192.168.137.1".to_string());
+    let adapter = adapter_name.unwrap_or_else(|| LOOPBACK_ADAPTER.to_string());
+    let ip = ip_address.unwrap_or_else(|| LOOPBACK_IP.to_string());
+    let adapter_esc = ps_escape(&adapter);
+    let ip_esc = ps_escape(&ip);
 
+    // The Microsoft KM-TEST loopback adapter is not a Windows feature; it is an
+    // INF install. `netcfg` is the reliable route, `devcon` is the WDK fallback.
     let install_script = format!(
-        r#"
-        $existing = Get-NetAdapter -Name '{adapter}' -ErrorAction SilentlyContinue
-        if (-not $existing) {{
-            $devconPath = "C:\Program Files (x86)\Windows Kits\10\Tools\x64\devcon.exe"
-            if (Test-Path $devconPath) {{
-                & $devconPath install $env:WINDIR\INF\netloop.inf *MSLOOP
-            }} else {{
-                Install-WindowsFeature -Name RSAT-Loopback -ErrorAction SilentlyContinue
-            }}
-            Start-Sleep -Seconds 2
-            $adapters = Get-NetAdapter | Where-Object {{ $_.InterfaceDescription -like '*Loopback*' }} | Sort-Object ifIndex | Select-Object -Last 1
-            if ($adapters) {{ Rename-NetAdapter -Name $adapters.Name -NewName '{adapter}' }}
+        r#"$ErrorActionPreference = 'Stop'
+$name = '{adapter}'
+$existing = Get-NetAdapter -Name $name -ErrorAction SilentlyContinue
+if (-not $existing) {{
+    $lo = Get-NetAdapter -ErrorAction SilentlyContinue |
+          Where-Object {{ $_.InterfaceDescription -like '*Loopback*' }} |
+          Select-Object -First 1
+    if (-not $lo) {{
+        netcfg -l $env:WINDIR\inf\netloop.inf -c s -i ms_loopback | Out-Null
+        Start-Sleep -Seconds 3
+        $lo = Get-NetAdapter -ErrorAction SilentlyContinue |
+              Where-Object {{ $_.InterfaceDescription -like '*Loopback*' }} |
+              Select-Object -First 1
+    }}
+    if (-not $lo) {{
+        $devcon = "C:\Program Files (x86)\Windows Kits\10\Tools\x64\devcon.exe"
+        if (Test-Path $devcon) {{
+            & $devcon install $env:WINDIR\INF\netloop.inf *MSLOOP | Out-Null
+            Start-Sleep -Seconds 3
+            $lo = Get-NetAdapter -ErrorAction SilentlyContinue |
+                  Where-Object {{ $_.InterfaceDescription -like '*Loopback*' }} |
+                  Select-Object -First 1
         }}
-        Enable-NetAdapter -Name '{adapter}' -Confirm:$false
-        "#,
-        adapter = adapter
+    }}
+    if (-not $lo) {{ throw 'loopback adapter could not be installed (need admin + netcfg)' }}
+    Rename-NetAdapter -Name $lo.Name -NewName $name -ErrorAction SilentlyContinue
+}}
+if (-not (Get-NetAdapter -Name $name -ErrorAction SilentlyContinue)) {{
+    throw 'loopback adapter missing after install'
+}}
+Enable-NetAdapter -Name $name -Confirm:$false -ErrorAction SilentlyContinue
+"#,
+        adapter = adapter_esc
     );
 
-    Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            install_script.as_str(),
-        ])
-        .output()
-        .map_err(|e| format!("Adapter installation failed: {}", e))?;
+    run_ps(&install_script)?;
 
+    // Clear any stacked address from a previous run before assigning.
     let ip_script = format!(
-        r#"
-        $iface = Get-NetAdapter -Name '{adapter}'
-        $iface | New-NetIPAddress -IPAddress {ip} -PrefixLength 24 -ErrorAction SilentlyContinue
-        $iface | Set-NetIPInterface -InterfaceMetric 5
-        "#,
-        adapter = adapter,
-        ip = ip
+        r#"$ErrorActionPreference = 'Stop'
+$name = '{adapter}'
+Get-NetIPAddress -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+New-NetIPAddress -InterfaceAlias $name -IPAddress {ip} -PrefixLength 24 -ErrorAction Stop | Out-Null
+Set-NetIPInterface -InterfaceAlias $name -InterfaceMetric 5
+"#,
+        adapter = adapter_esc,
+        ip = ip_esc
     );
 
-    let ip_output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", ip_script.as_str()])
-        .output()
-        .map_err(|e| format!("IP assignment failed: {}", e))?;
+    let ip_ok = run_ps(&ip_script).is_ok();
 
-    let success = ip_output.status.success();
-
-    Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'",
-        ])
-        .output()
-        .map_err(|e| format!("RDP enable failed: {}", e))?;
+    // Host-side RDP listener; best-effort, needs elevation.
+    let _ = run_ps(
+        "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' \
+         -Name 'fDenyTSConnections' -Value 0; \
+         Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'",
+    );
 
     Ok(TunnelStartResult {
-        success,
+        success: ip_ok,
         adapter_name: adapter,
         ip_address: ip,
-        message: if success {
-            "Loopback tunnel established".to_string()
+        message: if ip_ok {
+            "loopback tunnel established".to_string()
         } else {
-            "Adapter created but IP assignment may have failed".to_string()
+            "adapter present but IP assignment failed".to_string()
         },
     })
 }
 
 #[tauri::command]
 pub fn stop_loopback_tunnel(adapter_name: Option<String>) -> Result<String, String> {
-    let adapter = adapter_name.unwrap_or_else(|| "ProtocolLoopback".to_string());
+    let adapter = adapter_name.unwrap_or_else(|| LOOPBACK_ADAPTER.to_string());
 
     let script = format!(
-        r#"
-        $adapter = Get-NetAdapter -Name '{0}' -ErrorAction SilentlyContinue
-        if ($adapter) {{
-            Disable-NetAdapter -Name '{0}' -Confirm:$false
-            Write-Output "Disabled"
-        }} else {{
-            Write-Output "NotFound"
-        }}
-        "#,
-        adapter
+        r#"$ErrorActionPreference = 'SilentlyContinue'
+$name = '{adapter}'
+if (-not (Get-NetAdapter -Name $name -ErrorAction SilentlyContinue)) {{ Write-Output 'NotFound'; exit }}
+Get-NetIPAddress -InterfaceAlias $name -AddressFamily IPv4 |
+    Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+Disable-NetAdapter -Name $name -Confirm:$false -ErrorAction SilentlyContinue
+Write-Output 'Disabled'
+"#,
+        adapter = ps_escape(&adapter)
     );
 
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script.as_str()])
-        .output()
-        .map_err(|e| format!("Stop tunnel failed: {}", e))?;
+    let output = run_ps(&script)?;
 
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    match result.as_str() {
-        "Disabled" => Ok(format!("Tunnel adapter '{}' disabled", adapter)),
-        "NotFound" => Ok("No active tunnel found".to_string()),
-        _ => Err(format!("Unexpected result: {}", result)),
+    match output.trim() {
+        "Disabled" => Ok(format!("tunnel adapter '{}' disabled and unbind", adapter)),
+        "NotFound" => Ok("no active tunnel found".to_string()),
+        other => Err(format!("unexpected result: {}", other)),
     }
 }
 
@@ -297,26 +323,19 @@ pub enum RdpError {
 // Config & state
 // =============================================================================
 
-/// Lifecycle of a single tunnel instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TunnelState {
-    /// mstsc.exe not yet spawned.
     Idle,
-    /// Client launched, waiting for the logon desktop to paint.
     Connecting,
-    /// Full desktop rendered, capture loop running.
     Live,
-    /// shutdown() in progress.
     Disconnecting,
-    /// Dead. Build a new Tunnel to retry.
     Closed,
 }
 
-/// Tunnel configuration — mutated per target profile before connect.
 #[derive(Debug, Clone)]
 pub struct TunnelConfig {
-    pub loopback_addr: String, // default "127.0.0.2"
+    pub loopback_addr: String,
     pub username: String,
     pub password: String,
     pub domain: String,
@@ -331,7 +350,7 @@ pub struct TunnelConfig {
 impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
-            loopback_addr: "127.0.0.2".to_string(),
+            loopback_addr: LOOPBACK_IP.to_string(),
             username: String::new(),
             password: String::new(),
             domain: String::new(),
@@ -373,7 +392,6 @@ impl Tunnel {
         }
     }
 
-    /// Current lifecycle state, reconciled against client health.
     pub fn state(&mut self) -> TunnelState {
         match self.state {
             TunnelState::Live if !self.client.is_alive() => {
@@ -389,9 +407,8 @@ impl Tunnel {
 
     /// Spawn mstsc.exe, wait for the desktop, then attach capture and audio.
     ///
-    /// wait_for_desktop() is synchronous and blocks up to its configured
-    /// timeout, so call this off the main UI thread (a Tauri command or a
-    /// spawn_blocking task), not from an executor-critical path.
+    /// `wait_for_desktop()` blocks up to its timeout, so call this from a
+    /// blocking task rather than an executor-critical path.
     pub async fn connect(&mut self) -> Result<(), RdpError> {
         if self.stream.is_some() {
             return Err(RdpError::AlreadyInitialized("stream"));
@@ -413,7 +430,6 @@ impl Tunnel {
         self.client.spawn()?;
         self.client.wait_for_desktop()?;
 
-        // Handle is only valid after spawn + desktop paint.
         let handle = self.client.handle().ok_or(RdpError::NotConnected)?;
 
         tracing::info!(
@@ -422,11 +438,9 @@ impl Tunnel {
             "RDP client handle acquired; attaching subsystems"
         );
 
-        // Attach capture before marking Live so no frame is missed.
         let capture = StreamCapture::attach(&handle, self.config.capture.clone()).await?;
         self.stream = Some(capture);
 
-        // Audio failures are non-fatal.
         if let Err(e) = self.audio.start(&handle) {
             tracing::warn!(error = %e, "audio tap failed to start; continuing without audio");
         }
@@ -434,29 +448,25 @@ impl Tunnel {
         Ok(())
     }
 
-    /// Initialize input forwarding once the session is live.
     pub async fn start_input_forwarding(&mut self) -> Result<(), RdpError> {
         if self.input_forwarder.is_some() {
             return Err(RdpError::AlreadyInitialized("input_forwarder"));
         }
 
         let handle = self.client.handle().ok_or(RdpError::NotConnected)?;
-
         if handle.pid() == 0 {
             return Err(RdpError::InvalidPid);
         }
 
-        let forwarder = InputForwarder::new(&handle, self.config.input.clone())?;
-        self.input_forwarder = Some(forwarder);
+        self.input_forwarder = Some(InputForwarder::new(&handle, self.config.input.clone())?);
         Ok(())
     }
 
-    pub async fn send_input(&mut self, event: InputEvent) -> Result<(), RdpError> {
-        let fwd = self
-            .input_forwarder
+    pub fn send_input(&mut self, event: InputEvent) -> Result<(), RdpError> {
+        self.input_forwarder
             .as_mut()
-            .ok_or(RdpError::NotConnected)?;
-        fwd.send(event)?;
+            .ok_or(RdpError::NotConnected)?
+            .send(event)?;
         Ok(())
     }
 
@@ -465,7 +475,6 @@ impl Tunnel {
         Ok(stream.next_frame().await?)
     }
 
-    /// Graceful teardown: input, then stream, then audio, then client.
     pub async fn shutdown(&mut self) -> Result<(), RdpError> {
         self.state = TunnelState::Disconnecting;
 
@@ -494,10 +503,6 @@ impl Tunnel {
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        // shutdown() is async, so Drop can only do the synchronous half.
-        // Both of these are idempotent and both are also covered by the
-        // subsystems' own Drop impls — this just makes the ordering explicit
-        // for a Tunnel dropped without an awaited shutdown().
         if let Some(mut fwd) = self.input_forwarder.take() {
             let _ = fwd.shutdown();
         }
