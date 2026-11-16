@@ -18,8 +18,6 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rdev::{listen, EventType, Key};
 use screenshots::Screen;
 use serde::{Deserialize, Serialize};
-use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[cfg(target_os = "windows")]
@@ -29,6 +27,10 @@ use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCL
 
 /// Fallback guest name when `PROTOCOL_VM_NAME` is unset.
 const DEFAULT_VM_NAME: &str = "Test-Nartan-Build";
+
+/// A key still flagged as held after this long is assumed to have lost its
+/// release event (focus steal, hook drop) and is treated as fresh.
+const REPEAT_GRACE_MS: u64 = 5_000;
 
 // ---------------------------------------------------------------------------
 // Trigger configuration (trigger_config.json next to the executable)
@@ -70,8 +72,8 @@ impl Default for TriggerConfig {
             opacity_up_double_tap: "=".to_string(),
             opacity_down_double_tap: "[".to_string(),
             double_tap_window_ms: 400,
-            cooldown_min_ms: 1500,
-            cooldown_max_ms: 2000,
+            cooldown_min_ms: 800,
+            cooldown_max_ms: 1200,
         }
     }
 }
@@ -134,15 +136,13 @@ fn config_path() -> Option<std::path::PathBuf> {
         .map(|d| d.join("trigger_config.json"))
 }
 
+/// Silent on purpose — the dispatcher reloads this on every capture, and a
+/// println per keystroke drowns the log.
 fn load_config() -> TriggerConfig {
     if let Some(path) = config_path() {
         if let Ok(raw) = fs::read_to_string(&path) {
             match serde_json::from_str::<TriggerConfig>(&raw) {
-                Ok(cfg) => {
-                    #[cfg(debug_assertions)]
-                    println!("⚙️ trigger_config.json loaded: {:?}", cfg);
-                    return cfg.sanitized();
-                }
+                Ok(cfg) => return cfg.sanitized(),
                 Err(e) => {
                     eprintln!("⚠️ trigger_config.json malformed ({}), restoring template.", e);
                     if let Ok(t) = serde_json::to_string_pretty(&TriggerConfig::default()) {
@@ -165,6 +165,8 @@ fn get_trigger_config() -> TriggerConfig {
 #[tauri::command]
 fn reload_trigger_config(app: AppHandle) -> TriggerConfig {
     let cfg = load_config();
+    #[cfg(debug_assertions)]
+    println!("⚙️ trigger config reloaded: {:?}", cfg);
     let _ = app.emit("trigger-config", &cfg);
     cfg
 }
@@ -305,15 +307,23 @@ fn key_token(k: &Key) -> Option<String> {
 
 enum KeyMsg {
     Press { key: Key, at: u64 },
+    Release { key: Key },
 }
 
 fn keystroke_thread(app: AppHandle, rx: Receiver<KeyMsg>) {
     let mut cfg = load_config();
+    #[cfg(debug_assertions)]
+    println!("⚙️ trigger config loaded: {:?}", cfg);
     let _ = app.emit("trigger-config", &cfg);
 
     // Only gated commands appear here.
     let mut gates: HashMap<&'static str, u64> = HashMap::new();
     let mut last_key: Option<(Key, u64)> = None;
+
+    // Currently-held keys and when last seen. rdev repeats KeyPress at the OS
+    // repeat rate while a key is down; without this a held key fires on every
+    // repeat. Small Vec beats a HashSet here and avoids a Hash bound on `Key`.
+    let mut held: Vec<(Key, u64)> = Vec::new();
 
     let matches = |token: &Option<String>, trigger: &str| -> bool {
         token
@@ -323,7 +333,25 @@ fn keystroke_thread(app: AppHandle, rx: Receiver<KeyMsg>) {
     };
 
     while let Ok(msg) = rx.recv() {
-        let KeyMsg::Press { key, at } = msg;
+        let (key, at) = match msg {
+            KeyMsg::Release { key } => {
+                held.retain(|(k, _)| *k != key);
+                continue;
+            }
+            KeyMsg::Press { key, at } => (key, at),
+        };
+
+        // Drop auto-repeat: same key still down and seen recently.
+        if let Some(idx) = held.iter().position(|(k, _)| *k == key) {
+            let seen = held[idx].1;
+            held[idx].1 = at;
+            if at.saturating_sub(seen) < REPEAT_GRACE_MS {
+                continue;
+            }
+        } else {
+            held.push((key, at));
+        }
+
         let token = key_token(&key);
 
         let pair = matches!(&last_key, Some((prev, prev_at))
@@ -403,40 +431,6 @@ fn keystroke_thread(app: AppHandle, rx: Receiver<KeyMsg>) {
 // App
 // ---------------------------------------------------------------------------
 
-fn build_tray(app: &tauri::App) -> tauri::Result<()> {
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&quit])?;
-
-    let mut builder = TrayIconBuilder::new()
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| {
-            if event.id() == "quit" {
-                app.exit(0);
-            }
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                ..
-            } = event
-            {
-                let app = tray.app_handle();
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
-        });
-
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
-
-    builder.build(app)?;
-    Ok(())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -458,8 +452,6 @@ pub fn run() {
             stealth::verify_stealth_posture,
         ])
         .setup(|app| {
-            let _ = build_tray(app);
-
             // Raw global keystream — replaces every global shortcut.
             let app_handle = app.handle().clone();
             let (tx, rx) = channel::<KeyMsg>();
@@ -468,8 +460,14 @@ pub fn run() {
 
             std::thread::spawn(move || {
                 let callback = move |event: rdev::Event| {
-                    if let EventType::KeyPress(key) = event.event_type {
-                        let _ = tx.send(KeyMsg::Press { key, at: now_ms() });
+                    match event.event_type {
+                        EventType::KeyPress(key) => {
+                            let _ = tx.send(KeyMsg::Press { key, at: now_ms() });
+                        }
+                        EventType::KeyRelease(key) => {
+                            let _ = tx.send(KeyMsg::Release { key });
+                        }
+                        _ => {}
                     }
                 };
                 if let Err(e) = listen(callback) {

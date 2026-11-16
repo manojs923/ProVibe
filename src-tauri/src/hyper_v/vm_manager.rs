@@ -4,8 +4,7 @@
 //!
 //! Everything the artifact cleaner needs from a VM goes through
 //! [`VmManagerOps`]: liveness, in-guest execution, and file movement. The trait
-//! exists so the cleaner can be driven by `MockVmManager` in tests without a
-//! hypervisor.
+//! exists so the cleaner can be driven by a mock in tests without a hypervisor.
 //!
 //! Methods return boxed futures rather than being plain `async fn` because the
 //! cleaner stores `Box<dyn VmManagerOps>` — native async-in-trait is not
@@ -27,6 +26,10 @@ use super::{build_guest_invocation, run_host_ps, run_host_ps_transfer, GuestCred
 ///
 /// Every method takes the VM name explicitly rather than being bound to one
 /// VM, so a single manager can serve several guests.
+///
+/// `#[async_trait]` must precede `automock`: the outer attribute expands
+/// first, so automock sees the desugared boxed-future signature rather than
+/// raw `async fn`.
 #[async_trait]
 #[cfg_attr(test, mockall::automock)]
 pub trait VmManagerOps: Send + Sync {
@@ -62,6 +65,12 @@ pub trait VmManagerOps: Send + Sync {
         guest_path: &str,
     ) -> Result<(), StealthError>;
 }
+
+/// `automock` names its output `Mock` + the trait name, so `VmManagerOps`
+/// yields `MockVmManagerOps`. Call sites want `MockVmManager`; alias it rather
+/// than churn every import.
+#[cfg(test)]
+pub use MockVmManagerOps as MockVmManager;
 
 // ---------------------------------------------------------------------------
 // Implementation

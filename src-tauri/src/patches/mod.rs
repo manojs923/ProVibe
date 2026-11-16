@@ -1,17 +1,18 @@
 // src-tauri/src/patches/mod.rs
 
-pub mod loader;
-pub mod respondus;
-pub mod proctorio;
-pub mod proctoru;
-pub mod honorlock;
+pub mod errors;
 pub mod examity;
 pub mod generic;
+pub mod honorlock;
+pub mod loader;
+pub mod orchestrator;
+pub mod proctorio;
+pub mod proctoru;
+pub mod respondus;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::process::Command;
-use crate::vm::lifecycle::VmHandle;
 
 use crate::patches::generic::get_patches;
 
@@ -32,8 +33,15 @@ pub struct PatchReport {
 }
 
 fn run_powershell(script: &str) -> (bool, String) {
-    match Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+    match Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
         .output()
     {
         Ok(output) => {
@@ -50,9 +58,11 @@ fn run_powershell(script: &str) -> (bool, String) {
 }
 
 fn patch_vm_processor(vm_name: &str) -> PatchResult {
+    // `HideHypervisorPresent` is the real parameter; there is no
+    // `HypervisorProtectionExposedToGuests` on Set-VMProcessor.
     let script = format!(
         r#"
-        Set-VMProcessor -VMName '{}' -HypervisorProtectionExposedToGuests $false -ErrorAction Stop
+        Set-VMProcessor -VMName '{}' -HideHypervisorPresent $true -ErrorAction Stop
         Set-VMProcessor -VMName '{}' -ExposeVirtualizationExtensions $false -ErrorAction Stop
         Write-Output 'OK'
         "#,
@@ -67,12 +77,13 @@ fn patch_vm_processor(vm_name: &str) -> PatchResult {
 }
 
 fn patch_vm_network(vm_name: &str) -> PatchResult {
-    // Spoof MAC with Intel OUI and disable RSS/VMQ offloads that leak virtualization
+    // Spoof MAC with Intel OUI and disable offloads that leak virtualization.
     let script = format!(
         r#"
         $adapter = Get-VMNetworkAdapter -VMName '{}' -ErrorAction Stop
         $adapter | Set-VMNetworkAdapter -MacAddressSpoofing On -DeviceNaming On -ErrorAction Stop
-        $adapter | Set-VMNetworkAdapter -RssWeight 0 -VmqWeight 0 -IPsecOffloadMaximumSA 0 -ErrorAction SilentlyContinue
+        $adapter | Set-VMNetworkAdapter -RssWeight 0 -VmqWeight 0 `
+            -IPsecOffloadMaximumSecurityAssociation 0 -ErrorAction SilentlyContinue
         Write-Output 'OK'
         "#,
         vm_name
@@ -86,13 +97,21 @@ fn patch_vm_network(vm_name: &str) -> PatchResult {
 }
 
 fn patch_vm_integration_services(vm_name: &str) -> PatchResult {
+    // Guest Service Interface MUST stay enabled or Copy-VMFile stops working.
+    // Heartbeat stays enabled so state reporting remains meaningful.
     let script = format!(
         r#"
-        Get-VMIntegrationService -VMName '{}' | Where-Object {{ $_.Enabled -eq $true -and $_.Id -ne 'Microsoft:VirtualMachine\Status' }} | Disable-VMIntegrationService -ErrorAction SilentlyContinue
-        Set-VM -VMName '{}' -EnhancedSessionModeType None -ErrorAction Stop
+        Get-VMIntegrationService -VMName '{}' |
+            Where-Object {{
+                $_.Enabled -and
+                $_.Name -ne 'Guest Service Interface' -and
+                $_.Name -ne 'Heartbeat'
+            }} |
+            Disable-VMIntegrationService -ErrorAction SilentlyContinue
+        Set-VMHost -EnableEnhancedSessionMode $false -ErrorAction SilentlyContinue
         Write-Output 'OK'
         "#,
-        vm_name, vm_name
+        vm_name
     );
     let (ok, msg) = run_powershell(&script);
     PatchResult {
@@ -120,13 +139,9 @@ fn patch_vm_time_sync(vm_name: &str) -> PatchResult {
 }
 
 fn patch_host_display_affinity() -> PatchResult {
-    // Ensure WDA_EXCLUDEFROMCAPTURE is available (Win10 2004+)
+    // WDA_EXCLUDEFROMCAPTURE needs Win10 2004 (build 19041) or newer.
     let build = run_powershell("[Environment]::OSVersion.Version.Build");
-    let build_num = build
-        .1
-        .trim()
-        .parse::<u32>()
-        .unwrap_or(0);
+    let build_num = build.1.trim().parse::<u32>().unwrap_or(0);
 
     let supported = build_num >= 19041;
     PatchResult {
@@ -135,17 +150,20 @@ fn patch_host_display_affinity() -> PatchResult {
         details: format!(
             "Build {} — WDA_EXCLUDEFROMCAPTURE {}",
             build_num,
-            if supported { "supported" } else { "NOT supported (needs 2004+)" }
+            if supported {
+                "supported"
+            } else {
+                "NOT supported (needs 2004+)"
+            }
         ),
     }
 }
 
-#[tauri::command]
-pub fn apply_target_patches(vm_name: Option<String>) -> Result<PatchReport, String> {
+fn apply_target_patches_blocking(vm_name: Option<String>) -> Result<PatchReport, String> {
     let vm = vm_name.unwrap_or_else(|| "*".to_string());
     let mut results = Vec::new();
 
-    // Only apply VM-specific patches if a named VM was given
+    // Only apply VM-specific patches if a named VM was given.
     if vm != "*" {
         results.push(patch_vm_processor(&vm));
         results.push(patch_vm_network(&vm));
@@ -153,7 +171,7 @@ pub fn apply_target_patches(vm_name: Option<String>) -> Result<PatchReport, Stri
         results.push(patch_vm_time_sync(&vm));
     }
 
-    // Host-level patches always run
+    // Host-level patches always run.
     results.push(patch_host_display_affinity());
 
     let successful = results.iter().filter(|r| r.success).count();
@@ -166,6 +184,13 @@ pub fn apply_target_patches(vm_name: Option<String>) -> Result<PatchReport, Stri
         results,
         requires_reboot: failed > 0,
     })
+}
+
+#[tauri::command]
+pub async fn apply_target_patches(vm_name: Option<String>) -> Result<PatchReport, String> {
+    tokio::task::spawn_blocking(move || apply_target_patches_blocking(vm_name))
+        .await
+        .map_err(|e| format!("patch task panicked: {}", e))?
 }
 
 /// Represents a specific patch to be applied inside the VM.
@@ -203,6 +228,7 @@ impl fmt::Display for PatchType {
 
 /// Loads the appropriate patch set based on the target ID.
 /// This maps the `patch_set_id` from the target profile to concrete implementations.
+#[allow(dead_code)]
 pub fn load_patches(target_id: &str) -> Vec<Patch> {
     match target_id {
         "respondus" => respondus::get_patches(),
@@ -211,8 +237,10 @@ pub fn load_patches(target_id: &str) -> Vec<Patch> {
         "honorlock" => honorlock::get_patches(),
         "examity" => get_patches(),
         _ => {
-            // Fallback to generic stealth patches if target is unknown or unspecified
-            println!("Target ID '{}' not recognized. Loading generic patch set.", target_id);
+            println!(
+                "Target ID '{}' not recognized. Loading generic patch set.",
+                target_id
+            );
             generic::get_patches()
         }
     }
