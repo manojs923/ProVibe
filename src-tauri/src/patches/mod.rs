@@ -58,15 +58,29 @@ fn run_powershell(script: &str) -> (bool, String) {
 }
 
 fn patch_vm_processor(vm_name: &str) -> PatchResult {
-    // `HideHypervisorPresent` is the real parameter; there is no
-    // `HypervisorProtectionExposedToGuests` on Set-VMProcessor.
+    // `HideHypervisorPresent` is not exposed as a `Set-VMProcessor` parameter
+    // on current builds, so it is written through `Msvm_ProcessorSettingData`.
+    // The change is stored immediately but only takes effect on the next boot.
     let script = format!(
         r#"
-        Set-VMProcessor -VMName '{}' -HideHypervisorPresent $true -ErrorAction Stop
-        Set-VMProcessor -VMName '{}' -ExposeVirtualizationExtensions $false -ErrorAction Stop
+        $ErrorActionPreference = 'Stop'
+        $name = '{vm}'
+        $vmObj = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -Filter "ElementName='$name'"
+        if (-not $vmObj) {{ throw "vm not found: $name" }}
+        $sd = $vmObj.GetRelated('Msvm_VirtualSystemSettingData') | Where-Object {{ $_.VirtualSystemType -eq 'Microsoft:Hyper-V:System:Realized' }} | Select-Object -First 1
+        if (-not $sd) {{ throw 'realized setting data not found' }}
+        $proc = $sd.GetRelated('Msvm_ProcessorSettingData') | Select-Object -First 1
+        if (-not $proc) {{ throw 'processor setting data not found' }}
+        $proc.HideHypervisorPresent = $true
+        $vmms = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+        $res = $vmms.ModifyResourceSettings($proc.GetText(1))
+        if ($res.ReturnValue -ne 0 -and $res.ReturnValue -ne 4096) {{
+            throw "ModifyResourceSettings failed: $($res.ReturnValue)"
+        }}
+        Set-VMProcessor -VMName $name -ExposeVirtualizationExtensions $false -ErrorAction Stop
         Write-Output 'OK'
         "#,
-        vm_name, vm_name
+        vm = vm_name
     );
     let (ok, msg) = run_powershell(&script);
     PatchResult {

@@ -12,10 +12,11 @@
 //   - CPUID leaf 0x40000001: Hypervisor interface version
 //   - MSR 0x40000000 range: Hypervisor-specific MSRs
 //
-// Hyper-V provides a first-class mechanism for this via
-// `Set-VMProcessor -HideHypervisorPresent $true`, which handles most of
-// the above automatically. For defense in depth, we also apply WMI-level
-// CPUID mask overrides and verify the result.
+// `HideHypervisorPresent` is the switch that clears most of the above. It is
+// NOT exposed as a `Set-VMProcessor` parameter on current Windows builds
+// (confirmed absent on 10.0.26200), so it is written through the
+// `Msvm_ProcessorSettingData` WMI class instead. The property only takes
+// effect on the guest's next boot.
 
 use crate::stealth::StealthError;
 use crate::vm::lifecycle::VmHandle;
@@ -74,10 +75,9 @@ const PS_ARGS: [&str; 6] = [
 
 /// Apply hypervisor masking to the target VM.
 ///
-/// Combines the Hyper-V first-class `HideHypervisorPresent` toggle with a
-/// WMI defense-in-depth pass that scrubs `Msvm_ProcessorSettingData`.
-///
-/// Safe to invoke while the VM is running (live update) or offline.
+/// Sets `HideHypervisorPresent` through WMI and clears virtualization
+/// extension exposure. The mask is stored immediately but only takes effect
+/// on the guest's next boot.
 pub async fn mask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> {
     let vm_name = &vm_handle.name;
     let script = build_mask_script(vm_name);
@@ -129,22 +129,15 @@ pub async fn unmask_hypervisor(vm_handle: VmHandle) -> Result<(), StealthError> 
 
 /// Capability check: can the current host apply CPUID masking?
 ///
-/// Requires the Hyper-V PowerShell module and a `Set-VMProcessor` that
-/// exposes the `HideHypervisorPresent` parameter (Windows 10 1803+ /
-/// Windows Server 2019+).
+/// Probes the WMI class rather than the cmdlet, because the cmdlet parameter
+/// is absent on builds where the underlying property still exists.
 pub fn host_supports_masking() -> bool {
     let probe = r#"
 $ErrorActionPreference = 'Stop'
 try {
-    $cmd = Get-Command Set-VMProcessor -ErrorAction Stop
-    if ($cmd.Parameters.ContainsKey('HideHypervisorPresent')) {
-        Write-Output 'SUPPORTED'
-    } else {
-        Write-Output 'UNSUPPORTED'
-    }
-} catch {
-    Write-Output 'UNSUPPORTED'
-}
+    $names = (Get-CimClass -Namespace root\virtualization\v2 -ClassName Msvm_ProcessorSettingData).CimClassProperties.Name
+    if ($names -contains 'HideHypervisorPresent') { 'SUPPORTED' } else { 'UNSUPPORTED' }
+} catch { 'UNSUPPORTED' }
 "#;
 
     // `-Command` with the script inline: PS_ARGS ends in `-Command -`, which
@@ -171,9 +164,12 @@ try {
 // PowerShell script templates
 // ---------------------------------------------------------------------------
 
-/// Primary masking script — sets HideHypervisorPresent and clears
-/// virtualization extension exposure. Can apply while the VM is running
-/// (live update) or offline.
+/// Primary masking script — sets HideHypervisorPresent through WMI and clears
+/// virtualization extension exposure.
+///
+/// The property is writable only on the WMI object, and `ModifyResourceSettings`
+/// takes the serialized MOF from `GetText(1)`, not a CIM instance. ReturnValue
+/// 0 is success; 4096 means the change was queued as a job, also acceptable.
 pub fn build_mask_script(vm_name: &str) -> String {
     format!(
         r#"
@@ -181,9 +177,20 @@ $ErrorActionPreference = 'Stop'
 
 $vmName = '{vm_name}'
 
-# --- Hide hypervisor from guest ---
+# --- Hide hypervisor from guest (WMI; the cmdlet parameter is absent) ---
 try {{
-    Set-VMProcessor -VMName $vmName -HideHypervisorPresent $true
+    $vmObj = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -Filter "ElementName='$vmName'"
+    if (-not $vmObj) {{ throw "vm not found: $vmName" }}
+    $sd = $vmObj.GetRelated('Msvm_VirtualSystemSettingData') | Where-Object {{ $_.VirtualSystemType -eq 'Microsoft:Hyper-V:System:Realized' }} | Select-Object -First 1
+    if (-not $sd) {{ throw 'realized setting data not found' }}
+    $proc = $sd.GetRelated('Msvm_ProcessorSettingData') | Select-Object -First 1
+    if (-not $proc) {{ throw 'processor setting data not found' }}
+    $proc.HideHypervisorPresent = $true
+    $vmms = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+    $res = $vmms.ModifyResourceSettings($proc.GetText(1))
+    if ($res.ReturnValue -ne 0 -and $res.ReturnValue -ne 4096) {{
+        throw "ModifyResourceSettings failed: $($res.ReturnValue)"
+    }}
     Write-Output "MASK_APPLIED:HideHypervisorPresent"
 }} catch {{
     Write-Output "MASK_FAILED:HideHypervisorPresent:$($_.Exception.Message)"
@@ -207,44 +214,6 @@ try {{
     Write-Output "MASK_SKIPPED:ResourceMetering:$($_.Exception.Message)"
 }}
 
-# --- Clear hypervisor present bit in CPUID leaf 0x1 via WMI ---
-try {{
-    $vm = Get-CimInstance -Namespace 'root\virtualization\v2' `
-        -ClassName 'Msvm_ComputerSystem' `
-        -Filter "ElementName = '$vmName'"
-
-    if ($null -ne $vm) {{
-        $procSD = $vm | Get-CimAssociatedInstance `
-            -ResultClassName 'Msvm_ProcessorSettingData'
-
-        if ($null -ne $procSD) {{
-            # Strip hypervisor hints from the processor setting data
-            $procSD.HideHypervisorPresent = $true
-            $procSD.ExposeVirtualizationExtensions = $false
-
-            $vmms = Get-CimInstance -Namespace 'root\virtualization\v2' `
-                -ClassName 'Msvm_VirtualSystemManagementService'
-
-            if ($null -ne $vmms) {{
-                $cimSerializer = [Microsoft.Management.Infrastructure.Serialization.CimSerializer]::Create()
-                $sdBytes = $cimSerializer.Serialize($procSD, [Microsoft.Management.Infrastructure.Serialization.InstanceSerializationOptions]::None)
-                $sdText = [System.Text.Encoding]::Unicode.GetString($sdBytes)
-                $result = Invoke-CimMethod -InputObject $vmms `
-                    -MethodName 'ModifyResourceSettings' `
-                    -Arguments @{{ ResourceSettings = @($sdText) }}
-                if ($result.ReturnValue -eq 0 -or $result.ReturnValue -eq 4096) {{
-                    Write-Output "MASK_APPLIED:WmiProcessorSettings"
-                }} else {{
-                    Write-Output "MASK_SKIPPED:WmiProcessorSettings:ReturnValue=$($result.ReturnValue)"
-                }}
-            }}
-        }}
-    }}
-}} catch {{
-    # WMI path is defense-in-depth; primary path already succeeded
-    Write-Output "MASK_SKIPPED:WmiProcessorSettings:$($_.Exception.Message)"
-}}
-
 Write-Output "MASK_COMPLETE"
 "#,
         vm_name = vm_name
@@ -262,12 +231,24 @@ pub fn build_unmask_script(vm_name: &str) -> String {
     s.push_str(vm_name);
     s.push_str("\n\n");
 
-    // 1. Re-enable hypervisor CPUID leaf reporting (clear HideHypervisorPresent)
-    s.push_str("# Restore CPUID leaf 0x40000000+ disclosures\n");
+    // 1. Re-enable hypervisor CPUID leaf reporting (clear HideHypervisorPresent).
+    //    Same WMI route as the mask: the property is not settable through the
+    //    cmdlet on current builds.
+    s.push_str("# Restore CPUID leaf 0x40000000+ disclosures (WMI)\n");
     s.push_str(&format!(
-        "try {{ Set-VMProcessor -VMName \"{}\" -HideHypervisorPresent $false }} \
-         catch {{ Write-Output \"UNMASK_SKIPPED:HideHypervisorPresent:$($_.Exception.Message)\" }}\n",
-        vm_name
+        r#"try {{
+    $vmObj = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -Filter "ElementName='{vm}'"
+    if (-not $vmObj) {{ throw "vm not found: {vm}" }}
+    $sd = $vmObj.GetRelated('Msvm_VirtualSystemSettingData') | Where-Object {{ $_.VirtualSystemType -eq 'Microsoft:Hyper-V:System:Realized' }} | Select-Object -First 1
+    if (-not $sd) {{ throw 'realized setting data not found' }}
+    $proc = $sd.GetRelated('Msvm_ProcessorSettingData') | Select-Object -First 1
+    if (-not $proc) {{ throw 'processor setting data not found' }}
+    $proc.HideHypervisorPresent = $false
+    $vmms = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+    $null = $vmms.ModifyResourceSettings($proc.GetText(1))
+}} catch {{ Write-Output "UNMASK_SKIPPED:HideHypervisorPresent:$($_.Exception.Message)" }}
+"#,
+        vm = vm_name
     ));
     s.push_str(&format!(
         "try {{ Set-VMProcessor -VMName \"{}\" -ExposeVirtualizationExtensions $true }} \
@@ -293,15 +274,12 @@ pub fn build_unmask_script(vm_name: &str) -> String {
     s.push_str("Where-Object { $_.Path -like '*shim*.vhdx' } | ");
     s.push_str("Remove-VMHardDiskDrive } catch { Write-Output \"UNMASK_SKIPPED:ShimRemoval:$($_.Exception.Message)\" }\n\n");
 
-    // 4. Reattach the original disk image (if the canonical path is present)
+    // 4. Reattach the original disk image (if the canonical path is present).
+    //    `VM_DISKS` is only a hint; ProgramData is where provisioning puts it.
     s.push_str("# Reattach original disk image if canonical path exists\n");
     s.push_str("$diskRoot = $env:VM_DISKS\n");
     s.push_str("if (-not $diskRoot) { $diskRoot = Join-Path $env:ProgramData 'Protocol\\VMs' }\n");
     s.push_str(&format!("$origDisk = Join-Path $diskRoot \"{}.vhdx\"\n", vm_name));
-    s.push_str(&format!(
-        "$origDisk = Join-Path $env:VM_DISKS \"{}.vhdx\"\n",
-        vm_name
-    ));
     s.push_str("if (Test-Path $origDisk) {\n");
     s.push_str(&format!(
         "    $already = Get-VMHardDiskDrive -VMName \"{}\" | Where-Object {{ $_.Path -eq $origDisk }}\n",
@@ -535,16 +513,19 @@ mod tests {
     }
 
     #[test]
-    fn mask_script_sets_hide_hypervisor() {
+    fn mask_script_sets_hide_hypervisor_through_wmi() {
         let script = build_mask_script("TestVM");
-        assert!(script.contains("Set-VMProcessor -VMName $vmName -HideHypervisorPresent $true"));
+        assert!(script.contains("Msvm_ProcessorSettingData"));
+        assert!(script.contains("$proc.HideHypervisorPresent = $true"));
+        assert!(script.contains("ModifyResourceSettings"));
         assert!(script.contains("MASK_COMPLETE"));
     }
 
     #[test]
-    fn unmask_script_clears_hide_hypervisor() {
+    fn unmask_script_clears_hide_hypervisor_through_wmi() {
         let script = build_unmask_script("TestVM");
-        assert!(script.contains("Set-VMProcessor -VMName \"TestVM\" -HideHypervisorPresent $false"));
+        assert!(script.contains("Msvm_ProcessorSettingData"));
+        assert!(script.contains("$proc.HideHypervisorPresent = $false"));
         assert!(script.contains("UNMASK_COMPLETE"));
     }
 

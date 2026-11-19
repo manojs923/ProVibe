@@ -11,6 +11,7 @@ pub use target_id::{fetch_all, fetch_profile};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +24,10 @@ use tauri::{AppHandle, Emitter, Manager};
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HWND;
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowLongPtrW, SetForegroundWindow, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, GWL_EXSTYLE, WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE,
+};
 
 /// Fallback guest name when `PROTOCOL_VM_NAME` is unset.
 const DEFAULT_VM_NAME: &str = "Test-Nartan-Build";
@@ -32,21 +36,37 @@ const DEFAULT_VM_NAME: &str = "Test-Nartan-Build";
 /// release event (focus steal, hook drop) and is treated as fresh.
 const REPEAT_GRACE_MS: u64 = 5_000;
 
+/// Bumped whenever a default binding moves. Drives the migration below so an
+/// existing trigger_config.json is rewritten instead of silently fighting the
+/// new defaults.
+const CONFIG_VERSION: u32 = 2;
+
+/// Set while a provision is in flight so a second ENGAGE cannot start a second
+/// New-VHD against the same base disk.
+static PROVISIONING: AtomicBool = AtomicBool::new(false);
+
+/// Foreground window captured the moment a text field borrows focus, so it can
+/// be handed straight back on release.
+static PREV_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
+
 // ---------------------------------------------------------------------------
 // Trigger configuration (trigger_config.json next to the executable)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerConfig {
+    /// Schema stamp. Missing in v1 files, hence the serde default.
+    #[serde(default)]
+    pub version: u32,
     /// Double-tap to summon the copilot. Default: CapsLock (invisible, net-zero).
     pub summon_double_tap: String,
-    /// Double-tap to buffer one frame. Default: "-" (leaves "--").
+    /// Double-tap to buffer one frame. Default: "/" (leaves "//").
     pub sniper_double_tap: String,
     /// Double-tap to flush the frame buffer. Default: Return.
     pub flush_double_tap: String,
     /// Double-tap to start/stop audio capture. Default: "." (leaves "..").
     pub audio_double_tap: String,
-    /// Double-tap to hide/show the window. Default: ScrollLock (inert in browsers).
+    /// Double-tap to hide/show the window. Default: "-" (leaves "--").
     pub toggle_double_tap: String,
     /// Double-tap to raise opacity.
     pub opacity_up_double_tap: String,
@@ -64,11 +84,12 @@ pub struct TriggerConfig {
 impl Default for TriggerConfig {
     fn default() -> Self {
         Self {
+            version: CONFIG_VERSION,
             summon_double_tap: "CapsLock".to_string(),
-            sniper_double_tap: "-".to_string(),
+            sniper_double_tap: "/".to_string(),
             flush_double_tap: "Return".to_string(),
             audio_double_tap: ".".to_string(),
-            toggle_double_tap: "ScrollLock".to_string(),
+            toggle_double_tap: "-".to_string(),
             opacity_up_double_tap: "=".to_string(),
             opacity_down_double_tap: "[".to_string(),
             double_tap_window_ms: 400,
@@ -79,6 +100,30 @@ impl Default for TriggerConfig {
 }
 
 impl TriggerConfig {
+    /// Brings an older file up to the current binding set. Returns whether
+    /// anything was rewritten so the caller can persist it.
+    fn migrated(mut self) -> (Self, bool) {
+        if self.version >= CONFIG_VERSION {
+            return (self, false);
+        }
+
+        // v1 shipped the sniper on "-" and the toggle on ScrollLock. Anyone who
+        // never edited the file gets both moved; anyone who did keeps their
+        // custom key unless it collides with the new toggle.
+        if self.sniper_double_tap == "-" {
+            self.sniper_double_tap = "/".to_string();
+        }
+        if self
+            .toggle_double_tap
+            .eq_ignore_ascii_case("ScrollLock")
+            || self.toggle_double_tap.is_empty()
+        {
+            self.toggle_double_tap = "-".to_string();
+        }
+        self.version = CONFIG_VERSION;
+        (self, true)
+    }
+
     /// Rejects tokens that carry a modifier, since the whole point is to keep
     /// the guest-side fingerprint modifier-free.
     fn sanitized(mut self) -> Self {
@@ -119,12 +164,20 @@ impl TriggerConfig {
             }
         }
 
+        // Two commands on one key means the first match always wins and the
+        // second becomes dead. Nudge the sniper back to its default.
+        if self.sniper_double_tap.eq_ignore_ascii_case(&self.toggle_double_tap) {
+            eprintln!("⚠️ sniper and toggle share a key, moving the sniper to '/'");
+            self.sniper_double_tap = defaults.sniper_double_tap.clone();
+        }
+
         if self.double_tap_window_ms < 120 {
             self.double_tap_window_ms = 400;
         }
         if self.cooldown_max_ms < self.cooldown_min_ms {
             self.cooldown_max_ms = self.cooldown_min_ms;
         }
+        self.version = CONFIG_VERSION;
         self
     }
 }
@@ -136,22 +189,40 @@ fn config_path() -> Option<std::path::PathBuf> {
         .map(|d| d.join("trigger_config.json"))
 }
 
+fn write_config(cfg: &TriggerConfig) {
+    if let Some(path) = config_path() {
+        if let Ok(t) = serde_json::to_string_pretty(cfg) {
+            let _ = fs::write(&path, t);
+        }
+    }
+}
+
 /// Silent on purpose — the dispatcher reloads this on every capture, and a
 /// println per keystroke drowns the log.
 fn load_config() -> TriggerConfig {
     if let Some(path) = config_path() {
         if let Ok(raw) = fs::read_to_string(&path) {
             match serde_json::from_str::<TriggerConfig>(&raw) {
-                Ok(cfg) => return cfg.sanitized(),
+                Ok(cfg) => {
+                    let (cfg, rewritten) = cfg.migrated();
+                    let cfg = cfg.sanitized();
+                    if rewritten {
+                        eprintln!("⚙️ trigger_config.json migrated to v{}", CONFIG_VERSION);
+                        write_config(&cfg);
+                    }
+                    return cfg;
+                }
                 Err(e) => {
                     eprintln!("⚠️ trigger_config.json malformed ({}), restoring template.", e);
-                    if let Ok(t) = serde_json::to_string_pretty(&TriggerConfig::default()) {
-                        let _ = fs::write(&path, t);
-                    }
+                    let cfg = TriggerConfig::default();
+                    write_config(&cfg);
+                    return cfg;
                 }
             }
-        } else if let Ok(t) = serde_json::to_string_pretty(&TriggerConfig::default()) {
-            let _ = fs::write(&path, t);
+        } else {
+            let cfg = TriggerConfig::default();
+            write_config(&cfg);
+            return cfg;
         }
     }
     TriggerConfig::default()
@@ -169,6 +240,94 @@ fn reload_trigger_config(app: AppHandle) -> TriggerConfig {
     println!("⚙️ trigger config reloaded: {:?}", cfg);
     let _ = app.emit("trigger-config", &cfg);
     cfg
+}
+
+#[tauri::command]
+fn reset_trigger_config(app: AppHandle) -> TriggerConfig {
+    let cfg = TriggerConfig::default();
+    write_config(&cfg);
+    let _ = app.emit("trigger-config", &cfg);
+    cfg
+}
+
+// ---------------------------------------------------------------------------
+// Window visibility and activation
+// ---------------------------------------------------------------------------
+
+/// `focusable: false` covers creation, but the style is re-applied after every
+/// show because a window that was hidden can come back activation-hungry.
+#[cfg(target_os = "windows")]
+fn suppress_activation(window: &tauri::WebviewWindow) {
+    if let Ok(h) = window.hwnd() {
+        let hwnd = HWND(h.0 as _);
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE.0 as isize));
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn suppress_activation(_window: &tauri::WebviewWindow) {}
+
+/// OS-level hide/show. Used by the strip button and by the toggle key, so both
+/// paths behave identically. Returns the resulting visibility.
+///
+/// The strip button must not rely on a click firing after `pointerdown` starts
+/// a native drag — once the drag owns the pointer, the click never arrives and
+/// the window stays collapsed. Hiding at the OS level sidesteps that entirely.
+fn toggle_window_visibility(app: &AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        return false;
+    };
+
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        false
+    } else {
+        let _ = window.show();
+        // No set_focus here: activation is what trips the exam's tab counter.
+        suppress_activation(&window);
+        true
+    }
+}
+
+#[tauri::command]
+fn toggle_overlay(app: AppHandle) -> bool {
+    toggle_window_visibility(&app)
+}
+
+/// Lends the window real keyboard focus for a text field. The exam's current
+/// foreground window is remembered first.
+#[tauri::command]
+fn begin_text_input(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        PREV_FOREGROUND.store(GetForegroundWindow().0 as isize, Ordering::SeqCst);
+    }
+
+    let window = app.get_webview_window("main").ok_or("window_missing")?;
+    window.set_focusable(true).map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Drops focus again and pushes activation back to whatever had it before.
+#[tauri::command]
+fn end_text_input(app: AppHandle) -> Result<(), String> {
+    let window = app.get_webview_window("main").ok_or("window_missing")?;
+    window.set_focusable(false).map_err(|e| e.to_string())?;
+    suppress_activation(&window);
+
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let prev = PREV_FOREGROUND.swap(0, Ordering::SeqCst);
+        if prev != 0 {
+            let _ = SetForegroundWindow(HWND(prev as _));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -226,35 +385,41 @@ async fn capture_rdp_window(ip: String) -> Result<String, String> {
 // C2 endpoints
 // ---------------------------------------------------------------------------
 
+/// Starts provisioning and returns immediately. Progress is reported by
+/// `vm-provisioned` / `vm-provision-failed` events and by polling
+/// `get_vm_status`, so the overlay never sits on a frozen "please wait".
 #[tauri::command]
-async fn launch_stealth_vm(target: String) -> Result<String, String> {
+async fn launch_stealth_vm(app: AppHandle, target: String) -> Result<String, String> {
+    if PROVISIONING.swap(true, Ordering::SeqCst) {
+        return Ok("provisioning already in flight".to_string());
+    }
+
     #[cfg(debug_assertions)]
     println!("orchestrating hyper-v container for target: {}", target);
 
     let vm_name = std::env::var("PROTOCOL_VM_NAME").unwrap_or_else(|_| DEFAULT_VM_NAME.to_string());
     let spawn_name = vm_name.clone();
     let profile = target.clone();
+    let handle = app.clone();
 
-    // `spawn_stealth_vm_cmd` is async; the blocking form is what belongs inside
-    // spawn_blocking.
-    let spawned = tokio::task::spawn_blocking(move || {
-        vm::spawn_stealth_vm_blocking(spawn_name, Some(profile))
-    })
-    .await
-    .map_err(|e| format!("spawn task panicked: {}", e))?
-    .map_err(|e| format!("spawn failed: {}", e))?;
+    tokio::task::spawn_blocking(move || {
+        let outcome = vm::spawn_stealth_vm_blocking(spawn_name, Some(profile));
+        PROVISIONING.store(false, Ordering::SeqCst);
 
-    if !spawned.success {
-        return Err(format!(
-            "VM '{}' did not reach Running ({})",
-            vm_name, spawned.message
-        ));
-    }
+        match outcome {
+            Ok(report) if report.success => {
+                let _ = handle.emit("vm-provisioned", report.message);
+            }
+            Ok(report) => {
+                let _ = handle.emit("vm-provision-failed", report.message);
+            }
+            Err(e) => {
+                let _ = handle.emit("vm-provision-failed", e.to_string());
+            }
+        }
+    });
 
-    Ok(format!(
-        "hypervisor engaged. {} is now isolated in sandbox '{}'.",
-        target, vm_name
-    ))
+    Ok(format!("provisioning '{}'", vm_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -403,14 +568,10 @@ fn keystroke_thread(app: AppHandle, rx: Receiver<KeyMsg>) {
         #[cfg(debug_assertions)]
         println!("🔥 INTERCEPT: {}", command);
 
+        // Both paths go through the same OS-level helper, so the key and the
+        // strip button can never disagree about visibility.
         if command == "SUMMON_COPILOT" || command == "TOGGLE_VISIBILITY" {
-            if let Some(window) = app.get_webview_window("main") {
-                if command == "TOGGLE_VISIBILITY" && window.is_visible().unwrap_or(false) {
-                    let _ = window.hide();
-                } else {
-                    let _ = window.show();
-                }
-            }
+            toggle_window_visibility(&app);
         }
 
         if command == "TRIGGER_SNIPER" || command == "TRIGGER_AUDIO" {
@@ -440,6 +601,10 @@ pub fn run() {
             capture_rdp_window,
             get_trigger_config,
             reload_trigger_config,
+            reset_trigger_config,
+            toggle_overlay,
+            begin_text_input,
+            end_text_input,
             launch_stealth_vm,
             target_id::scan_for_lockdown_browsers,
             vm::get_vm_status,
@@ -479,18 +644,23 @@ pub fn run() {
             {
                 if let Some(window) = app.get_webview_window("main") {
                     if let Ok(hwnd_wrapper) = window.hwnd() {
+                        let hwnd = HWND(hwnd_wrapper.0 as _);
                         unsafe {
-                            if SetWindowDisplayAffinity(
-                                HWND(hwnd_wrapper.0 as _),
-                                WDA_EXCLUDEFROMCAPTURE,
-                            )
-                            .is_err()
-                            {
+                            // Belt and braces on top of `focusable: false`. If
+                            // either path ever regresses, the other still holds.
+                            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                            SetWindowLongPtrW(
+                                hwnd,
+                                GWL_EXSTYLE,
+                                style | (WS_EX_NOACTIVATE.0 as isize),
+                            );
+
+                            if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
                                 eprintln!("🛡️ stealth failure: os blocked drm evasion.");
                             }
                         }
                         #[cfg(debug_assertions)]
-                        println!("🛡️ DRM screen evasion active.");
+                        println!("🛡️ DRM screen evasion active, activation suppressed.");
                     }
                 }
 

@@ -16,7 +16,9 @@
         "title": "Protocol",
         "width": 460,
         "height": 640,
-        "resizable": true,
+        "minWidth": 360,
+        "minHeight": 240,
+        "resizable": false,
         "fullscreen": false,
         "transparent": true,
         "decorations": false,
@@ -26,6 +28,8 @@
         "center": false,
         "skipTaskbar": false,
         "focus": false,
+        "focusable": false,
+        "visible": true,
         "visibleOnAllWorkspaces": true
       }
     ],

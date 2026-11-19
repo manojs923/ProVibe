@@ -61,16 +61,34 @@ impl Default for StealthConfig {
 // Target normalisation
 // ---------------------------------------------------------------------------
 
-/// Collapses the several spellings a target arrives as — `"MSB"`, `"SEB"`,
-/// `"Respondus LockDown Browser"` — onto one discriminant. `engage()` passes a
-/// display name while `launch_stealth_vm` passes a short code, so both have to
-/// land here.
-fn is_msb(target: &str) -> bool {
+/// What kind of product the caller named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// Safe Exam Browser.
+    Seb,
+    /// Respondus LockDown Browser / Monitor.
+    Msb,
+}
+
+/// Collapses the several spellings a target arrives as onto one discriminant.
+///
+/// `engage()` passes a display name (`"respondus lockdown browser"`) while
+/// `launch_stealth_vm` passes a short code (`"MSB"`), so both have to land
+/// here. SEB and MSB are checked separately — folding `"safeexam"` into the
+/// MSB branch sent every Safe Exam Browser run down the Respondus persona.
+pub fn classify(target: &str) -> TargetKind {
     let t = target.to_lowercase();
-    t.contains("msb")
-        || t.contains("respondus")
-        || t.contains("lockdown")
-        || t.contains("safeexam")
+
+    if t.contains("msb") || t.contains("respondus") || t.contains("lockdown") || t.contains("monitor") {
+        return TargetKind::Msb;
+    }
+
+    // SEB, "Safe Exam Browser", or anything unrecognised.
+    TargetKind::Seb
+}
+
+fn is_msb(target: &str) -> bool {
+    classify(target) == TargetKind::Msb
 }
 
 // ---------------------------------------------------------------------------
@@ -87,8 +105,10 @@ pub fn build_config(target_id: &str) -> VmConfig {
 pub fn build_config_named(target_id: &str, vm_name: &str) -> VmConfig {
     let mut rng = rand::thread_rng();
 
-    // Randomize specs to defeat hardware-uniformity heuristics.
-    let memory_mb = if rng.gen_bool(0.6) { 8192 } else { 16384 };
+    // Randomize specs to defeat hardware-uniformity heuristics. The floor is
+    // deliberately low: a 2 GB guest starts on a busy 16 GB host, a 6 GB one
+    // does not. `PROTOCOL_VM_MEMORY_MB` overrides this at spawn time.
+    let memory_mb = if rng.gen_bool(0.6) { 2048 } else { 3072 };
     let cpu_cores = if rng.gen_bool(0.7) { 4 } else { 8 };
 
     // Believable Intel OUI (E4:42:A6) instead of Hyper-V's 00:15:5D.
@@ -135,23 +155,36 @@ pub fn build_config_named(target_id: &str, vm_name: &str) -> VmConfig {
 // Spoof application
 // ---------------------------------------------------------------------------
 
-/// Push the spoof profile at the VM. Best-effort: the MAC always lands, the
-/// BIOS serial only on hosts where `Set-CimInstance` is allowed against
-/// `Msvm_BIOSElement`. Manufacturer/model are not writable through the WMI
-/// surface at all, so they stay advisory here.
+/// Push the spoof profile at the VM. Best-effort, and **requires the VM to be
+/// powered off** — the BIOS and board serials live in
+/// `Msvm_VirtualSystemSettingData` and are committed with
+/// `ModifySystemSettings`, not `Set-CimInstance` (whose properties are
+/// read-only). Manufacturer and model are not writable through this surface at
+/// all, so they stay advisory.
 pub fn apply_spoof(vm_name: &str, profile: &SpoofProfile) -> Result<(), String> {
     let script = format!(
-        r#"$ErrorActionPreference = 'SilentlyContinue'
+        r#"$ErrorActionPreference = 'Stop'
 $name = {name}
-Set-VMNetworkAdapter -VMName $name -MacAddress {mac}
+$mac  = {mac}
+$serial = {serial}
 
-$vm = Get-CimInstance -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem |
-      Where-Object {{ $_.ElementName -eq $name }}
-$sd = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VirtualSystemSettingData |
-      Where-Object {{ $_.VirtualSystemType -eq 'Microsoft:Hyper-V:System:Realized' }} |
-      Select-Object -First 1
-$bios = Get-CimAssociatedInstance -InputObject $sd -ResultClassName Msvm_BIOSElement
-if ($bios) {{ $bios | Set-CimInstance -Property @{{ SerialNumber = {serial} }} }}
+Set-VMNetworkAdapter -VMName $name -StaticMacAddress $mac -ErrorAction SilentlyContinue
+
+$vmObj = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -Filter "ElementName='$name'"
+if (-not $vmObj) {{ throw "vm not found: $name" }}
+$sd = $vmObj.GetRelated('Msvm_VirtualSystemSettingData') | Where-Object {{ $_.VirtualSystemType -eq 'Microsoft:Hyper-V:System:Realized' }} | Select-Object -First 1
+if (-not $sd) {{ throw 'realized setting data not found' }}
+
+$sd.BIOSSerialNumber    = $serial
+$sd.BaseBoardSerialNumber = $serial
+$sd.ChassisSerialNumber = $serial
+$sd.ChassisAssetTag     = 'No Asset Information'
+
+$vmms = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+$res = $vmms.ModifySystemSettings($sd.GetText(1))
+if ($res.ReturnValue -ne 0 -and $res.ReturnValue -ne 4096) {{
+    throw "ModifySystemSettings failed: $($res.ReturnValue)"
+}}
 "#,
         name = ps_literal(vm_name),
         mac = ps_literal(&profile.mac_address.replace(':', "")),

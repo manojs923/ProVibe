@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -25,8 +24,25 @@ const DEFAULT_GUEST_PASSWORD: &str = "Protocol!2024";
 /// Virtual switch used for the loopback pair. Created by `network`.
 const LOOPBACK_SWITCH: &str = "Protocol-Loopback";
 
-/// Startup memory for a freshly provisioned guest.
-const PROVISION_MEMORY_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+/// Default startup memory for a freshly provisioned guest, in MB.
+///
+/// Overridable with `PROTOCOL_VM_MEMORY_MB`. The 6 GB this used to hardcode
+/// cannot be committed on a 16 GB host that is already busy, and a failed
+/// commit surfaces as a bare `Insufficient system resources` from Start-VM.
+const DEFAULT_VM_MEMORY_MB: u64 = 2048;
+
+/// Resolve the startup memory, in bytes. An explicit `PROTOCOL_VM_MEMORY_MB`
+/// always wins over the profile, because the profile has no idea how much RAM
+/// the host can actually spare.
+fn provision_memory_bytes(profile_mb: u32) -> u64 {
+    std::env::var("PROTOCOL_VM_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|mb| *mb >= 1024)
+        .unwrap_or(profile_mb as u64)
+        * 1024
+        * 1024
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -35,6 +51,21 @@ const PROVISION_MEMORY_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// PowerShell single-quoted literal escaping. Doubles embedded quotes.
 fn ps_escape(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// `Path::canonicalize` hands back an extended-length path (`\\?\C:\...`).
+/// `New-VHD` passes the parent path straight down to the VHD layer, which does
+/// not accept the verbatim prefix and reports the file as not existing. Strip
+/// it before any path reaches a cmdlet.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 fn run_ps(script: &str) -> Result<String, String> {
@@ -62,6 +93,8 @@ fn run_ps(script: &str) -> Result<String, String> {
 /// Locate the base VHDX. Checked in order: explicit override, the working
 /// directory (dev runs from `src-tauri`), then beside the executable
 /// (bundled resources land in `resources/`).
+///
+/// The returned path is absolute but never verbatim-prefixed.
 pub fn resolve_base_vhdx() -> Option<PathBuf> {
     let candidates = [
         std::env::var("PROTOCOL_BASE_VHDX").ok().map(PathBuf::from),
@@ -75,7 +108,7 @@ pub fn resolve_base_vhdx() -> Option<PathBuf> {
         .into_iter()
         .flatten()
         .find(|p| p.exists())
-        .map(|p| p.canonicalize().unwrap_or(p))
+        .map(|p| strip_verbatim(p.canonicalize().unwrap_or(p)))
 }
 
 fn vm_state(name: &str) -> Option<String> {
@@ -198,8 +231,10 @@ pub struct VmSpawnResult {
 
 /// Provision (if absent) and start the guest, then attach the console.
 ///
-/// A VM that already exists is reused; only the disk work is skipped. Boot is
-/// polled rather than slept on, so a fast start returns fast.
+/// A VM that already exists is reused and the entire cold path is skipped, so
+/// a warm engage costs one `Get-VM` plus one `Start-VM`. Boot is *not* awaited
+/// here: the caller returns to the UI immediately and the frontend polls
+/// `get_vm_status` for the transition to Running.
 fn spawn_blocking_impl(
     vm_name: String,
     stealth_profile: Option<String>,
@@ -207,7 +242,11 @@ fn spawn_blocking_impl(
     let profile = stealth_profile.unwrap_or_else(|| "default".to_string());
     let name = ps_escape(&vm_name);
 
-    // ── 1. Provision ─────────────────────────────────────────────
+    // ── 1. Cold path: provision + spoof + harden ─────────────────
+    //
+    // All three only make sense on a disk that does not exist yet, and all
+    // three require the guest to be off. Running them on every engage is what
+    // made the button feel like it hung.
     let existing = vm_state(&vm_name);
 
     if existing.is_none() {
@@ -215,92 +254,105 @@ fn spawn_blocking_impl(
             "base VHDX not found. Set PROTOCOL_BASE_VHDX or run scripts/create-base-vhdx.ps1."
                 .to_string()
         })?;
-        let base_literal = ps_escape(&base.to_string_lossy());
+        // Defensive second strip: PROTOCOL_BASE_VHDX may be set by hand with a
+        // verbatim prefix and never passes through resolve_base_vhdx's map.
+        let base_literal = ps_escape(&strip_verbatim(base).to_string_lossy());
 
+        // The profile now reaches the VM instead of being thrown away.
+        let cfg = config::build_config_named(&profile, &vm_name);
+        let mem = provision_memory_bytes(cfg.memory_mb);
+        let cores = cfg.cpu_cores.clamp(2, 8);
+
+        // Disk work and hardening share one interpreter launch. Hardening is
+        // wrapped so a WMI hiccup cannot leave a half-provisioned disk behind
+        // with the whole engage reported as failed.
         let provision = format!(
             r#"$ErrorActionPreference = 'Stop'
 $name = '{name}'
 $base = '{base}'
+if (-not (Test-Path -LiteralPath $base)) {{ throw "base image missing: $base" }}
 $dir  = Join-Path $env:ProgramData 'Protocol\VMs'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $vhd = Join-Path $dir ($name + '.vhdx')
 New-VHD -Path $vhd -ParentPath $base -Differencing | Out-Null
 New-VM -Name $name -VHDPath $vhd -MemoryStartupBytes {mem} -Generation 2 | Out-Null
-Set-VM -Name $name -ProcessorCount 4 -CheckpointType Disabled | Out-Null
+Set-VM -Name $name -ProcessorCount {cores} -CheckpointType Disabled | Out-Null
 Add-VMNetworkAdapter -VMName $name -SwitchName '{switch}' -ErrorAction SilentlyContinue
+try {{
+    Set-VMMemory -VMName $name -DynamicMemoryEnabled $false
+    $vmObj = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -Filter "ElementName='$name'"
+    if ($vmObj) {{
+        $sd = $vmObj.GetRelated('Msvm_VirtualSystemSettingData') | Where-Object {{ $_.VirtualSystemType -eq 'Microsoft:Hyper-V:System:Realized' }} | Select-Object -First 1
+        if ($sd) {{
+            $proc = $sd.GetRelated('Msvm_ProcessorSettingData') | Select-Object -First 1
+            if ($proc) {{
+                $proc.HideHypervisorPresent = $true
+                $vmms = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+                $res = $vmms.ModifyResourceSettings($proc.GetText(1))
+                if ($res.ReturnValue -ne 0 -and $res.ReturnValue -ne 4096) {{
+                    throw "ModifyResourceSettings failed: $($res.ReturnValue)"
+                }}
+            }}
+        }}
+    }}
+    Set-VMProcessor -VMName $name -ExposeVirtualizationExtensions $false
+}} catch {{
+    Write-Warning "hardening skipped: $_"
+}}
 "#,
             name = name,
             base = base_literal,
-            mem = PROVISION_MEMORY_BYTES,
+            mem = mem,
+            cores = cores,
             switch = LOOPBACK_SWITCH
         );
 
         run_ps(&provision).map_err(|e| format!("provisioning failed: {}", e))?;
+
+        // Identity spoof. The VM is still off here, which the WMI writes require.
+        if let Err(e) = config::apply_spoof(&vm_name, &cfg.spoof_profile) {
+            eprintln!("[vm] spoof failed for '{}': {}", vm_name, e);
+        }
+
+        // Host-wide, needs elevation, and has nothing to do with an individual
+        // guest, so it stays on the cold path only.
+        let _ = run_ps("Set-VMHost -EnableEnhancedSessionMode $false -ErrorAction SilentlyContinue");
     }
 
-    // ── 2. Harden (best-effort) ──────────────────────────────────
-    // `Set-VMHost` is host-wide and needs elevation; a guest that boots
-    // unhardened still beats no guest.
-    let harden = format!(
-        r#"$ErrorActionPreference = 'Stop'
-Set-VMProcessor -VMName '{name}' -HideHypervisorPresent $true
-Set-VMMemory -VMName '{name}' -DynamicMemoryEnabled $false
-"#,
-        name = name
-    );
-    if let Err(e) = run_ps(&harden) {
-        eprintln!("[vm] hardening failed for '{}': {}", vm_name, e);
-    }
-
-    let _ = run_ps("Set-VMHost -EnableEnhancedSessionMode $false -ErrorAction SilentlyContinue");
-
-    // ── 3. Start ─────────────────────────────────────────────────
+    // ── 2. Start ─────────────────────────────────────────────────
     let state = vm_state(&vm_name).unwrap_or_else(|| "Off".to_string());
-    if !state.eq_ignore_ascii_case("Running") {
+    let already_running = state.eq_ignore_ascii_case("Running");
+
+    if !already_running {
         run_ps(&format!("Start-VM -Name '{}'", name))
             .map_err(|e| format!("Start-VM failed: {}", e))?;
     }
 
-    // ── 4. Poll for Running ──────────────────────────────────────
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut final_state = state;
-    while Instant::now() < deadline {
-        final_state = vm_state(&vm_name).unwrap_or_else(|| "Unknown".to_string());
-        if final_state.eq_ignore_ascii_case("Running") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    let success = final_state.eq_ignore_ascii_case("Running")
-        || final_state.eq_ignore_ascii_case("Starting");
-
-    if !success {
-        return Ok(VmSpawnResult {
-            success: false,
-            vm_name: vm_name.clone(),
-            pid: None,
-            message: format!("VM state: {} (profile: {})", final_state, profile),
-        });
-    }
-
-    // ── 5. Attach the console ────────────────────────────────────
-    let child = Command::new("vmconnect.exe")
+    // ── 3. Attach the console (best-effort) ──────────────────────
+    //
+    // vmconnect works against a Starting guest, and a console failure is not
+    // worth failing the engage over when the guest is already on its way up.
+    let pid = match Command::new("vmconnect.exe")
         .arg("localhost")
         .arg(&vm_name)
         .spawn()
-        .map_err(|e| {
-            format!(
-                "VM is running but vmconnect failed: {}. Install Hyper-V management tools.",
-                e
-            )
-        })?;
+    {
+        Ok(child) => Some(child.id()),
+        Err(e) => {
+            eprintln!("[vm] vmconnect failed for '{}': {}", vm_name, e);
+            None
+        }
+    };
 
     Ok(VmSpawnResult {
         success: true,
         vm_name,
-        pid: Some(child.id()),
-        message: format!("VM state: {} (profile: {})", final_state, profile),
+        pid,
+        message: if already_running {
+            format!("VM already running (profile: {})", profile)
+        } else {
+            format!("VM starting (profile: {})", profile)
+        },
     })
 }
 

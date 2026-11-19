@@ -10,3 +10,40 @@ body,
   overflow: hidden;
   overscroll-behavior: none;
 }
+
+/*
+ * The pointer must never change shape — a cursor swap is a visible tell on a
+ * recorded screen. Chromium hands range thumbs a pointer cursor by default, so
+ * it is reset here alongside the buttons.
+ */
+button,
+select,
+input,
+textarea,
+a,
+input[type="range"],
+input[type="range"]::-webkit-slider-thumb {
+  cursor: default;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: #1e293b;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: -3.5px;
+  border-radius: 999px;
+  background: #34d399;
+}

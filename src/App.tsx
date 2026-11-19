@@ -16,7 +16,7 @@ supabaseUrls.forEach((url: string, index: number) => {
     try {
       supabaseClients.push(createClient(url, key));
     } catch (err) {
-      console.error(`[⚠️] Failed to init UI DB client for ${url}:`, err);
+      console.error(`[WARN] Failed to init UI DB client for ${url}:`, err);
     }
   }
 });
@@ -26,15 +26,45 @@ if (supabaseClients.length === 0) {
 }
 
 const REMOTE_VIEWER = "https://copilate-frontend.vercel.app/";
+const MIN_W = 360;
+const MIN_H = 240;
+
+/** Must match DEFAULT_VM_NAME / PROTOCOL_VM_NAME on the Rust side. */
+const VM_NAME = (import.meta.env as any).VITE_VM_NAME || "Test-Nartan-Build";
+
+/** Status poll cadence and ceiling. 90 s is past a cold sysprep boot. */
+const VM_POLL_MS = 1500;
+const VM_POLL_MAX_TICKS = 60;
+
+type Destination = "AI" | "FRD";
 
 interface WebSocketPayload {
-  status: 'loading' | 'success' | 'error' | 'config_updated' | 'sync_cursor' | 'nav_up' | 'nav_down';
+  status:
+    | 'loading'
+    | 'success'
+    | 'error'
+    | 'config_updated'
+    | 'sync_cursor'
+    | 'nav_up'
+    | 'nav_down'
+    | 'awaiting_friend';
   data?: string;
   transcript?: string;
   active_line?: number;
 }
 
+interface VmStatusPayload {
+  running: boolean;
+  vm_name: string;
+  state: string;
+  uptime_seconds: number;
+  cpu_usage: number;
+  memory_assigned_mb: number;
+  memory_usage_mb: number;
+}
+
 interface TriggerConfig {
+  version: number;
   summon_double_tap: string;
   sniper_double_tap: string;
   flush_double_tap: string;
@@ -48,23 +78,92 @@ interface TriggerConfig {
 }
 
 const FALLBACK_KEYS: TriggerConfig = {
+  version: 2,
   summon_double_tap: "CapsLock",
-  sniper_double_tap: "-",
+  sniper_double_tap: "/",
   flush_double_tap: "Return",
   audio_double_tap: ".",
-  toggle_double_tap: "ScrollLock",
+  toggle_double_tap: "-",
   opacity_up_double_tap: "=",
   opacity_down_double_tap: "[",
   double_tap_window_ms: 400,
-  cooldown_min_ms: 1500,
-  cooldown_max_ms: 2000,
+  cooldown_min_ms: 800,
+  cooldown_max_ms: 1200,
 };
 
 const isTauri = () =>
   typeof window !== 'undefined' &&
   ('__TAURI__' in window || '__TAURI_INTERNALS__' in window || '__TAURI_IPC__' in window);
 
-const displayKey = (k: string) => (k === "Return" ? "ENTER" : k === "CapsLock" ? "CAPS" : k);
+const labelKey = (raw: string) => {
+  if (!raw) return "?";
+  if (raw === "Return") return "ENTER";
+  if (raw === "CapsLock") return "CAPS";
+  if (raw === "ScrollLock") return "SCRLK";
+  if (raw === "Tab") return "TAB";
+  if (raw === "BackQuote") return "`";
+  return raw.toUpperCase();
+};
+
+// ── Icons (inline SVG, currentColor, no emoji) ──────────────────
+const IconScan = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5">
+    <path d="M4 8V6a2 2 0 0 1 2-2h2" />
+    <path d="M20 8V6a2 2 0 0 0-2-2h-2" />
+    <path d="M4 16v2a2 2 0 0 0 2 2h2" />
+    <path d="M20 16v2a2 2 0 0 1-2 2h-2" />
+    <circle cx="12" cy="12" r="2.5" />
+  </svg>
+);
+
+const IconChip = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5">
+    <rect x="7" y="7" width="10" height="10" rx="2" />
+    <path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4" />
+  </svg>
+);
+
+const IconPeople = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5">
+    <circle cx="9" cy="8" r="3" />
+    <path d="M3.5 19a5.5 5.5 0 0 1 11 0" />
+    <path d="M16 6.5a2.5 2.5 0 0 1 0 5" />
+    <path d="M17.5 19a4.5 4.5 0 0 0-2.2-3.9" />
+  </svg>
+);
+
+const IconSend = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5">
+    <path d="M12 19V5" />
+    <path d="M6 11l6-6 6 6" />
+  </svg>
+);
+
+const IconGrip = () => (
+  <svg viewBox="0 0 24 24" fill="currentColor" className="h-3.5 w-3.5">
+    <circle cx="9" cy="7" r="1.4" />
+    <circle cx="15" cy="7" r="1.4" />
+    <circle cx="9" cy="12" r="1.4" />
+    <circle cx="15" cy="12" r="1.4" />
+    <circle cx="9" cy="17" r="1.4" />
+    <circle cx="15" cy="17" r="1.4" />
+  </svg>
+);
+
+const IconResize = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5">
+    <path d="M20 14v6h-6" />
+    <path d="M20 20 13 13" />
+    <path d="M4 10V4h6" />
+    <path d="M4 4l7 7" />
+  </svg>
+);
+
+const IconMinus = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" className="h-3.5 w-3.5">
+    <path d="M6 12h12" />
+  </svg>
+);
 
 export default function App() {
   const [sessionCode, setSessionCode] = useState("");
@@ -73,9 +172,10 @@ export default function App() {
   const [response, setResponse] = useState("// agent online — press the summon key.");
   const [keys, setKeys] = useState<TriggerConfig>(FALLBACK_KEYS);
 
-  const [isVisible, setIsVisible] = useState(true);
   const [uiOpacity, setUiOpacity] = useState(0.95);
   const [captureMode, setCaptureMode] = useState<"VM" | "HOST">("VM");
+  const [destination, setDestination] = useState<Destination>("AI");
+  const [buffered, setBuffered] = useState(0);
 
   const [activeLine, setActiveLine] = useState<number | null>(null);
   const activeLineRef = useRef<HTMLDivElement>(null);
@@ -92,11 +192,16 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const taskModeRef = useRef(taskMode);
   const captureModeRef = useRef(captureMode);
+  const destinationRef = useRef<Destination>(destination);
+  const targetBrowserRef = useRef(targetBrowser);
   const imageBufferRef = useRef<string[]>([]);
+  const vmPollRef = useRef<number | undefined>(undefined);
 
   useEffect(() => { taskModeRef.current = taskMode; }, [taskMode]);
   useEffect(() => { captureModeRef.current = captureMode; }, [captureMode]);
+  useEffect(() => { destinationRef.current = destination; }, [destination]);
   useEffect(() => { responseRef.current = response; }, [response]);
+  useEffect(() => { targetBrowserRef.current = targetBrowser; }, [targetBrowser]);
 
   useEffect(() => {
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -112,7 +217,7 @@ export default function App() {
     localStorage.setItem('protocol_ui_opacity', uiOpacity.toString());
   }, [uiOpacity]);
 
-  // ── Trigger legend, sourced from trigger_config.json ──────────
+  // ── Trigger config, for the browser-mode mirror ───────────────
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
@@ -145,7 +250,7 @@ export default function App() {
             if (payload.new && payload.new.answer_text) {
               setResponse(payload.new.answer_text);
               setStatus("OVERRIDE");
-              setTranscript("👤 Remote operator updated the profile.");
+              setTranscript("remote operator updated the profile.");
             }
           })
         .subscribe());
@@ -189,7 +294,9 @@ export default function App() {
           if (payload.status === "loading") {
             setStatus("THINKING...");
             setTranscript(payload.transcript || "Processing...");
-            setIsVisible(true);
+          } else if (payload.status === "awaiting_friend") {
+            setStatus("AWAITING");
+            setTranscript(payload.transcript || "frames with operator.");
           } else if (payload.status === "success" && payload.data) {
             setStatus("READY");
             setTranscript(payload.transcript || "Processed.");
@@ -206,7 +313,7 @@ export default function App() {
             });
           } else if (payload.status === "error" && payload.data) {
             setStatus("ERROR");
-            setResponse("⚠️ " + payload.data);
+            setResponse("[!] " + payload.data);
           } else if (payload.status === "config_updated") {
             setStatus("CONFIG SAVED");
             setTimeout(() => { if (isMounted) setStatus("READY"); }, 2000);
@@ -242,66 +349,158 @@ export default function App() {
     }
   }, [activeLine, response]);
 
+  // ── Focus borrowing ───────────────────────────────────────────
+  //
+  // The window carries WS_EX_NOACTIVATE so a click never steals the exam's
+  // focus. A text field still needs real keyboard focus, so it is borrowed for
+  // as long as the field is focused and handed straight back on blur.
+  const borrowFocus = async () => {
+    if (!isTauri()) return;
+    try { await invoke("begin_text_input"); } catch (e) { console.error(e); }
+  };
+
+  const releaseFocus = async () => {
+    if (!isTauri()) return;
+    try { await invoke("end_text_input"); } catch (e) { console.error(e); }
+  };
+
+  // ── VM status watch ───────────────────────────────────────────
+  const stopVmWatch = () => {
+    if (vmPollRef.current) {
+      clearInterval(vmPollRef.current);
+      vmPollRef.current = undefined;
+    }
+  };
+
+  const settleHooked = (label: string) => {
+    stopVmWatch();
+    setVmStatus("HOOKED");
+    setCaptureMode("VM");
+    setTranscript(`loopback established. ${label} sandboxed.`);
+  };
+
+  /**
+   * ENGAGE returns as soon as Start-VM is issued, so the transition to Running
+   * is watched here. Polling beats a blocking invoke: the overlay stays usable
+   * and the transcript shows real state instead of a frozen "please wait".
+   */
+  const startVmWatch = () => {
+    stopVmWatch();
+    let ticks = 0;
+
+    vmPollRef.current = window.setInterval(async () => {
+      ticks += 1;
+      try {
+        const s = await invoke<VmStatusPayload>("get_vm_status", { vmName: VM_NAME });
+        if (s.running) {
+          settleHooked(targetBrowserRef.current);
+          return;
+        }
+        if (s.state === "Starting" || s.state === "Off") {
+          setTranscript(`booting ${VM_NAME} — ${s.state.toLowerCase()} (${ticks})`);
+        }
+      } catch (err) {
+        console.warn("status poll failed", err);
+      }
+
+      if (ticks >= VM_POLL_MAX_TICKS) {
+        stopVmWatch();
+        setVmStatus("OFFLINE");
+        setTranscript("boot watch timed out — inspect the console window.");
+      }
+    }, VM_POLL_MS);
+  };
+
+  // Reconcile with a guest that is already up when the overlay opens.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const s = await invoke<VmStatusPayload>("get_vm_status", { vmName: VM_NAME });
+        if (!cancelled && s.running) settleHooked(targetBrowserRef.current);
+      } catch { /* guest simply is not there */ }
+    })();
+
+    return () => { cancelled = true; stopVmWatch(); };
+  }, []);
+
   // ── Actions ───────────────────────────────────────────────────
   const engageHypervisor = async () => {
     if (!isTauri()) return;
     try {
       setVmStatus("BOOTING");
       setTranscript(`initiating hyper-v container for ${targetBrowser}...`);
-      await invoke("launch_stealth_vm", { target: targetBrowser });
-      setVmStatus("HOOKED");
-      setCaptureMode("VM");
-      setTranscript(`loopback established. ${targetBrowser} sandboxed.`);
+      const msg = await invoke<string>("launch_stealth_vm", { target: targetBrowser });
+      setTranscript(String(msg));
+      startVmWatch();
     } catch (err) {
       console.error(err);
+      stopVmWatch();
       setVmStatus("OFFLINE");
-      setTranscript("critical failure: hypervisor hook rejected.");
+      setTranscript(`critical failure: ${String(err)}`);
     }
   };
 
   const captureFrame = async () => {
     if (!isTauri()) {
       (window as any).__browserBuffered = true;
-      setTranscript("📸 browser mode — press ENTER to capture + send");
+      setTranscript("browser mode — press ENTER to capture and send");
       return;
     }
+
+    const wantVm = captureModeRef.current === "VM";
+
     try {
-      const b64: string = captureModeRef.current === "VM"
-        ? await invoke("capture_rdp_window", { ip: "127.0.0.2" })
-        : await invoke("capture_screen_native");
+      let b64: string;
+      if (wantVm) {
+        try {
+          b64 = await invoke("capture_rdp_window", { ip: "127.0.0.2" });
+        } catch (vmErr) {
+          console.warn("console capture failed, falling back to host", vmErr);
+          b64 = await invoke("capture_screen_native");
+          setTranscript("no console window — captured monitor instead");
+        }
+      } else {
+        b64 = await invoke("capture_screen_native");
+      }
+
       imageBufferRef.current.push(`data:image/jpeg;base64,${b64}`);
-      setTranscript(`📸 buffered ${imageBufferRef.current.length} frame(s) — press ENTER to send`);
+      setBuffered(imageBufferRef.current.length);
+      setTranscript(`held ${imageBufferRef.current.length} frame(s) — press send`);
     } catch (err) {
       console.error(err);
-      setTranscript(captureModeRef.current === "VM"
-        ? "capture failed: is the console window open?"
-        : "capture failed.");
+      setTranscript("capture failed.");
     }
   };
 
   const flushBuffer = async () => {
     const mode = taskModeRef.current;
+    const route = destinationRef.current;
 
     if (isTauri()) {
       if (wsRef.current?.readyState !== WebSocket.OPEN) {
         setStatus("ERROR");
-        setTranscript("backend disconnected.");
+        setTranscript("backend disconnected — retrying");
         return;
       }
       if (imageBufferRef.current.length === 0) {
-        setTranscript("buffer empty — capture a frame first.");
+        setTranscript("nothing held — capture a frame first.");
         return;
       }
       setStatus("UPLOADING...");
-      setTranscript(`transmitting ${imageBufferRef.current.length} frame(s)...`);
+      setTranscript(`transmitting ${imageBufferRef.current.length} frame(s) to ${route}...`);
       wsRef.current.send(JSON.stringify({
         action: "browser_image_batch_upload",
         images: imageBufferRef.current,
         mode,
+        route,
       }));
       imageBufferRef.current = [];
-      setStatus("READY");
-      setTranscript("frames synced.");
+      setBuffered(0);
+      setStatus(route === "FRD" ? "AWAITING" : "READY");
+      setTranscript(route === "FRD" ? "frames with operator." : "frames synced.");
     } else {
       let stream: MediaStream | null = null;
       try {
@@ -316,9 +515,9 @@ export default function App() {
         canvas.getContext('2d')?.drawImage(video, 0, 0);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
         if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ action: "browser_image_batch_upload", images: [dataUrl], mode }));
+          wsRef.current.send(JSON.stringify({ action: "browser_image_batch_upload", images: [dataUrl], mode, route }));
         }
-        setStatus("READY");
+        setStatus(route === "FRD" ? "AWAITING" : "READY");
       } catch (err) {
         console.error(err);
         setStatus("ERROR");
@@ -346,7 +545,7 @@ export default function App() {
     rec.lang = 'en-US';
     rec.interimResults = false;
     rec.maxAlternatives = 1;
-    rec.onstart = () => { setStatus("LISTENING..."); setTranscript("🔴 recording..."); };
+    rec.onstart = () => { setStatus("LISTENING..."); setTranscript("recording..."); };
     rec.onresult = (e: any) => {
       const text = e.results[0][0].transcript;
       setTranscript(`heard: ${text}`);
@@ -363,6 +562,8 @@ export default function App() {
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
+    let unlistenProvisioned: (() => void) | undefined;
+    let unlistenFailed: (() => void) | undefined;
 
     (async () => {
       try {
@@ -372,17 +573,30 @@ export default function App() {
           if (c === "TRIGGER_SNIPER") captureFrame();
           if (c === "FLUSH_BUFFER") flushBuffer();
           if (c === "TRIGGER_AUDIO") triggerAudio();
-          if (c === "SUMMON_COPILOT") setIsVisible(true);
-          if (c === "TOGGLE_VISIBILITY") setIsVisible(v => !v);
           if (c === "OPACITY_UP") setUiOpacity(p => Math.min(1.0, p + 0.1));
           if (c === "OPACITY_DOWN") setUiOpacity(p => Math.max(0.1, p - 0.1));
+          // SUMMON and TOGGLE are handled at the OS level by Rust.
+        });
+
+        unlistenProvisioned = await listen<string>('vm-provisioned', () => {
+          setTranscript("guest started — waiting for Running state");
+        });
+
+        unlistenFailed = await listen<string>('vm-provision-failed', (event) => {
+          stopVmWatch();
+          setVmStatus("OFFLINE");
+          setTranscript(`engage failed: ${event.payload}`);
         });
       } catch (e) {
         console.error("event setup failed", e);
       }
     })();
 
-    return () => { if (unlisten) unlisten(); };
+    return () => {
+      if (unlisten) unlisten();
+      if (unlistenProvisioned) unlistenProvisioned();
+      if (unlistenFailed) unlistenFailed();
+    };
   }, []);
 
   // ── Browser-mode keyboard mirror ──────────────────────────────
@@ -412,8 +626,6 @@ export default function App() {
         if (cmd === "TRIGGER_SNIPER") captureFrame();
         if (cmd === "FLUSH_BUFFER") flushBuffer();
         if (cmd === "TRIGGER_AUDIO") triggerAudio();
-        if (cmd === "SUMMON_COPILOT") setIsVisible(true);
-        if (cmd === "TOGGLE_VISIBILITY") setIsVisible(v => !v);
         if (cmd === "OPACITY_UP") setUiOpacity(p => Math.min(1.0, p + 0.1));
         if (cmd === "OPACITY_DOWN") setUiOpacity(p => Math.max(0.1, p - 0.1));
       } else {
@@ -429,25 +641,74 @@ export default function App() {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ action: "update_config", api_key: apiKey, resume_text: resumeText }));
       setShowSettings(false);
+      releaseFocus();
     }
   };
 
-  const copySessionCode = async () => {
+  const copyText = async (text: string, label: string) => {
     try {
-      await navigator.clipboard.writeText(sessionCode);
-      setTranscript(`✅ copied ${sessionCode}`);
+      await navigator.clipboard.writeText(text);
+      setTranscript(label);
     } catch {
-      setTranscript("❌ clipboard blocked");
+      setTranscript(`clipboard blocked — ${text}`);
     }
-    setTimeout(() => setTranscript("Awaiting diagnostic trigger..."), 3000);
+    setTimeout(() => setTranscript("Awaiting diagnostic trigger..."), 4000);
+  };
+
+  const shareLink = () => {
+    const url = `${REMOTE_VIEWER}?session=${sessionCode}`;
+    copyText(url, `share link copied — ${url}`);
+  };
+
+  const startDrag = async () => {
+    if (!isTauri()) return;
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    getCurrentWindow().startDragging();
+  };
+
+  /**
+   * Manual resize. The window is declared `resizable: false` so Windows never
+   * paints its own edge cursor; size is driven from pointer movement instead.
+   */
+  const startResize = async (e: React.PointerEvent) => {
+    if (!isTauri()) return;
+    e.preventDefault();
+
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    const { LogicalSize } = await import('@tauri-apps/api/dpi');
+    const win = getCurrentWindow();
+
+    const scale = await win.scaleFactor();
+    const size = await win.outerSize();
+    const baseW = size.width / scale;
+    const baseH = size.height / scale;
+    const originX = e.screenX;
+    const originY = e.screenY;
+
+    const onMove = (ev: PointerEvent) => {
+      const w = Math.max(MIN_W, Math.round(baseW + (ev.screenX - originX)));
+      const h = Math.max(MIN_H, Math.round(baseH + (ev.screenY - originY)));
+      win.setSize(new LogicalSize(w, h));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   };
 
   const handleHeaderDrag = async (e: React.PointerEvent) => {
     const target = e.target as HTMLElement;
     if (target.closest("button, select, input, textarea, a")) return;
     if (!isTauri()) return;
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
-    getCurrentWindow().startDragging();
+    startDrag();
+  };
+
+  const toggleHidden = async () => {
+    if (!isTauri()) return;
+    await invoke("toggle_overlay");
   };
 
   const reloadKeys = async () => {
@@ -460,43 +721,43 @@ export default function App() {
     }
   };
 
-  const Hint = ({ k, label }: { k: string; label: string }) => (
-    <span className="flex items-center gap-1 whitespace-nowrap">
-      <kbd className="px-1 py-[1px] rounded bg-slate-800 border border-slate-600 text-slate-200 text-[9px]">
-        {displayKey(k)}
-      </kbd>
-      <span className="text-slate-600 text-[9px]">x2</span>
-      <span className="text-slate-400 text-[9px] uppercase tracking-wide">{label}</span>
-    </span>
-  );
+  const destActive = (d: Destination) =>
+    destination === d
+      ? d === "AI"
+        ? "bg-emerald-700 text-white border-emerald-500"
+        : "bg-sky-700 text-white border-sky-500"
+      : "bg-slate-900 text-slate-500 border-slate-700";
 
   return (
     <main
       className="h-screen w-screen p-3 select-none font-mono relative overflow-hidden"
-      style={{ opacity: isVisible ? uiOpacity : 0, backgroundColor: 'transparent' }}
+      style={{ opacity: uiOpacity, backgroundColor: 'transparent' }}
     >
-      <div className="h-full w-full bg-slate-950 border-2 border-slate-700/80 rounded-xl p-4 flex flex-col justify-between text-white relative shadow-2xl">
+      <div className="h-full w-full bg-slate-950 border-2 border-slate-700/80 rounded-xl p-3 flex flex-col justify-between text-white relative shadow-2xl">
 
-        <div onPointerDown={handleHeaderDrag} className={`flex items-center justify-between border-b border-slate-700 pb-2 ${isTauri() ? "cursor-grab" : ""}`}>
+        <div onPointerDown={handleHeaderDrag} className="flex items-center justify-between border-b border-slate-700 pb-2">
           <div className="flex items-center gap-2 pointer-events-none">
             <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse" />
             <span className="text-xs font-bold tracking-widest text-white uppercase flex items-center">
-              TELEMETRY
+              PROTOCOL
               <span className="ml-2 text-[9px] px-1 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
                 {isTauri() ? "NATIVE" : "WEB"}
               </span>
             </span>
           </div>
 
-          <div className="flex items-center gap-2 bg-slate-900 border border-slate-700 rounded pl-3 pr-1 py-0.5">
+          <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-700 rounded pl-2 pr-1 py-0.5">
             <span className="text-[10px] font-bold text-slate-400">ID:</span>
             <span className="text-[11px] font-bold text-emerald-400 tracking-wider">{sessionCode || "GEN..."}</span>
-            <button onClick={copySessionCode} tabIndex={-1} className="ml-2 text-[9px] bg-slate-800 hover:bg-slate-700 text-white px-2 py-0.5 rounded">
+            <button onClick={() => copyText(sessionCode, `copied ${sessionCode}`)} tabIndex={-1} className="text-[9px] bg-slate-800 hover:bg-slate-700 text-white px-1.5 py-0.5 rounded">
               COPY
+            </button>
+            <button onClick={shareLink} tabIndex={-1} className="text-[9px] bg-sky-800 hover:bg-sky-700 text-white px-1.5 py-0.5 rounded font-bold">
+              SHARE
             </button>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <select
               value={targetBrowser}
               onChange={(e) => setTargetBrowser(e.target.value as any)}
@@ -517,19 +778,25 @@ export default function App() {
                 "bg-purple-900/50 text-purple-400 border-purple-700"
               }`}
             >
-              {vmStatus === "OFFLINE" ? "ENGAGE VM" : vmStatus}
+              {vmStatus === "OFFLINE" ? "ENGAGE VM" : vmStatus === "BOOTING" ? "BOOTING" : "HOOKED"}
             </button>
 
-            <select
-              value={captureMode}
-              onChange={(e) => setCaptureMode(e.target.value as any)}
-              tabIndex={-1}
-              className="bg-slate-900 border border-slate-700 text-[10px] text-sky-400 font-bold rounded px-1 py-0.5 outline-none"
-              title="VM captures only the console window. HOST captures the full screen."
-            >
-              <option value="VM">CAP: VM</option>
-              <option value="HOST">CAP: HOST</option>
-            </select>
+            <div className="flex rounded border border-slate-700 overflow-hidden">
+              <button
+                onClick={() => setCaptureMode("VM")}
+                tabIndex={-1}
+                className={`text-[10px] font-bold px-1.5 py-0.5 ${captureMode === "VM" ? "bg-sky-700 text-white" : "bg-slate-900 text-slate-500"}`}
+              >
+                VM
+              </button>
+              <button
+                onClick={() => setCaptureMode("HOST")}
+                tabIndex={-1}
+                className={`text-[10px] font-bold px-1.5 py-0.5 ${captureMode === "HOST" ? "bg-sky-700 text-white" : "bg-slate-900 text-slate-500"}`}
+              >
+                HOST
+              </button>
+            </div>
 
             <select
               value={taskMode}
@@ -564,6 +831,8 @@ export default function App() {
                 placeholder="AIzaSy..."
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
+                onFocus={borrowFocus}
+                onBlur={releaseFocus}
                 tabIndex={-1}
                 className="w-full bg-slate-950 border border-slate-700 text-white text-xs p-2 rounded mb-3 outline-none focus:border-emerald-500"
               />
@@ -573,6 +842,8 @@ export default function App() {
                 placeholder="Paste environment context here..."
                 value={resumeText}
                 onChange={(e) => setResumeText(e.target.value)}
+                onFocus={borrowFocus}
+                onBlur={releaseFocus}
                 tabIndex={-1}
                 className="w-full bg-slate-950 border border-slate-700 text-white text-xs p-2 rounded outline-none focus:border-emerald-500 font-sans resize-none"
               />
@@ -587,12 +858,18 @@ export default function App() {
                 tabIndex={-1}
                 className="mt-2 inline-block text-[10px] text-sky-400 underline"
               >
-                open remote viewer ↗
+                open remote viewer
               </a>
             </div>
             <div className="flex gap-2">
               <button onClick={saveSettings} tabIndex={-1} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold py-2 rounded uppercase">Save</button>
-              <button onClick={() => setShowSettings(false)} tabIndex={-1} className="bg-slate-800 text-slate-300 text-xs font-bold px-4 py-2 rounded">Cancel</button>
+              <button
+                onClick={() => { setShowSettings(false); releaseFocus(); }}
+                tabIndex={-1}
+                className="bg-slate-800 text-slate-300 text-xs font-bold px-4 py-2 rounded"
+              >
+                Cancel
+              </button>
             </div>
           </div>
         )}
@@ -614,16 +891,96 @@ export default function App() {
           </div>
         </div>
 
-        {/* KEY LEGEND — always matches trigger_config.json */}
-        <div className="mt-2 pt-2 border-t border-slate-800 flex flex-wrap items-center gap-x-3 gap-y-1">
-          <Hint k={keys.summon_double_tap} label="summon" />
-          <Hint k={keys.sniper_double_tap} label="grab" />
-          <Hint k={keys.flush_double_tap} label="send" />
-          <Hint k={keys.audio_double_tap} label="audio" />
-          <Hint k={keys.toggle_double_tap} label="hide" />
-          <Hint k={keys.opacity_up_double_tap} label="dim+" />
-          <Hint k={keys.opacity_down_double_tap} label="dim-" />
-          <span className="ml-auto text-[9px] text-slate-600 uppercase">{captureMode} cap</span>
+        {/* CONTROL STRIP */}
+        <div className="mt-2 pt-2 border-t border-slate-800 flex items-center gap-1.5">
+
+          <button
+            onClick={captureFrame}
+            tabIndex={-1}
+            className="relative flex items-center gap-1 text-[10px] font-bold px-2 py-1 rounded border bg-sky-900/60 text-sky-200 border-sky-700 hover:bg-sky-800/70"
+          >
+            <IconScan />
+            SS
+            {buffered > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[14px] h-[14px] px-0.5 rounded-full bg-emerald-500 text-slate-950 text-[9px] font-bold flex items-center justify-center">
+                {buffered}
+              </span>
+            )}
+          </button>
+
+          <div className="flex rounded border border-slate-700 overflow-hidden">
+            <button
+              onClick={() => setDestination("AI")}
+              tabIndex={-1}
+              className={`flex items-center gap-1 text-[10px] font-bold px-2 py-1 border-r border-slate-700 ${destActive("AI")}`}
+            >
+              <IconChip />
+              AI
+            </button>
+            <button
+              onClick={() => setDestination("FRD")}
+              tabIndex={-1}
+              className={`flex items-center gap-1 text-[10px] font-bold px-2 py-1 ${destActive("FRD")}`}
+            >
+              <IconPeople />
+              FRD
+            </button>
+          </div>
+
+          <button
+            onClick={flushBuffer}
+            tabIndex={-1}
+            className="flex items-center gap-1 text-[10px] font-bold px-2 py-1 rounded border bg-emerald-700 text-white border-emerald-500 hover:bg-emerald-600"
+          >
+            <IconSend />
+            SEND
+          </button>
+
+          <input
+            type="range"
+            min={0.2}
+            max={1}
+            step={0.05}
+            value={uiOpacity}
+            onChange={(e) => setUiOpacity(parseFloat(e.target.value))}
+            tabIndex={-1}
+            className="flex-1 min-w-[52px] h-3"
+          />
+
+          <button
+            onPointerDown={startDrag}
+            tabIndex={-1}
+            className="text-slate-400 hover:text-slate-200 px-1 py-1 rounded border border-slate-700 bg-slate-900"
+          >
+            <IconGrip />
+          </button>
+
+          <button
+            onPointerDown={startResize}
+            tabIndex={-1}
+            className="text-slate-400 hover:text-slate-200 px-1 py-1 rounded border border-slate-700 bg-slate-900"
+          >
+            <IconResize />
+          </button>
+
+          <button
+            onClick={toggleHidden}
+            tabIndex={-1}
+            className="text-slate-400 hover:text-slate-200 px-1 py-1 rounded border border-slate-700 bg-slate-900"
+          >
+            <IconMinus />
+          </button>
+
+        </div>
+
+        {/* BINDING LEGEND — driven off the live config, so a rebind updates it */}
+        <div className="mt-1 flex items-center justify-center gap-2 text-[8.5px] text-slate-600 pointer-events-none leading-none">
+          <span>{labelKey(keys.summon_double_tap)} SUMMON</span>
+          <span>{labelKey(keys.sniper_double_tap)} SHOT</span>
+          <span>{labelKey(keys.toggle_double_tap)} HIDE</span>
+          <span>{labelKey(keys.flush_double_tap)} SEND</span>
+          <span>{labelKey(keys.audio_double_tap)} AUDIO</span>
+          <span>{labelKey(keys.opacity_up_double_tap)}{labelKey(keys.opacity_down_double_tap)} OPACITY</span>
         </div>
 
       </div>
