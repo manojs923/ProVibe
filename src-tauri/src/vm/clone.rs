@@ -1,6 +1,7 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::hidden_command;
 
 #[derive(Debug, Clone)]
 pub struct CloneResult {
@@ -68,7 +69,7 @@ pub fn create_differencing_disk(
     let output_str = disk_path.to_string_lossy().to_string();
     let base_str = base_path.to_string_lossy().to_string();
 
-    let status = Command::new("powershell")
+    let status = hidden_command("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -110,7 +111,7 @@ pub fn destroy_differencing_disk(disk_path: &Path) -> Result<(), String> {
 
     // First attempt: PowerShell Remove-VHD (handles attached disk scenarios cleanly)
     let path_str = disk_path.to_string_lossy().to_string();
-    let status = Command::new("powershell")
+    let status = hidden_command("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",

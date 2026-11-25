@@ -1,5 +1,6 @@
-use std::process::Command;
 use std::path::PathBuf;
+
+use crate::hidden_command;
 
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
@@ -26,7 +27,7 @@ pub struct NetworkResult {
 }
 
 fn run_powershell(command: &str) -> Result<String, String> {
-    let output = Command::new("powershell")
+    let output = hidden_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", command])
         .output()
         .map_err(|e| format!("Failed to spawn PowerShell: {}", e))?;
@@ -122,7 +123,7 @@ pub fn configure_loopback_adapter(config: &NetworkConfig) -> Result<bool, String
         }
     } else {
         // Install the KM-TEST loopback adapter via pnputil (silent, no driver signing popup).
-        let status = Command::new("pnputil")
+        let status = hidden_command("pnputil")
             .args(["/add-driver", "C:\\Windows\\INF\\netloop.inf", "/install"])
             .output()
             .map_err(|e| format!("Failed to spawn pnputil: {}", e))?;

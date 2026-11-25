@@ -14,7 +14,7 @@
 #>
 
 param(
-    [string]$WinISO       = "C:\ISO\Win11_24H2.iso",
+    [string]$WinISO       = "C:\Users\rippl\Downloads\Windows11_Client_x64_en-us_26300_9457.iso",
     [string]$WorkDir       = "C:\VMBase",
     [string]$VMSwitchName = "Default Switch",
     [string]$BaseVHDX     = "C:\VMBase\Images\Win11-Base.vhdx",
@@ -114,7 +114,7 @@ function New-UnattendXml {
 
     $unattend = @'
 <?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend">
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
     <settings pass="specialize">
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
                    publicKeyToken="31bf3856ad364e35" language="neutral"
@@ -162,7 +162,7 @@ function New-UnattendXml {
                     <Value>TempPass123!</Value>
                     <PlainText>true</PlainText>
                 </Password>
-                <LogonCount>1</LogonCount>
+                <LogonCount>50</LogonCount>
             </AutoLogon>
         </component>
     </settings>
@@ -574,3 +574,5 @@ try {
 }
 
 Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+
+

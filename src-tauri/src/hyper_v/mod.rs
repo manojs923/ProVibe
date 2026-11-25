@@ -115,6 +115,13 @@ impl Default for GuestCredentials {
 /// `HOST_PS_TIMEOUT`. A non-zero exit becomes
 /// [`StealthError::PowerShellFailure`] carrying the child's stderr, so callers
 /// see the actual PowerShell error instead of a bare exit code.
+///
+/// Two Windows details matter here:
+///   - `CREATE_NO_WINDOW` — this binary owns no console, so without it every
+///     call allocates a fresh conhost window that appears and vanishes. The
+///     artifact cleaner runs several of these per artifact.
+///   - `kill_on_drop` — a timeout drops the wait future, and without this the
+///     child survives it, holding its pipe and its console forever.
 pub(crate) async fn run_host_ps(script: &str) -> Result<String, StealthError> {
     run_host_ps_with_timeout(script, HOST_PS_TIMEOUT).await
 }
@@ -124,15 +131,20 @@ pub(crate) async fn run_host_ps_with_timeout(
     script: &str,
     ceiling: Duration,
 ) -> Result<String, StealthError> {
-    let mut child = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args(PS_ARGS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            StealthError::HostInvocation(format!("failed to spawn powershell.exe: {}", e))
-        })?;
+        .kill_on_drop(true);
+
+    #[cfg(windows)]
+    command.creation_flags(crate::util::CREATE_NO_WINDOW);
+
+    let mut child = command.spawn().map_err(|e| {
+        StealthError::HostInvocation(format!("failed to spawn powershell.exe: {}", e))
+    })?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(script.as_bytes()).await.map_err(|e| {

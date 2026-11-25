@@ -1,10 +1,10 @@
 use std::path::PathBuf;
-use std::process::Command;
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::hidden_command;
 use crate::util::ps_literal;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +161,9 @@ pub fn build_config_named(target_id: &str, vm_name: &str) -> VmConfig {
 /// `ModifySystemSettings`, not `Set-CimInstance` (whose properties are
 /// read-only). Manufacturer and model are not writable through this surface at
 /// all, so they stay advisory.
+///
+/// Runs on the cold path of every fresh provision, so it goes through
+/// `hidden_command` — otherwise it flashes a console window on each engage.
 pub fn apply_spoof(vm_name: &str, profile: &SpoofProfile) -> Result<(), String> {
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
@@ -191,7 +194,7 @@ if ($res.ReturnValue -ne 0 -and $res.ReturnValue -ne 4096) {{
         serial = ps_literal(&profile.bios_guid),
     );
 
-    let output = Command::new("powershell.exe")
+    let output = hidden_command("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",

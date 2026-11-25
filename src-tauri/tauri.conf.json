@@ -17,7 +17,7 @@
         "width": 460,
         "height": 640,
         "minWidth": 360,
-        "minHeight": 240,
+        "minHeight": 260,
         "resizable": false,
         "fullscreen": false,
         "transparent": true,
@@ -40,7 +40,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -49,19 +49,16 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "resources/base.vhdx",
       "../scripts/*.ps1"
     ],
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper"
       },
-      "wix": {
-        "language": "en-US"
-      },
       "nsis": {
         "installMode": "perMachine",
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "compression": "none"
       }
     }
   }

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>supacol</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --k:#0b0b0c; --w:#f2f2ef;
+  --p1:color-mix(in srgb,var(--w) 5%,var(--k));
+  --p2:color-mix(in srgb,var(--w) 10%,var(--k));
+  --line:color-mix(in srgb,var(--w) 18%,var(--k));
+  --mute:color-mix(in srgb,var(--w) 55%,var(--k));
+  --sans:'Space Grotesk',system-ui,sans-serif; --mono:'JetBrains Mono',ui-monospace,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--k);color:var(--w);font-family:var(--sans)}
+body{min-height:100vh}
+:focus-visible{outline:2px solid var(--w);outline-offset:2px}
+header{display:flex;align-items:baseline;gap:16px;padding:26px 28px;border-bottom:1px solid var(--line)}
+h1{font-size:26px;margin:0;font-weight:700;letter-spacing:-.03em}
+header p{margin:0;color:var(--mute);font-size:13px}
+main{display:grid;grid-template-columns:320px 1fr;gap:20px;padding:22px 28px;max-width:1500px;margin:auto}
+@media(max-width:900px){main{grid-template-columns:1fr;padding:16px}header{flex-direction:column;gap:4px}}
+.card{background:var(--p1);border:1px solid var(--line);border-radius:6px;padding:18px}
+.card h2{font-size:14px;margin:0 0 12px;font-weight:700}
+label.f{display:block;font-size:12px;color:var(--mute);margin:12px 0 5px}
+input[type=text]{width:100%;background:var(--k);border:1px solid var(--line);border-radius:4px;color:var(--w);padding:10px 12px;font:13px var(--mono)}
+input[type=text]:focus{border-color:var(--w);outline:none}
+.proj{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:4px;cursor:pointer}
+.proj:hover{background:var(--p2)}
+.proj input{accent-color:var(--w);width:15px;height:15px}
+.proj .ref{font:13px var(--mono)}
+.proj small{display:block;color:var(--mute);font:11px var(--mono)}
+.dot{width:9px;height:9px;border-radius:50%;border:1.5px solid var(--mute);margin-left:auto;flex:none}
+.dot.ok{background:var(--w);border-color:var(--w)}
+.dot.err{border-color:var(--w);background:repeating-linear-gradient(45deg,var(--w) 0 2px,transparent 2px 4px)}
+.dot.run{border-color:var(--w);animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.25}}
+.link{background:none;border:0;color:var(--mute);text-decoration:underline;cursor:pointer;font:12px var(--sans);padding:0}
+.link:hover{color:var(--w)}
+.right{display:flex;flex-direction:column;gap:20px;min-width:0}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.chip{background:transparent;border:1px solid var(--line);color:var(--w);border-radius:4px;padding:5px 12px;font:12px var(--sans);cursor:pointer}
+.chip:hover{background:var(--w);color:var(--k)}
+textarea{width:100%;min-height:210px;resize:vertical;background:var(--k);border:1px solid var(--line);border-radius:4px;color:var(--w);padding:14px;font:13.5px/1.6 var(--mono);tab-size:2}
+textarea:focus{border-color:var(--w);outline:none}
+.run{display:flex;align-items:center;gap:12px;margin-top:12px}
+button.go{background:var(--w);color:var(--k);border:0;border-radius:4px;padding:11px 22px;font:700 14px var(--sans);cursor:pointer}
+button.go:hover{opacity:.88}
+button.go:disabled{opacity:.45;cursor:wait}
+.hint{color:var(--mute);font-size:12px}
+.tabs{display:flex;gap:6px;overflow-x:auto;border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:12px}
+.tab{flex:none;display:flex;align-items:center;gap:8px;background:transparent;color:var(--mute);border:1px solid transparent;border-radius:4px;padding:7px 12px;font:12px var(--mono);cursor:pointer}
+.tab .dot{margin-left:0}
+.tab.on{background:var(--w);color:var(--k)}
+.tab.on .dot{border-color:var(--k)}
+.tab.on .dot.ok{background:var(--k)}
+.meta{font-size:12px;color:var(--mute);margin-bottom:10px}
+.msg{padding:14px;border-radius:4px;font:13px/1.5 var(--mono);white-space:pre-wrap;border:1px solid var(--line)}
+.msg.err{border:1px dashed var(--w)}
+.tw{overflow:auto;max-height:440px;border:1px solid var(--line);border-radius:4px}
+table{border-collapse:collapse;width:100%;font:12.5px var(--mono)}
+th{position:sticky;top:0;background:var(--p2);text-align:left;padding:9px 12px;font-weight:500;border-bottom:1px solid var(--line)}
+td{padding:8px 12px;border-bottom:1px solid var(--line);white-space:pre;max-width:420px;overflow:hidden;text-overflow:ellipsis}
+tr:hover td{background:var(--p2)}
+.null{color:var(--mute);font-style:italic}
+.sum{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px}
+.sum .c{background:var(--p2);border:1px solid var(--line);border-radius:4px;padding:12px;cursor:pointer}
+.sum .c:hover{border-color:var(--w)}
+.sum .c b{font:500 13px var(--mono)}
+.sum .c div{font-size:12px;margin-top:6px}
+.empty{color:var(--mute);padding:28px;text-align:center;font-size:14px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<header>
+  <h1>supacol</h1>
+  <p>One query, every Supabase project.</p>
+</header>
+
+<main>
+  <aside class="card">
+    <h2>Access</h2>
+    <p class="hint" id="tokInfo">Tokens loaded.</p>
+    <p class="hint" id="proxyInfo" style="margin-top:4px">Checking proxy…</p>
+    <label class="f" for="base">Proxy URL</label>
+    <input id="base" type="text" value="http://localhost:8787">
+
+    <h2 style="margin-top:22px;display:flex;justify-content:space-between;align-items:center">
+      <span>Projects <span id="count" class="hint"></span></span>
+      <span><button class="link" id="all">all</button> · <button class="link" id="none">none</button></span>
+    </h2>
+    <div id="projects"></div>
+  </aside>
+
+  <section class="right">
+    <div class="card">
+      <h2>Query</h2>
+      <div class="bar" id="presets"></div>
+      <textarea id="sql" spellcheck="false" placeholder="select now();"></textarea>
+      <div class="run">
+        <button class="go" id="runBtn">Run on selected projects</button>
+        <span class="hint">Ctrl / ⌘ + Enter</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Results</h2>
+      <div class="tabs" id="tabs"></div>
+      <div id="out"><div class="empty">Run a query to see results here.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+// ---- Your projects (refs come from the URLs, keys kept for reference) ----
+const URLS = "https://yfyiizovbhsddpmgduvs.supabase.co,https://jbgrwhzmxuydnmbbqoaa.supabase.co,https://aujoerlxflvbxvqqtprr.supabase.co,https://uwqxnontvuxwjhsckeob.supabase.co,https://ilahujayzykctouvvpyg.supabase.co,https://gqdbheqwbxzwyirwjuno.supabase.co,https://tchqndgtxbscmspdisie.supabase.co,https://elhenjwqewmowpfqjlea.supabase.co".split(",");
+const KEYS = "sb_publishable_NoyP-ECcNTrOdxc27CQdtw_9iopHIN9,sb_publishable_QWcngQrI9zZyXgiMi1KYeg_V8dyYrlj,sb_publishable_hlPdNMypLHQ-LCd_j0Eg1Q_-IN6QBw6,sb_publishable_MO6LFY6KX3ZCkbLhemgrdg_UBe9TBsy,sb_publishable_-XAFHhUw3YBH7PuV7FaZew_4VmSyQKy,sb_publishable_QjB3Q1YblXc4jIURMoLw4A_2Gv1foUz,sb_publishable_DV_nvpL6Mtdr9Xs2-3Nb_g_o2SqVgOI,sb_publishable_4g89JyZ53yYaBHwv7Rnijg_2aduQO78".split(",");
+const PROJECTS = URLS.map((u,i)=>({ref:new URL(u).hostname.split(".")[0],url:u,key:KEYS[i],n:i+1,on:true,state:"idle",res:null}));
+
+const PRESETS = {
+"Copilot RLS":`alter table copilot_sessions enable row level security;
+drop policy if exists sessions_anon_select on copilot_sessions;
+drop policy if exists sessions_anon_insert on copilot_sessions;
+drop policy if exists sessions_anon_delete on copilot_sessions;
+create policy sessions_anon_select on copilot_sessions for select using (true);
+create policy sessions_anon_insert on copilot_sessions for insert with check (true);
+create policy sessions_anon_delete on copilot_sessions for delete using (true);
+
+alter table copilot_control enable row level security;
+drop policy if exists control_anon_select on copilot_control;
+drop policy if exists control_anon_insert on copilot_control;
+drop policy if exists control_anon_update on copilot_control;
+create policy control_anon_select on copilot_control for select using (true);
+create policy control_anon_insert on copilot_control for insert with check (true);
+create policy control_anon_update on copilot_control for update using (true) with check (true);`,
+"Check policies":`select tablename, policyname, cmd, qual, with_check
+from pg_policies
+where tablename in ('copilot_sessions','copilot_control')
+order by tablename, policyname;`,
+"RLS status":`select relname as table, relrowsecurity as rls_enabled
+from pg_class
+where relname in ('copilot_sessions','copilot_control');`,
+"List tables":`select table_name from information_schema.tables
+where table_schema = 'public' order by 1;`
+};
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let active = "all";
+
+// ---- Tokens (built in): token #n is used for project #n ----
+const TOKENS = "sbp_fc18b595c3284c24a23a5c30a6747918b4622652,sbp_fc45ff922ed8dc5866dc0d7ae39a6a505f7fac74,sbp_fc7e381a9cfe977aed82d3d70fcd1ffe02409313,sbp_fc5743a1bdd98b186fd1f0efe16e338b09f30013,sbp_fc3c0ac633dbe9faf39bfed225080ac58e2d2287,sbp_fc5f1a2372c6c44f800bcac429ad818286c44741,sbp_fc34211c8ebe9cfd87210f510d557e1116f98b9a,sbp_fc57209a8dfe40535ab4bcebf51e3c1783a3aaee".split(",");
+function tokenFor(p){ return TOKENS[p.n-1] || TOKENS[TOKENS.length-1]; }
+$("#tokInfo").textContent = `${TOKENS.length} tokens built in — one per project.`;
+
+// persistence (base URL + last query, in this browser only)
+try{
+  $("#base").value = (location.protocol.startsWith("http") && location.port==="8787") ? location.origin : "http://localhost:8787";
+  $("#sql").value = localStorage.getItem("supacol_sql")||PRESETS["Copilot RLS"];
+}catch(e){ $("#sql").value = PRESETS["Copilot RLS"]; }
+
+function renderProjects(){
+  $("#projects").innerHTML = PROJECTS.map((p,i)=>`
+    <label class="proj"><input type="checkbox" data-i="${i}" ${p.on?"checked":""}>
+      <span><span class="ref">#${p.n} ${p.ref}</span><small>${p.key.slice(0,22)}…</small></span>
+      <span class="dot ${p.state==="ok"?"ok":p.state==="err"?"err":p.state==="run"?"run":""}"></span></label>`).join("");
+  $("#count").textContent = `(${PROJECTS.filter(p=>p.on).length}/${PROJECTS.length})`;
+  document.querySelectorAll("#projects input").forEach(el=>el.onchange=()=>{PROJECTS[el.dataset.i].on=el.checked;renderProjects()});
+}
+$("#all").onclick=()=>{PROJECTS.forEach(p=>p.on=true);renderProjects()};
+$("#none").onclick=()=>{PROJECTS.forEach(p=>p.on=false);renderProjects()};
+$("#presets").innerHTML = Object.keys(PRESETS).map(k=>`<button class="chip" data-k="${esc(k)}">${esc(k)}</button>`).join("");
+document.querySelectorAll(".chip").forEach(b=>b.onclick=()=>{$("#sql").value=PRESETS[b.dataset.k]});
+
+function cell(v){
+  if(v===null) return '<span class="null">NULL</span>';
+  if(typeof v==="object") return esc(JSON.stringify(v));
+  return esc(v);
+}
+function renderTable(rows){
+  if(!Array.isArray(rows)||!rows.length) return '<div class="msg ok">Success. No rows returned.</div>';
+  const cols=[...new Set(rows.flatMap(r=>Object.keys(r)))];
+  return `<div class="meta">${rows.length} row${rows.length>1?"s":""}</div><div class="tw"><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${cell(r[c]??null)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+function renderOut(){
+  const ran = PROJECTS.filter(p=>p.res);
+  $("#tabs").innerHTML = ran.length ? [`<button class="tab ${active==="all"?"on":""}" data-t="all">All projects</button>`,
+    ...ran.map(p=>`<button class="tab ${active===p.ref?"on":""}" data-t="${p.ref}"><span class="dot ${p.state}"></span>#${p.n}</button>`)].join("") : "";
+  document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{active=t.dataset.t;renderOut()});
+  if(!ran.length) return;
+  if(active==="all"){
+    $("#out").innerHTML = `<div class="sum">${ran.map(p=>`<div class="c" data-r="${p.ref}"><b>#${p.n} ${p.ref}</b><div>${p.state==="ok"?"✓ "+(Array.isArray(p.res.data)&&p.res.data.length?p.res.data.length+" rows":"Success"):p.state==="err"?"✕ "+esc(p.res.error).slice(0,90):"Running…"}</div><div class="hint">${p.res.ms??"–"} ms</div></div>`).join("")}</div>`;
+    document.querySelectorAll(".sum .c").forEach(c=>c.onclick=()=>{active=c.dataset.r;renderOut()});
+  } else {
+    const p = PROJECTS.find(x=>x.ref===active);
+    $("#out").innerHTML = `<div class="meta">${p.ref} · ${p.res.ms??"–"} ms</div>` + (p.state==="err"?`<div class="msg err">${esc(p.res.error)}</div>`:p.state==="run"?'<div class="empty">Running…</div>':renderTable(p.res.data));
+  }
+}
+
+async function runOne(p, sql, token, base){
+  p.state="run"; p.res={}; renderProjects(); renderOut();
+  const t0=performance.now();
+  try{
+    const r = await fetch(`${base.replace(/\/$/,"")}/v1/projects/${p.ref}/database/query`,{
+      method:"POST",headers:{"Authorization":"Bearer "+token,"Content-Type":"application/json"},body:JSON.stringify({query:sql})});
+    const txt = await r.text(); let j; try{j=JSON.parse(txt)}catch{j=txt}
+    p.res.ms=Math.round(performance.now()-t0);
+    if(!r.ok){p.state="err";p.res.error=(j&&j.message)||(typeof j==="string"?j:JSON.stringify(j))||("HTTP "+r.status)}
+    else {p.state="ok";p.res.data=j}
+  }catch(e){
+    p.res.ms=Math.round(performance.now()-t0); p.state="err";
+    p.res.error="Cannot reach the proxy at "+base+" ("+e.message+").\nRun: node server.cjs in the folder containing server.cjs, then run again.";
+  }
+  renderProjects(); renderOut();
+}
+
+async function runAll(){
+  const base=$("#base").value.trim(), sql=$("#sql").value.trim();
+  const sel=PROJECTS.filter(p=>p.on);
+  if(!sql||!sel.length){alert("Add a query and select at least one project.");return}
+  try{localStorage.setItem("supacol_sql",sql)}catch(e){}
+  PROJECTS.forEach(p=>{p.res=null;p.state="idle"});
+  active="all"; $("#runBtn").disabled=true; $("#runBtn").textContent="Running…";
+  await Promise.all(sel.map(p=>runOne(p,sql,tokenFor(p),base)));
+  $("#runBtn").disabled=false; $("#runBtn").textContent="Run on selected projects";
+  if(sel.length===1) {active=sel[0].ref;renderOut()}
+}
+$("#runBtn").onclick=runAll;
+$("#sql").addEventListener("keydown",e=>{if((e.ctrlKey||e.metaKey)&&e.key==="Enter"){e.preventDefault();runAll()}});
+renderProjects();
+
+async function checkProxy(){
+  const base=$("#base").value.trim().replace(/\/$/,"");
+  try{
+    const r=await fetch(base+"/ping",{cache:"no-store"});
+    if(!r.ok) throw 0;
+    $("#proxyInfo").textContent="✓ Proxy online";
+  }catch(e){
+    $("#proxyInfo").textContent="✕ Proxy offline — run: node server.cjs in the folder with server.cjs";
+  }
+}
+$("#base").addEventListener("change",checkProxy);
+checkProxy();
+</script>
+</body>
+</html>

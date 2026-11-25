@@ -15,6 +15,34 @@ pub mod powershell;
 pub use powershell::PowerShellScript;
 
 // ---------------------------------------------------------------------------
+// Process invocation
+// ---------------------------------------------------------------------------
+
+/// `CREATE_NO_WINDOW`.
+///
+/// This binary is GUI-subsystem and owns no console of its own, so every
+/// `powershell.exe` it launches gets a brand new conhost window. On a status
+/// poll that reads as a terminal flickering open and closed every second and a
+/// half. Every spawn in the crate goes through [`hidden_command`] — or applies
+/// this flag to its own tokio command — so none of them flash.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// A process builder that never allocates a console window.
+pub fn hidden_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd
+}
+
+// ---------------------------------------------------------------------------
 // PowerShell literal escaping
 //
 // Every host script in this crate interpolates guest-controlled or

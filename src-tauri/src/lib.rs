@@ -8,9 +8,14 @@ mod vm;
 
 pub use target_id::{fetch_all, fetch_profile};
 
+/// Re-exported for the modules that shell out; the definition and its
+/// rationale live in [`util`].
+pub(crate) use util::hidden_command;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,6 +37,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Fallback guest name when `PROTOCOL_VM_NAME` is unset.
 const DEFAULT_VM_NAME: &str = "Test-Nartan-Build";
 
+/// Folder under %APPDATA% that holds user-writable state.
+const APP_DIR_NAME: &str = "com.protocol.app";
+
+/// Prefix every stored frame carries.
+const DATA_URL_PREFIX: &str = "data:image/jpeg;base64,";
+
 /// A key still flagged as held after this long is assumed to have lost its
 /// release event (focus steal, hook drop) and is treated as fresh.
 const REPEAT_GRACE_MS: u64 = 5_000;
@@ -39,7 +50,7 @@ const REPEAT_GRACE_MS: u64 = 5_000;
 /// Bumped whenever a default binding moves. Drives the migration below so an
 /// existing trigger_config.json is rewritten instead of silently fighting the
 /// new defaults.
-const CONFIG_VERSION: u32 = 2;
+const CONFIG_VERSION: u32 = 3;
 
 /// Set while a provision is in flight so a second ENGAGE cannot start a second
 /// New-VHD against the same base disk.
@@ -50,7 +61,12 @@ static PROVISIONING: AtomicBool = AtomicBool::new(false);
 static PREV_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 
 // ---------------------------------------------------------------------------
-// Trigger configuration (trigger_config.json next to the executable)
+// Trigger configuration
+//
+// Lives in %APPDATA%\com.protocol.app\trigger_config.json. A perMachine install
+// puts the exe in Program Files, where fs::write fails unelevated, so the file
+// cannot sit beside the binary any more. A config left next to the exe by an
+// older build is carried over once and then ignored.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,25 +119,25 @@ impl TriggerConfig {
     /// Brings an older file up to the current binding set. Returns whether
     /// anything was rewritten so the caller can persist it.
     fn migrated(mut self) -> (Self, bool) {
-        if self.version >= CONFIG_VERSION {
-            return (self, false);
-        }
+        let mut changed = false;
 
-        // v1 shipped the sniper on "-" and the toggle on ScrollLock. Anyone who
-        // never edited the file gets both moved; anyone who did keeps their
-        // custom key unless it collides with the new toggle.
+        // The toggle always owns "-". Anything else on it — the sniper in v1,
+        // a stale hand-edit, a collision — is moved off.
         if self.sniper_double_tap == "-" {
             self.sniper_double_tap = "/".to_string();
+            changed = true;
         }
-        if self
-            .toggle_double_tap
-            .eq_ignore_ascii_case("ScrollLock")
-            || self.toggle_double_tap.is_empty()
-        {
+        if self.toggle_double_tap != "-" {
             self.toggle_double_tap = "-".to_string();
+            changed = true;
         }
-        self.version = CONFIG_VERSION;
-        (self, true)
+
+        if self.version != CONFIG_VERSION {
+            self.version = CONFIG_VERSION;
+            changed = true;
+        }
+
+        (self, changed)
     }
 
     /// Rejects tokens that carry a modifier, since the whole point is to keep
@@ -182,17 +198,90 @@ impl TriggerConfig {
     }
 }
 
-fn config_path() -> Option<std::path::PathBuf> {
+/// Writable config directory. %APPDATA% is the only location that works for a
+/// perMachine install running unelevated; the exe directory is a last resort
+/// for a portable/renamed environment where APPDATA is somehow unset.
+fn config_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("APPDATA") {
+        Some(appdata) => PathBuf::from(appdata),
+        None => {
+            let fallback = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))?;
+            eprintln!("⚠️ APPDATA unset, keeping config beside the exe");
+            return Some(fallback);
+        }
+    };
+
+    let dir = base.join(APP_DIR_NAME);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!(
+            "⚠️ cannot create {} ({}), keeping config beside the exe",
+            dir.display(),
+            e
+        );
+        return std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    }
+    Some(dir)
+}
+
+fn config_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("trigger_config.json"))
+}
+
+/// Where pre-APPDATA builds kept the file.
+fn legacy_config_path() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .map(|d| d.join("trigger_config.json"))
 }
 
+/// One-time carry-over of a config left next to the exe.
+///
+/// Copy, not move: the Program Files original may be read-only and a failed
+/// delete must not abort startup. The legacy file is left in place as a backup
+/// and never read again once the new one exists. Only valid JSON is carried
+/// over — a malformed legacy file is skipped so it cannot re-break the app on
+/// every launch.
+fn migrate_legacy_config(target: &Path) {
+    if target.exists() {
+        return;
+    }
+    let Some(legacy) = legacy_config_path() else {
+        return;
+    };
+    if !legacy.exists() || legacy == target {
+        return;
+    }
+    let Ok(raw) = fs::read_to_string(&legacy) else {
+        return;
+    };
+    if serde_json::from_str::<TriggerConfig>(&raw).is_err() {
+        eprintln!(
+            "⚠️ legacy config at {} is malformed, starting from defaults",
+            legacy.display()
+        );
+        return;
+    }
+    match fs::write(target, raw) {
+        Ok(()) => eprintln!(
+            "⚙️ migrated trigger_config.json from {} to {}",
+            legacy.display(),
+            target.display()
+        ),
+        Err(e) => eprintln!("⚠️ config migration failed ({}), starting from defaults", e),
+    }
+}
+
 fn write_config(cfg: &TriggerConfig) {
     if let Some(path) = config_path() {
         if let Ok(t) = serde_json::to_string_pretty(cfg) {
-            let _ = fs::write(&path, t);
+            if let Err(e) = fs::write(&path, t) {
+                eprintln!("⚠️ could not write {}: {}", path.display(), e);
+            }
         }
     }
 }
@@ -200,32 +289,36 @@ fn write_config(cfg: &TriggerConfig) {
 /// Silent on purpose — the dispatcher reloads this on every capture, and a
 /// println per keystroke drowns the log.
 fn load_config() -> TriggerConfig {
-    if let Some(path) = config_path() {
-        if let Ok(raw) = fs::read_to_string(&path) {
-            match serde_json::from_str::<TriggerConfig>(&raw) {
-                Ok(cfg) => {
-                    let (cfg, rewritten) = cfg.migrated();
-                    let cfg = cfg.sanitized();
-                    if rewritten {
-                        eprintln!("⚙️ trigger_config.json migrated to v{}", CONFIG_VERSION);
-                        write_config(&cfg);
-                    }
-                    return cfg;
-                }
-                Err(e) => {
-                    eprintln!("⚠️ trigger_config.json malformed ({}), restoring template.", e);
-                    let cfg = TriggerConfig::default();
+    let Some(path) = config_path() else {
+        return TriggerConfig::default();
+    };
+
+    // Cheap `exists()` stat on the hot path; a no-op once the file is present.
+    migrate_legacy_config(&path);
+
+    if let Ok(raw) = fs::read_to_string(&path) {
+        match serde_json::from_str::<TriggerConfig>(&raw) {
+            Ok(cfg) => {
+                let (cfg, rewritten) = cfg.migrated();
+                let cfg = cfg.sanitized();
+                if rewritten {
+                    eprintln!("⚙️ trigger_config.json migrated to v{}", CONFIG_VERSION);
                     write_config(&cfg);
-                    return cfg;
                 }
+                return cfg;
             }
-        } else {
-            let cfg = TriggerConfig::default();
-            write_config(&cfg);
-            return cfg;
+            Err(e) => {
+                eprintln!("⚠️ trigger_config.json malformed ({}), restoring template.", e);
+                let cfg = TriggerConfig::default();
+                write_config(&cfg);
+                return cfg;
+            }
         }
     }
-    TriggerConfig::default()
+
+    let cfg = TriggerConfig::default();
+    write_config(&cfg);
+    cfg
 }
 
 #[tauri::command]
@@ -248,6 +341,12 @@ fn reset_trigger_config(app: AppHandle) -> TriggerConfig {
     write_config(&cfg);
     let _ = app.emit("trigger-config", &cfg);
     cfg
+}
+
+/// Exposed so the HUD can show the real path instead of guessing.
+#[tauri::command]
+fn get_trigger_config_path() -> Option<String> {
+    config_path().map(|p| p.display().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -350,35 +449,146 @@ fn grab_primary_monitor() -> Result<String, String> {
 
 /// Full-monitor capture for the bare-metal fallback.
 ///
-/// The window is protected with WDA_EXCLUDEFROMCAPTURE, and GDI BitBlt (what
+/// The overlay is protected with WDA_EXCLUDEFROMCAPTURE and GDI BitBlt (what
 /// the `screenshots` crate uses) renders protected windows as a solid black
-/// rectangle. Protection is dropped for the duration of the shot so the exam
-/// underneath stays readable, then restored.
+/// rectangle. Hiding the window is used rather than dropping the protection,
+/// because the overlay usually sits on top of the exam and would otherwise
+/// cover the very text being captured. DWM needs a beat to recomposite, and the
+/// first grab after a visibility change is frequently stale, so the shot is
+/// taken twice and the first discarded.
 #[tauri::command]
 async fn capture_screen_native(app: AppHandle) -> Result<String, String> {
     let window = app.get_webview_window("main");
     if let Some(w) = &window {
-        let _ = w.set_content_protected(false);
+        let _ = w.hide();
     }
-    tokio::time::sleep(Duration::from_millis(90)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let result = tokio::task::spawn_blocking(grab_primary_monitor)
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = tokio::task::spawn_blocking(|| {
+        let _ = grab_primary_monitor();
+        std::thread::sleep(Duration::from_millis(60));
+        grab_primary_monitor()
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
 
+    // Restore on both paths — the old `?` skipped this on error and left the
+    // overlay hidden.
     if let Some(w) = &window {
-        let _ = w.set_content_protected(true);
+        let _ = w.show();
+        suppress_activation(w);
     }
+
     result
 }
 
 /// Console-only capture for VM mode. `ip` doubles as a window hint.
+///
+/// The console window is excluded from capture before every grab so a proctor's
+/// screen share never sees the VM. PrintWindow renders excluded windows fine,
+/// so this costs nothing.
 #[tauri::command]
 async fn capture_rdp_window(ip: String) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || rdp::stream::capture_window_by_hint(&ip))
-        .await
-        .map_err(|e| format!("capture task panicked: {}", e))?
-        .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        if let Ok(hwnd) = rdp::stream::find_console_window(&ip) {
+            unsafe {
+                let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            }
+        }
+        rdp::stream::capture_window_by_hint(&ip)
+    })
+    .await
+    .map_err(|e| format!("capture task panicked: {}", e))?
+    .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Frame dump
+//
+// Bulk image export without a download prompt per file. The frontend sends the
+// stored data URL as-is; the prefix is stripped here and the payload decoded
+// straight to disk. Callers batch the work so no single IPC payload grows
+// unbounded.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct FrameDumpFile {
+    /// Filename stem; the extension is added here.
+    name: String,
+    /// The full `data:image/jpeg;base64,...` URL as stored.
+    data: String,
+}
+
+/// Keep a filename to characters Windows will accept.
+fn sanitize_stem(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // Guard against reserved trailing dots and empty stems.
+    let trimmed = cleaned.trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "frame".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Create a fresh dump directory under the user's Downloads and return it.
+#[tauri::command]
+fn begin_frame_dump() -> Result<String, String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("no USERPROFILE: {}", e))?;
+    let dir = PathBuf::from(home)
+        .join("Downloads")
+        .join(format!("protocol_dump_{}", stamp));
+
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// Decode and write a batch of frames into `dir`. Returns how many landed.
+#[tauri::command]
+fn write_frame_dump(dir: String, files: Vec<FrameDumpFile>) -> Result<usize, String> {
+    let dir = PathBuf::from(dir);
+    let mut written = 0usize;
+
+    for file in files {
+        let payload = file.data.strip_prefix(DATA_URL_PREFIX).unwrap_or(&file.data);
+        let bytes = STANDARD
+            .decode(payload)
+            .map_err(|e| format!("decode '{}': {}", file.name, e))?;
+
+        let path = dir.join(format!("{}.jpg", sanitize_stem(&file.name)));
+        fs::write(&path, bytes).map_err(|e| format!("write {}: {}", path.display(), e))?;
+        written += 1;
+    }
+
+    Ok(written)
+}
+
+/// Reveal a directory in Explorer. Explorer is GUI-subsystem, so the window is
+/// the point — it takes no console flag.
+#[tauri::command]
+fn open_folder(path: String) -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("cannot open {}: {}", path, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +688,12 @@ enum KeyMsg {
 fn keystroke_thread(app: AppHandle, rx: Receiver<KeyMsg>) {
     let mut cfg = load_config();
     #[cfg(debug_assertions)]
-    println!("⚙️ trigger config loaded: {:?}", cfg);
+    {
+        if let Some(p) = config_path() {
+            println!("⚙️ config path: {}", p.display());
+        }
+        println!("⚙️ trigger config loaded: {:?}", cfg);
+    }
     let _ = app.emit("trigger-config", &cfg);
 
     // Only gated commands appear here.
@@ -599,7 +814,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             capture_screen_native,
             capture_rdp_window,
+            begin_frame_dump,
+            write_frame_dump,
+            open_folder,
             get_trigger_config,
+            get_trigger_config_path,
             reload_trigger_config,
             reset_trigger_config,
             toggle_overlay,

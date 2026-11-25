@@ -1,5 +1,38 @@
 @import "tailwindcss";
 
+:root {
+  --bg: rgba(8, 11, 16, 0.95);
+  --bg-soft: rgba(15, 20, 28, 0.94);
+  --bg-chip: rgba(30, 41, 59, 0.65);
+  --line: #1e293b;
+  --line-soft: #16202e;
+  --text: #cbd5e1;
+  --text-dim: #7d8ba1;
+  --text-faint: #556379;
+  --accent: #34d399;
+  --accent-dim: #0f9c6f;
+  --danger: #f87171;
+  --danger-dim: #b91c1c;
+}
+
+/*
+ * Cursor lock. The pointer must never change shape — a swap is a visible tell
+ * on a recorded screen. A container-level rule is not enough: text nodes still
+ * get an I-beam and Chromium hands range thumbs a pointer, so this is universal
+ * and important, and it is re-asserted on every interactive element below.
+ * `user-select: none` stops the I-beam being re-derived from a selectable run
+ * of text.
+ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  cursor: default !important;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
 html,
 body,
 #root {
@@ -9,24 +42,545 @@ body,
   background: transparent;
   overflow: hidden;
   overscroll-behavior: none;
-}
-
-/*
- * The pointer must never change shape — a cursor swap is a visible tell on a
- * recorded screen. Chromium hands range thumbs a pointer cursor by default, so
- * it is reset here alongside the buttons.
- */
-button,
-select,
-input,
-textarea,
-a,
-input[type="range"],
-input[type="range"]::-webkit-slider-thumb {
   cursor: default;
 }
 
+/* Belt and braces: elements Chromium likes to re-cursorize. */
+button,
+input,
+textarea,
+select,
+option,
+label,
+a,
+summary {
+  cursor: default !important;
+}
+
+input[type="range"],
+input[type="range"]::-webkit-slider-runnable-track,
+input[type="range"]::-webkit-slider-thumb {
+  cursor: default !important;
+}
+
+::selection {
+  background: rgba(52, 211, 153, 0.3);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #253044;
+  border-radius: 999px;
+}
+
+/* ── shell ─────────────────────────────────────────────────── */
+
+.shell {
+  height: 100%;
+  padding: 5px;
+  display: flex;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--text);
+  background: transparent;
+  transition: opacity 120ms linear;
+}
+
+.frame {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+}
+
+/* ── header ────────────────────────────────────────────────── */
+
+.bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: #e2e8f0;
+}
+
+.brand em {
+  font-style: normal;
+  font-size: 7px;
+  letter-spacing: 0.14em;
+  color: var(--text-faint);
+}
+
+.dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.idbox {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.idbox .k {
+  font-size: 7px;
+  letter-spacing: 0.14em;
+  color: var(--text-faint);
+}
+
+.idbox .v {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+}
+
+.tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-left: auto;
+}
+
+/* ── buttons ───────────────────────────────────────────────── */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text-dim);
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  outline: none;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+}
+
+.btn--on {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: rgba(15, 156, 111, 0.14);
+}
+
+.btn--danger {
+  color: var(--danger);
+  border-color: var(--danger-dim);
+  background: rgba(185, 28, 28, 0.14);
+}
+
+.btn--accent {
+  color: #04140d;
+  font-weight: 700;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+select.btn {
+  padding-right: 3px;
+  appearance: none;
+}
+
+select.btn option {
+  background: #0b1017;
+  color: var(--text);
+}
+
+/*
+ * ── hover / focus / active: nothing moves ───────────────────
+ *
+ * Every interactive state is pinned to the values of its base class so the
+ * shell looks identical whether or not a pointer is over it. Explicit values
+ * rather than an empty rule, because a stray inherited hover (tailwind
+ * preflight, UA sheet) would otherwise still show through. No transitions,
+ * no translate, no shadow, no outline, no brightness filter.
+ */
+.btn,
+.btn:hover,
+.btn:focus,
+.btn:focus-visible,
+.btn:active {
+  color: var(--text-dim);
+  background: var(--bg-chip);
+  border-color: var(--line);
+  outline: none;
+  box-shadow: none;
+  transform: none;
+  filter: none;
+  transition: none;
+}
+
+.btn--on,
+.btn--on:hover,
+.btn--on:focus,
+.btn--on:active {
+  color: var(--accent);
+  background: rgba(15, 156, 111, 0.14);
+  border-color: var(--accent-dim);
+}
+
+.btn--danger,
+.btn--danger:hover,
+.btn--danger:focus,
+.btn--danger:active {
+  color: var(--danger);
+  background: rgba(185, 28, 28, 0.14);
+  border-color: var(--danger-dim);
+}
+
+.btn--accent,
+.btn--accent:hover,
+.btn--accent:focus,
+.btn--accent:active {
+  color: #04140d;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.btn:disabled,
+.btn:disabled:hover {
+  opacity: 0.4;
+  box-shadow: none;
+  transform: none;
+}
+
+/* ── status pill ───────────────────────────────────────────── */
+
+.pill {
+  padding: 2px 6px;
+  font-size: 7.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.pill--ok {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: rgba(15, 156, 111, 0.14);
+}
+
+.pill--busy {
+  color: #fbbf24;
+  border-color: #92610a;
+  background: rgba(180, 120, 10, 0.16);
+}
+
+.pill--err {
+  color: var(--danger);
+  border-color: var(--danger-dim);
+  background: rgba(185, 28, 28, 0.18);
+}
+
+/* ── drawer ────────────────────────────────────────────────── */
+
+.drawer {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+
+.drawer h3 {
+  margin: 0 0 4px;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--text-dim);
+}
+
+.drawer label {
+  display: block;
+  margin: 4px 0 2px;
+  font-size: 7.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.field {
+  width: 100%;
+  padding: 4px 5px;
+  font: inherit;
+  font-size: 10px;
+  color: var(--text);
+  background: #060a0f;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  outline: none;
+}
+
+.field:focus,
+.field:focus-visible,
+.field:hover {
+  color: var(--text);
+  background: #060a0f;
+  border-color: var(--line);
+  outline: none;
+  box-shadow: none;
+}
+
+.field--area {
+  resize: none;
+  line-height: 1.5;
+}
+
+.row {
+  display: flex;
+  gap: 3px;
+}
+
+/* ── transcript ────────────────────────────────────────────── */
+
+.transcript {
+  padding: 2px 5px;
+  font-size: 8.5px;
+  color: var(--text-dim);
+  border-left: 2px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── split panes ───────────────────────────────────────────── */
+
+.split {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 5px;
+}
+
+.pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg-soft);
+  overflow: hidden;
+}
+
+.pane__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 3px 5px;
+  font-size: 7.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.pane__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 5px;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.pane__body--answer {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #e2e8f0;
+}
+
+.line {
+  padding: 0 3px;
+  border-left: 2px solid transparent;
+}
+
+.line--active {
+  color: #ffffff;
+  background: rgba(52, 211, 153, 0.16);
+  border-left-color: var(--accent);
+}
+
+.msg {
+  padding: 1px 0;
+}
+
+.msg b {
+  margin-right: 5px;
+  font-size: 7.5px;
+  letter-spacing: 0.1em;
+  color: var(--accent-dim);
+}
+
+.empty {
+  padding: 3px;
+  font-size: 9px;
+  font-style: italic;
+  color: var(--text-faint);
+}
+
+/* ── chips ─────────────────────────────────────────────────── */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  max-height: 62px;
+  overflow-y: auto;
+}
+
+.chip {
+  padding: 2px 6px;
+  font: inherit;
+  font-size: 8.5px;
+  color: var(--text-dim);
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  outline: none;
+}
+
+.chip--add {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  font-weight: 700;
+}
+
+.chip,
+.chip:hover,
+.chip:focus,
+.chip:active {
+  color: var(--text-dim);
+  background: var(--bg-chip);
+  border-color: var(--line);
+  outline: none;
+  box-shadow: none;
+  transform: none;
+  transition: none;
+}
+
+.chip--add,
+.chip--add:hover,
+.chip--add:focus,
+.chip--add:active {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+/* ── composer ──────────────────────────────────────────────── */
+
+.composer {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg-soft);
+}
+
+.composer__text {
+  flex: 1;
+  min-width: 0;
+  padding: 0 3px;
+  font-size: 10px;
+  color: #e2e8f0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.composer__text--empty {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* ── action strip ──────────────────────────────────────────── */
+
+.strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding-top: 5px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.strip .ss {
+  position: relative;
+}
+
+.badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 11px;
+  padding: 0 3px;
+  font-size: 7.5px;
+  font-weight: 700;
+  line-height: 11px;
+  text-align: center;
+  color: #1a0505;
+  background: var(--danger);
+  border-radius: 999px;
+}
+
 input[type="range"] {
+  flex: 1;
+  min-width: 54px;
   -webkit-appearance: none;
   appearance: none;
   background: transparent;
@@ -45,5 +599,5 @@ input[type="range"]::-webkit-slider-thumb {
   height: 10px;
   margin-top: -3.5px;
   border-radius: 999px;
-  background: #34d399;
+  background: var(--accent);
 }

@@ -5,6 +5,7 @@ pub mod lifecycle;
 pub mod network;
 pub mod sandbox;
 
+use crate::hidden_command;
 use crate::target_id::TargetProfile;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -21,9 +22,6 @@ use crate::vm::network::NetworkConfig;
 const DEFAULT_GUEST_USER: &str = "Administrator";
 const DEFAULT_GUEST_PASSWORD: &str = "Protocol!2024";
 
-/// Virtual switch used for the loopback pair. Created by `network`.
-const LOOPBACK_SWITCH: &str = "Protocol-Loopback";
-
 /// Default startup memory for a freshly provisioned guest, in MB.
 ///
 /// Overridable with `PROTOCOL_VM_MEMORY_MB`. The 6 GB this used to hardcode
@@ -35,11 +33,17 @@ const DEFAULT_VM_MEMORY_MB: u64 = 2048;
 /// always wins over the profile, because the profile has no idea how much RAM
 /// the host can actually spare.
 fn provision_memory_bytes(profile_mb: u32) -> u64 {
+    let fallback = if profile_mb >= 1024 {
+        profile_mb as u64
+    } else {
+        DEFAULT_VM_MEMORY_MB
+    };
+
     std::env::var("PROTOCOL_VM_MEMORY_MB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|mb| *mb >= 1024)
-        .unwrap_or(profile_mb as u64)
+        .unwrap_or(fallback)
         * 1024
         * 1024
 }
@@ -69,7 +73,7 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 }
 
 fn run_ps(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell.exe")
+    let output = hidden_command("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -122,6 +126,60 @@ fn vm_state(name: &str) -> Option<String> {
     } else {
         Some(out)
     }
+}
+
+/// Switch the guest adapter attaches to.
+///
+/// `PROTOCOL_VM_SWITCH` overrides. The default is the built-in "Default
+/// Switch": it exists on every Hyper-V host and is NAT, so the guest can reach
+/// the internet to install a lockdown browser. `network.rs` builds a private
+/// switch named "HVSandboxSwitch" for isolation, but nothing on this path calls
+/// it — set the variable to that once isolation matters.
+///
+/// A name that does not resolve makes `Add-VMNetworkAdapter` fail silently and
+/// leaves the guest with no NIC, which is invisible from the UI. So the name is
+/// verified first and falls back rather than provisioning a blind VM.
+fn vm_switch_name() -> String {
+    let preferred =
+        std::env::var("PROTOCOL_VM_SWITCH").unwrap_or_else(|_| "Default Switch".to_string());
+
+    let exists = run_ps(&format!(
+        "@(Get-VMSwitch -Name '{}' -ErrorAction SilentlyContinue).Count",
+        ps_escape(&preferred)
+    ))
+    .ok()
+    .and_then(|s| s.trim().parse::<u32>().ok())
+    .unwrap_or(0)
+        > 0;
+
+    if exists {
+        preferred
+    } else {
+        eprintln!(
+            "[vm] switch '{}' not found, falling back to 'Default Switch'",
+            preferred
+        );
+        "Default Switch".to_string()
+    }
+}
+
+/// Whether a `vmconnect` console for this guest is already open.
+///
+/// `spawn_blocking_impl` is reachable more than once per session (a second
+/// ENGAGE, a retry after a failed poll) and each call used to open another
+/// console window on top of the last. Counting live processes first keeps it
+/// to one, and still reopens the console if the user closed it.
+fn console_open(vm_name: &str) -> bool {
+    let script = format!(
+        r#"@(Get-CimInstance Win32_Process -Filter "Name='vmconnect.exe'" -ErrorAction SilentlyContinue | Where-Object {{ $_.CommandLine -like '*{}*' }}).Count"#,
+        ps_escape(vm_name)
+    );
+
+    run_ps(&script)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +320,7 @@ fn spawn_blocking_impl(
         let cfg = config::build_config_named(&profile, &vm_name);
         let mem = provision_memory_bytes(cfg.memory_mb);
         let cores = cfg.cpu_cores.clamp(2, 8);
+        let switch = ps_escape(&vm_switch_name());
 
         // Disk work and hardening share one interpreter launch. Hardening is
         // wrapped so a WMI hiccup cannot leave a half-provisioned disk behind
@@ -304,7 +363,7 @@ try {{
             base = base_literal,
             mem = mem,
             cores = cores,
-            switch = LOOPBACK_SWITCH
+            switch = switch
         );
 
         run_ps(&provision).map_err(|e| format!("provisioning failed: {}", e))?;
@@ -332,17 +391,20 @@ try {{
     //
     // vmconnect works against a Starting guest, and a console failure is not
     // worth failing the engage over when the guest is already on its way up.
-    let pid = match Command::new("vmconnect.exe")
-        .arg("localhost")
-        .arg(&vm_name)
-        .spawn()
-    {
-        Ok(child) => Some(child.id()),
-        Err(e) => {
-            eprintln!("[vm] vmconnect failed for '{}': {}", vm_name, e);
-            None
+    // Skipped when a console is already attached, so a repeat engage does not
+    // stack windows. vmconnect is GUI-subsystem, so no console flag is needed.
+    let mut pid = None;
+
+    if !console_open(&vm_name) {
+        match Command::new("vmconnect.exe")
+            .arg("localhost")
+            .arg(&vm_name)
+            .spawn()
+        {
+            Ok(child) => pid = Some(child.id()),
+            Err(e) => eprintln!("[vm] vmconnect failed for '{}': {}", vm_name, e),
         }
-    };
+    }
 
     Ok(VmSpawnResult {
         success: true,

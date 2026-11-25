@@ -23,12 +23,12 @@ pub mod input;
 pub mod stream;
 
 use std::net::TcpStream;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::hidden_command;
 use crate::rdp::audio::AudioTap;
 use crate::rdp::client::{ClientError, RdpClient};
 use crate::rdp::input::{InputConfig, InputError, InputEvent, InputForwarder};
@@ -75,8 +75,10 @@ fn ps_escape(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// Every adapter/tunnel command goes through `hidden_command` — this binary has
+/// no console, so a bare spawn flashes a conhost window per call.
 fn run_ps(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell.exe")
+    let output = hidden_command("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
