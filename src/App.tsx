@@ -26,8 +26,8 @@ if (supabaseClients.length === 0) {
   console.error("CRITICAL: no database nodes configured.");
 }
 
-const REMOTE_VIEWER = "https://copilate-frontend.vercel.app/";
-const WS_URL = "wss://protocol-i59x.onrender.com";
+const REMOTE_VIEWER = "https://pro-buddy-jnu8d210x-dboss1.vercel.app/";
+const WS_URL = "wss://provibe.onrender.com";
 const MIN_W = 360;
 const MIN_H = 260;
 
