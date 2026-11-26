@@ -27,7 +27,6 @@ if (supabaseClients.length === 0) {
 }
 
 const REMOTE_VIEWER = "https://pro-buddy-jnu8d210x-dboss1.vercel.app/";
-const WS_URL = "wss://provibe.onrender.com";
 const MIN_W = 360;
 const MIN_H = 260;
 
@@ -183,6 +182,13 @@ const FALLBACK_KEYS: TriggerConfig = {
 const isTauri = () =>
   typeof window !== 'undefined' &&
   ('__TAURI__' in window || '__TAURI_INTERNALS__' in window || '__TAURI_IPC__' in window);
+
+const WS_URLS = [
+  (import.meta.env as any).VITE_WS_URL,
+  "wss://protocol-i59x.onrender.com",
+  "wss://provibe.onrender.com",
+  isTauri() ? "ws://localhost:8765" : null,
+].filter((url): url is string => typeof url === "string" && url.length > 0);
 
 const stamp = () => new Date().toISOString().slice(11, 23);
 const wsLog = (...args: unknown[]) => console.log(`[ws ${stamp()}]`, ...args);
@@ -657,19 +663,24 @@ export default function App() {
     if (!sessionCode) return;
     let isMounted = true;
     let reconnectTimer: number | undefined;
+    let urlIndex = 0;
+    let retryDelay = 3000;
 
     const connectWs = () => {
       if (!isMounted) return;
       if (wsRef.current && (wsRef.current.readyState === WebSocket.CONNECTING || wsRef.current.readyState === WebSocket.OPEN)) return;
 
-      wsLog("connecting", WS_URL, "session", sessionCode);
-      const socket = new WebSocket(WS_URL);
+      const wsUrl = WS_URLS[urlIndex % WS_URLS.length];
+      wsLog("connecting", wsUrl, "session", sessionCode);
+      setStatus("RECONNECTING...");
+      const socket = new WebSocket(wsUrl);
       wsRef.current = socket;
 
       socket.onopen = () => {
         if (!isMounted) return;
         wsLog("open");
         setStatus("CONNECTED");
+        retryDelay = 3000;
         socket.send(JSON.stringify({ action: "set_session", session_code: sessionCode }));
         socket.send(JSON.stringify({ action: "set_mode", mode: taskModeRef.current }));
       };
@@ -680,7 +691,9 @@ export default function App() {
         clearReplyWatchdog();
         setStatus("DISCONNECTED");
         wsRef.current = null;
-        reconnectTimer = window.setTimeout(connectWs, 3000);
+        urlIndex = (urlIndex + 1) % WS_URLS.length;
+        reconnectTimer = window.setTimeout(connectWs, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 15000);
       };
 
       socket.onerror = (err) => { wsLog("error", err); };
@@ -1257,7 +1270,7 @@ export default function App() {
       ? "pill pill--err"
       : status === "UPLOADING..." || status === "THINKING..." || status === "CAPTURING..."
         || status === "LISTENING..." || status === "CLOSING..." || status === "PURGING..."
-        || status === "EXPORTING..."
+        || status === "EXPORTING..." || status === "RECONNECTING..."
         ? "pill pill--busy"
         : "pill pill--ok";
 

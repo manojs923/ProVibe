@@ -5,7 +5,7 @@ import wave
 import asyncio
 import threading
 import time
-import websockets
+from aiohttp import web, WSMsgType
 import base64
 import requests
 import binascii
@@ -102,7 +102,7 @@ async def broadcast_to_ui(message_dict, session_code=None):
     msg = json.dumps(message_dict)
     for ws in list(sessions_ws[session_code]):
         try:
-            await ws.send(msg)
+            await ws.send_str(msg)
         except Exception:
             pass
 
@@ -286,13 +286,7 @@ def sync_upload_batch(images, session_code, batch_id):
             print(f"[CRITICAL] All database nodes failed to process frame {file_name}.")
 
 async def execute_screenshot_batch(requested_mode="AUTO", session_code=None, route="ai"):
-    """Handles Native Tauri screenshot batch.
-
-    `route` decides who answers:
-      - "ai"   -> upload, then the model reply arrives on the socket
-      - "frf"/"friend" -> upload only, and the session waits on an operator
-                          override written to `copilot_sessions.answer_text`
-    """
+    """Handles Native Tauri screenshot batch."""
     if not session_code:
         session_code = local_active_session
     if not session_code:
@@ -449,28 +443,36 @@ async def handle_audio_workflow(websocket, session_code):
 # =====================================================================
 # WEBSOCKET SERVER & CONFIG PROTOCOL
 # =====================================================================
-async def ws_handler(websocket):
+async def ws_handler(request):
     global local_active_session
+
+    # If it's a regular HTTP request (like a health check ping or HEAD), return 200 OK
+    if request.headers.get("Upgrade", "").lower() != "websocket":
+        return await health_handler(request)
 
     session_code = None
     client_type = None
-
-    try:
-        client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
-    except Exception:
-        client_ip = "unknown"
+    websocket = web.WebSocketResponse(max_msg_size=50 * 1024 * 1024)
+    await websocket.prepare(request)
+    client_ip = request.remote or "unknown"
 
     print(f"\n[NEW CONNECTION] From IP: {client_ip}")
 
     try:
         async for message in websocket:
+            if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
+                break
+            if message.type == WSMsgType.ERROR:
+                raise websocket.exception() or RuntimeError("WebSocket connection error")
+            if message.type not in (WSMsgType.TEXT, WSMsgType.BINARY):
+                continue
             try:
-                payload = json.loads(message)
+                payload = json.loads(message.data)
                 if not isinstance(payload, dict):
                     raise ValueError("Payload must be a JSON object")
             except (json.JSONDecodeError, ValueError):
                 print("[WARN] Received malformed JSON from client.")
-                await websocket.send(json.dumps({"status": "error", "data": "Malformed JSON payload."}))
+                await websocket.send_str(json.dumps({"status": "error", "data": "Malformed JSON payload."}))
                 continue
 
             action = payload.get("action")
@@ -478,18 +480,18 @@ async def ws_handler(websocket):
             if action == "set_session":
                 req_session_code = payload.get("session_code", "")
                 if not req_session_code or not isinstance(req_session_code, str):
-                    await websocket.send(json.dumps({"status": "error", "data": "Invalid session_code."}))
+                    await websocket.send_str(json.dumps({"status": "error", "data": "Invalid session_code."}))
                     continue
 
                 if session_code is not None and session_code != req_session_code:
-                    await websocket.send(json.dumps({"status": "error", "data": "Cannot switch sessions after authentication."}))
+                    await websocket.send_str(json.dumps({"status": "error", "data": "Cannot switch sessions after authentication."}))
                     continue
 
                 if REQUIRE_AUTH:
                     req_token = payload.get("auth_token", "")
                     if not AUTH_TOKEN or req_token != AUTH_TOKEN:
                         print(f"[UNAUTHORIZED] Failed auth attempt for session {req_session_code}")
-                        await websocket.send(json.dumps({"status": "error", "data": "Unauthorized connection."}))
+                        await websocket.send_str(json.dumps({"status": "error", "data": "Unauthorized connection."}))
                         continue
 
                 session_code = req_session_code
@@ -515,12 +517,12 @@ async def ws_handler(websocket):
                 continue
 
             if not session_code:
-                await websocket.send(json.dumps({"status": "error", "data": "Not authenticated. Send set_session first."}))
+                await websocket.send_str(json.dumps({"status": "error", "data": "Not authenticated. Send set_session first."}))
                 continue
 
             msg_session = payload.get("session_code", session_code)
             if msg_session != session_code:
-                await websocket.send(json.dumps({"status": "error", "data": "Session mismatch boundary violation."}))
+                await websocket.send_str(json.dumps({"status": "error", "data": "Session mismatch boundary violation."}))
                 continue
 
             if action == "set_mode":
@@ -543,7 +545,7 @@ async def ws_handler(websocket):
 
             elif action == "capture_screen":
                 if client_type != "desktop":
-                    await websocket.send(json.dumps({"status": "error", "data": "Action requires desktop client architecture."}))
+                    await websocket.send_str(json.dumps({"status": "error", "data": "Action requires desktop client architecture."}))
                     continue
 
                 state = get_session_state(session_code)
@@ -558,7 +560,7 @@ async def ws_handler(websocket):
 
             elif action == "toggle_audio":
                 if client_type != "desktop":
-                    await websocket.send(json.dumps({"status": "error", "data": "Action requires desktop client architecture."}))
+                    await websocket.send_str(json.dumps({"status": "error", "data": "Action requires desktop client architecture."}))
                     continue
 
                 state = get_session_state(session_code)
@@ -628,7 +630,7 @@ async def ws_handler(websocket):
 
             elif action == "update_config":
                 if REQUIRE_AUTH and client_type != "desktop":
-                    await websocket.send(json.dumps({
+                    await websocket.send_str(json.dumps({
                         "status": "error",
                         "data": "Only the authorized desktop client can update session configuration."
                     }))
@@ -639,8 +641,6 @@ async def ws_handler(websocket):
                     "data": "Settings saved successfully!"
                 }, session_code)
 
-    except websockets.exceptions.ConnectionClosed:
-        print(f"\n[UI DISCONNECTED] Session: {session_code}")
     except Exception as e:
         print(f"\n[UNEXPECTED WEBSOCKET ERROR] {e}")
     finally:
@@ -655,25 +655,53 @@ async def ws_handler(websocket):
                 if local_active_session == session_code and client_type == "desktop":
                     local_active_session = ""
 
-async def start_server():
+    return websocket
+
+COMMON_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+}
+
+async def health_handler(request):
+    """Answers GET, HEAD, etc. for health checks and pings."""
+    return web.Response(
+        text="ok",
+        status=200,
+        headers={"Cache-Control": "no-store", **COMMON_CORS_HEADERS},
+    )
+
+async def options_handler(request):
+    """Handles CORS preflight requests from browsers."""
+    return web.Response(
+        status=200,
+        headers=COMMON_CORS_HEADERS,
+    )
+
+def start_server():
     host = os.getenv("WS_HOST", "0.0.0.0")
     PORT = int(os.environ.get("PORT", 8765))
 
-    print(f"PROTOCOL V2 MULTI-DB ROUTER ACTIVE ON ws://{host}:{PORT}")
+    print(f"PROTOCOL V2 MULTI-DB ROUTER ACTIVE ON http://{host}:{PORT}")
 
     if REQUIRE_AUTH:
         print("Authentication layer ENABLED for secure deployment.")
     else:
         print("Authentication layer DISABLED (Local Development Mode).")
 
-    async with websockets.serve(
-        ws_handler,
-        host,
-        PORT,
-        max_size=50 * 1024 * 1024,
-        origins=ALLOWED_ORIGINS
-    ):
-        await asyncio.Future()
+    app = web.Application(client_max_size=50 * 1024 * 1024)
+
+    # 1. Catch OPTIONS preflight requests
+    app.router.add_route("OPTIONS", "/{tail:.*}", options_handler)
+
+    # 2. Main endpoint: accepts WebSocket or plain HTTP GET/HEAD
+    app.router.add_route("GET", "/", ws_handler)
+    app.router.add_route("HEAD", "/", health_handler)
+
+    # 3. Explicit /health endpoint for Render health checks
+    app.router.add_route("*", "/health", health_handler)
+
+    web.run_app(app, host=host, port=PORT)
 
 if __name__ == "__main__":
-    asyncio.run(start_server())
+    start_server()
