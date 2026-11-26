@@ -1,3 +1,4 @@
+import os
 import pyaudiowpatch as pyaudio
 import speech_recognition as sr
 from google import genai
@@ -5,8 +6,9 @@ import wave
 import io
 import threading
 
-# 🛑 INSERT YOUR GEMINI API KEY HERE
-API_KEY = "AQ.Ab8RN6LnyY-shVi-yjTIt6TaFJcer8KkgWrWcm2ZZoK-D0bf4A"
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is required to run stealth_audio.py")
 
 client = genai.Client(api_key=API_KEY)
 recognizer = sr.Recognizer()

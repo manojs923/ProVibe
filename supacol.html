@@ -118,8 +118,8 @@ tr:hover td{background:var(--p2)}
 
 <script>
 // ---- Your projects (refs come from the URLs, keys kept for reference) ----
-const URLS = "https://yfyiizovbhsddpmgduvs.supabase.co,https://jbgrwhzmxuydnmbbqoaa.supabase.co,https://aujoerlxflvbxvqqtprr.supabase.co,https://uwqxnontvuxwjhsckeob.supabase.co,https://ilahujayzykctouvvpyg.supabase.co,https://gqdbheqwbxzwyirwjuno.supabase.co,https://tchqndgtxbscmspdisie.supabase.co,https://elhenjwqewmowpfqjlea.supabase.co".split(",");
-const KEYS = "sb_publishable_NoyP-ECcNTrOdxc27CQdtw_9iopHIN9,sb_publishable_QWcngQrI9zZyXgiMi1KYeg_V8dyYrlj,sb_publishable_hlPdNMypLHQ-LCd_j0Eg1Q_-IN6QBw6,sb_publishable_MO6LFY6KX3ZCkbLhemgrdg_UBe9TBsy,sb_publishable_-XAFHhUw3YBH7PuV7FaZew_4VmSyQKy,sb_publishable_QjB3Q1YblXc4jIURMoLw4A_2Gv1foUz,sb_publishable_DV_nvpL6Mtdr9Xs2-3Nb_g_o2SqVgOI,sb_publishable_4g89JyZ53yYaBHwv7Rnijg_2aduQO78".split(",");
+const URLS = "https://hbeafjnartmylnkwjtfn.supabase.co,https://wbweusamfnzavtzxkjve.supabase.co,https://dngbxkijkrurywvsxqva.supabase.co,https://baxnacoiewnholwjadii.supabase.co,https://vxjlefmnhwzokvnejsvj.supabase.co,https://bulokkhwwmupmjueajwr.supabase.co".split(",");
+const KEYS = "sb_publishable_zueMId3r5IY0-rrQlnUq1Q_drN-y45c,sb_publishable_IhqnN1SC7LZgiJUsFpqiqA_jjwbvteR,sb_publishable_iNx5EaQM64wtVhO4rqTTDA_Cm-RTtRd,sb_publishable_pc0djIJiFYyHMZpcfpW8VA_WeTOwlW5,sb_publishable_sgCeYaoKWm1wLX5eh2C_SQ_ozwCbsP6,sb_publishable_oYld3b25kUiNuz022yfiXg_kvskozuq".split(",");
 const PROJECTS = URLS.map((u,i)=>({ref:new URL(u).hostname.split(".")[0],url:u,key:KEYS[i],n:i+1,on:true,state:"idle",res:null}));
 
 const PRESETS = {
@@ -154,7 +154,7 @@ const esc = s => String(s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&
 let active = "all";
 
 // ---- Tokens (built in): token #n is used for project #n ----
-const TOKENS = "sbp_fc18b595c3284c24a23a5c30a6747918b4622652,sbp_fc45ff922ed8dc5866dc0d7ae39a6a505f7fac74,sbp_fc7e381a9cfe977aed82d3d70fcd1ffe02409313,sbp_fc5743a1bdd98b186fd1f0efe16e338b09f30013,sbp_fc3c0ac633dbe9faf39bfed225080ac58e2d2287,sbp_fc5f1a2372c6c44f800bcac429ad818286c44741,sbp_fc34211c8ebe9cfd87210f510d557e1116f98b9a,sbp_fc57209a8dfe40535ab4bcebf51e3c1783a3aaee".split(",");
+const TOKENS = "sbp_fc866ce47976bad9e31c7f9bc099bd6c70de9692,sbp_fcf385eece946b1d0b6f17877b65114f3fee1ece,sbp_fc1aa2a5adf4dfef753d18e37110932a14e4618b,sbp_fc8d62312e84ada1b9609ad0120c805e7290bc4e,sbp_fc3329f55be3d52ad86c2c0e8c64b2a91bb2e74b,sbp_fcdf2138498072f3a6674860516439fc20001639".split(",");
 function tokenFor(p){ return TOKENS[p.n-1] || TOKENS[TOKENS.length-1]; }
 $("#tokInfo").textContent = `${TOKENS.length} tokens built in — one per project.`;
 

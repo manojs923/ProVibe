@@ -1,10 +1,14 @@
+import os
+
 import requests
 
-# 🛑 INSERT YOUR API KEY HERE
-API_KEY = "AQ.Ab8RN6LnyY-shVi-yjTIt6TaFJcer8KkgWrWcm2ZZoK-D0bf4A"
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+    raise SystemExit("Set GEMINI_API_KEY before running check_models.py")
 
 url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
-response = requests.get(url)
+response = requests.get(url, timeout=20)
+response.raise_for_status()
 
 data = response.json()
 

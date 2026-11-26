@@ -29,7 +29,7 @@ Get-Item "$env:ProgramFiles\protocol\resources\base.vhdx" | Select-Object Length
 
 # 1. clear the previous guest and its diff disk — the name is fixed, so a
 #    leftover VM gets reused with whatever the last session left on it
-Get-Process vmconnect -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process vmconnect -ErrorAction SilentlyContinue | Stop-Process -Force
 Remove-VM -Name Test-Nartan-Build -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:ProgramData\Protocol\VMs\Test-Nartan-Build.vhdx" -Force -ErrorAction SilentlyContinue
 
