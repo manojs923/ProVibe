@@ -3,8 +3,15 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { invoke } from '@tauri-apps/api/core';
 
 // ── multi-node Supabase ────────────────────────────────────────
-const urlsEnv = import.meta.env.VITE_SUPABASE_URLS || import.meta.env.VITE_SUPABASE_URL || "";
-const keysEnv = import.meta.env.VITE_SUPABASE_KEYS || import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+const urlsEnv =
+  import.meta.env.VITE_SUPABASE_URLS ||
+  import.meta.env.VITE_SUPABASE_URL ||
+  "https://hbeafjnartmylnkwjtfn.supabase.co,https://wbweusamfnzavtzxkjve.supabase.co,https://baxnacoiewnholwjadii.supabase.co,https://vxjlefmnhwzokvnejsvj.supabase.co,https://dngbxkijkrurywvsxqva.supabase.co,https://bulokkhwwmupmjueajwr.supabase.co";
+
+const keysEnv =
+  import.meta.env.VITE_SUPABASE_KEYS ||
+  import.meta.env.VITE_SUPABASE_ANON_KEY ||
+  "";
 
 const supabaseUrls: string[] = urlsEnv.split(',').map((u: string) => u.trim()).filter((u: string) => u.length > 0);
 const supabaseKeys: string[] = keysEnv.split(',').map((k: string) => k.trim()).filter((k: string) => k.length > 0);
@@ -23,10 +30,10 @@ supabaseUrls.forEach((url: string, index: number) => {
 });
 
 if (supabaseClients.length === 0) {
-  console.error("CRITICAL: no database nodes configured.");
+  console.warn("CRITICAL: no database nodes configured. Add VITE_SUPABASE_KEYS to your .env to enable cloud sync.");
 }
 
-const REMOTE_VIEWER = "https://pro-buddy-jnu8d210x-dboss1.vercel.app/";
+const REMOTE_VIEWER = "https://pro-buddy-onmv.vercel.app/";
 const MIN_W = 360;
 const MIN_H = 260;
 
@@ -185,7 +192,6 @@ const isTauri = () =>
 
 const WS_URLS = [
   (import.meta.env as any).VITE_WS_URL,
-  "wss://protocol-i59x.onrender.com",
   "wss://provibe.onrender.com",
   isTauri() ? "ws://localhost:8765" : null,
 ].filter((url): url is string => typeof url === "string" && url.length > 0);
@@ -264,7 +270,7 @@ export default function App() {
   const [configPath, setConfigPath] = useState("");
 
   const [uiOpacity, setUiOpacity] = useState(DEFAULT_OPACITY);
-  const [captureMode, setCaptureMode] = useState<"VM" | "HOST">("VM");
+  const [captureMode, setCaptureMode] = useState<"VM" | "HOST">("HOST");
   const [buffered, setBuffered] = useState(0);
   const [dbBusy, setDbBusy] = useState<null | "delete" | "download">(null);
 
@@ -312,8 +318,6 @@ export default function App() {
     const saved = localStorage.getItem('protocol_ui_opacity');
     if (saved) {
       const parsed = parseFloat(saved);
-      // Only adopt a value that is actually a usable number; a "0", a "NaN"
-      // or an empty string otherwise pins the whole shell at invisible.
       if (Number.isFinite(parsed) && parsed >= MIN_OPACITY && parsed <= 1) {
         setUiOpacity(parsed);
       } else {
@@ -373,12 +377,6 @@ export default function App() {
   }, []);
 
   // ── failover writes ────────────────────────────────────────
-  //
-  // Start at the node that last worked and walk forward only on failure. A
-  // dead node costs one probe per session, not one per frame, and the index
-  // sticks to whatever accepted. `% total` keeps the whole ring reachable, so
-  // a session that starts near the end can still fall back to the front.
-  // MIRROR_WIDTH adds background copies on top; at 0 this is failover only.
   const storeRow = async (payload: Record<string, unknown>): Promise<boolean> => {
     const total = supabaseClients.length;
     if (total === 0) return false;
@@ -442,10 +440,6 @@ export default function App() {
   };
 
   // ── bulk frame sweep ───────────────────────────────────────
-  //
-  // Page through every stored frame on every node and dedupe by id, since
-  // mirrored rows arrive from more than one node. Used by both the dump and
-  // the purge.
   const sweepFrames = async (onPage?: (seen: number) => void): Promise<FrameRow[]> => {
     const collected: FrameRow[] = [];
 
@@ -803,8 +797,6 @@ export default function App() {
     let inFlight = false;
 
     vmPollRef.current = window.setInterval(async () => {
-      // A slow status call must not stack a second one behind it — overlapping
-      // ticks are what turn a single stall into a burst of probes.
       if (inFlight) return;
       inFlight = true;
       ticks += 1;
@@ -824,9 +816,6 @@ export default function App() {
           try { await invoke("start_loopback_tunnel_cmd", { vmName: VM_NAME }); } catch (err) { console.warn(err); }
         }
 
-        // Only probe once Running has held for two consecutive ticks. A guest
-        // that flickers Starting/Running would otherwise fire a console grab
-        // on every single tick.
         if (runningStreak >= 2) {
           if (await probeStream()) { settleHooked(targetBrowserRef.current); return; }
           setTranscript("guest up, no stream yet — check RDP in the guest");
