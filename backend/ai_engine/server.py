@@ -218,6 +218,7 @@ def virtual_camera_loop():
             cam.sleep_until_next_frame()
 
 def get_vm_window_rect():
+    if not gw: return None
     windows = gw.getWindowsWithTitle("exam_stealth_vm") or gw.getWindowsWithTitle("Virtual Machine Connection")
     if windows:
         win = windows[0]
@@ -228,13 +229,18 @@ async def buffer_screenshot(session_code=None):
     session_code = session_code or local_active_session
     state = get_session_state(session_code)
 
-    rect = get_vm_window_rect()
-    if not rect:
-        await broadcast_to_ui({"status": "error", "data": "vm window not found."}, session_code)
+    if not mss:
+        await broadcast_to_ui({"status": "error", "data": "Screen capture library not available."}, session_code)
         return
 
+    rect = get_vm_window_rect()
     with mss.mss() as sct:
-        monitor = {"top": rect["top"], "left": rect["left"], "width": rect["width"], "height": rect["height"]}
+        if rect:
+            monitor = {"top": rect["top"], "left": rect["left"], "width": rect["width"], "height": rect["height"]}
+        else:
+            # Fall back to primary monitor
+            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+
         sct_img = sct.grab(monitor)
         img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         img.thumbnail((1280, 1280))
@@ -242,7 +248,7 @@ async def buffer_screenshot(session_code=None):
 
         await broadcast_to_ui({
             "status": "loading",
-            "transcript": f"optical air-gap buffered {len(state['buffer'])} frame(s) from vm."
+            "transcript": f"Buffered {len(state['buffer'])} frame(s)."
         }, session_code)
 
 
@@ -341,6 +347,9 @@ async def execute_screenshot_batch(requested_mode="AUTO", session_code=None, rou
 # AUDIO RECORDING ENGINE
 # =====================================================================
 def record_audio_sync(stop_event):
+    if not pyaudio:
+        return "ERROR_SYSTEM"
+
     CHUNK = 4096
     MAX_SECONDS = 30
 
@@ -446,7 +455,6 @@ async def handle_audio_workflow(websocket, session_code):
 async def ws_handler(request):
     global local_active_session
 
-    # If it's a regular HTTP request (like a health check ping or HEAD), return 200 OK
     if request.headers.get("Upgrade", "").lower() != "websocket":
         return await health_handler(request)
 
@@ -569,13 +577,25 @@ async def ws_handler(request):
                 else:
                     state["stop_recording_event"].set()
 
-            elif action == "text_query":
-                query_text = payload.get("text", "")
-                if query_text and isinstance(query_text, str):
+            # ── DIRECT ANSWER TRANSMISSION (Overseer -> Protocol Native) ──
+            elif action in ("text_query", "operator_answer", "transmit_answer", "answer"):
+                answer_content = payload.get("text") or payload.get("data") or payload.get("answer") or ""
+                if answer_content and isinstance(answer_content, str):
                     await broadcast_to_ui({
                         "status": "success",
-                        "data": "Text query received.",
-                        "transcript": f"Query: {query_text}",
+                        "data": answer_content,
+                        "transcript": f"Answer received: {answer_content[:40]}...",
+                    }, session_code)
+
+            # ── OPERATOR CHAT TRANSMISSION ──
+            elif action == "chat":
+                chat_msg = payload.get("text", "")
+                if chat_msg and isinstance(chat_msg, str):
+                    await broadcast_to_ui({
+                        "status": "chat",
+                        "data": chat_msg,
+                        "sender": payload.get("sender", "operator"),
+                        "transcript": f"Chat: {chat_msg}",
                     }, session_code)
 
             elif action == "browser_image_batch_upload":
